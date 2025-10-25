@@ -53,6 +53,9 @@ void AluUnit::tick() {
 			case AluType::CZERO:
 				delay = 2;
 				break;
+			case AluType::DOT8:
+				delay = 2;
+				break;
 			default:
 				std::abort();
 			}
