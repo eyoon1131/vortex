@@ -182,7 +182,7 @@ package VX_gpu_pkg;
     ///////////////////////////////////////////////////////////////////////////
 
     localparam INST_ALU_ADD =    4'b0000;
-    //localparam INST_ALU_UNUSED=4'b0001;
+    localparam INST_ALU_DOT8 =   4'b0001;
     localparam INST_ALU_LUI =    4'b0010;
     localparam INST_ALU_AUIPC =  4'b0011;
     localparam INST_ALU_SLTU =   4'b0100;

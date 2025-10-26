@@ -963,4 +963,11 @@
 `define ARCHITECTURE_ID     0
 `define IMPLEMENTATION_ID   0
 
+// DOT8 ///////////////////////////////////////////////////////////////////////
+
+// DOT8 Latency
+`ifndef LATENCY_DOT8
+`define LATENCY_DOT8 2
+`endif
+
 `endif // VX_CONFIG_VH
