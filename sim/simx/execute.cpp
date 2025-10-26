@@ -307,12 +307,13 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
           uint32_t packedA = rs1_data[t].u;
           uint32_t packedB = rs2_data[t].u;
           int32_t sum = 0;
-          // TODO: 
+          
           for (uint8_t i = 0; i < 4; ++i) {
             int8_t a = packedA >> (i * 8) & 0xFF;
             int8_t b = packedB >> (i * 8) & 0xFF;
             sum += a * b;
           }
+          
           DP(3, "*** DOT8[" << t << "]: a=0x" << std::hex << packedA << ", b=0x" << packedB << ", c=0x" << sum << std::dec);
           rd_data[t].i = sum;
         }
