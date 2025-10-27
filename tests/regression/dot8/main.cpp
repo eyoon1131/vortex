@@ -143,7 +143,7 @@ int main(int argc, char *argv[]) {
   uint32_t in_buf_size = size_sq * sizeof(int8_t);
   uint32_t out_buf_size = size_sq * sizeof(int32_t);
 
-  // std::cout << "data type: " << Comparator<int8_t>::type_str() << std::endl;
+  std::cout << "data type: int8_t" << std::endl;
   std::cout << "matrix size: " << size << "x" << size << std::endl;
 
   kernel_arg.grid_dim[0] = size;
