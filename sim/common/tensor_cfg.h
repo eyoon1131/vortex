@@ -43,6 +43,13 @@ struct bf16 {
   static constexpr const char* name = "bf16";
 };
 
+struct tf32 {
+  using dtype = uint32_t;
+  static constexpr uint32_t id = 3;
+  static constexpr uint32_t bits = 32;
+  static constexpr const char* name = "tf32";
+};
+
 struct int32 {
   using dtype = int32_t;
   static constexpr uint32_t id = 8;
@@ -88,6 +95,7 @@ inline const char* fmt_string(uint32_t fmt) {
   case uint8::id: return uint8::name;
   case int4::id:  return int4::name;
   case uint4::id: return uint4::name;
+  case tf32::id:  return tf32::name;
   default:        return "";
   }
 }

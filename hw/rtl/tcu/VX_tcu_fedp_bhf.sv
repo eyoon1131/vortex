@@ -75,6 +75,7 @@ module VX_tcu_fedp_bhf #(
     for (genvar i = 0; i < TCK; i++) begin : g_prod
         wire [32:0] mult_result_fp16;
         wire [32:0] mult_result_bf16;
+        wire [32:0] mult_result_tf32;
 
         // FP16 multiplication
         VX_tcu_bhf_fmul #(
@@ -118,11 +119,33 @@ module VX_tcu_fedp_bhf #(
             `UNUSED_PIN(fflags)
         );
 
+        // TF32 multiplication
+        VX_tcu_bhf_fmul #(
+            .IN_EXPW (8),
+            .IN_SIGW (10+1),
+            .OUT_EXPW(8),
+            .OUT_SIGW(24),
+            .IN_REC  (0), // input in IEEE format
+            .OUT_REC (1), // output in recoded format
+            .MUL_LATENCY (FMUL_LATENCY),
+            .RND_LATENCY (FRND_LATENCY)
+        ) tf32_mul (
+            .clk    (clk),
+            .reset  (reset),
+            .enable (enable),
+            .frm    (frm),
+            .a      (i[0] ? 19'b0 : a_row[i >> 1][18:0]),
+            .b      (i[0] ? 19'b0 : b_col[i >> 1][18:0]),
+            .y      (mult_result_tf32),
+            `UNUSED_PIN(fflags)
+        );
+
         logic [32:0] mult_result_mux;
         always_comb begin
             case(fmt_s_delayed)
                 3'd1: mult_result_mux = mult_result_fp16;
                 3'd2: mult_result_mux = mult_result_bf16;
+                3'd3: mult_result_mux = mult_result_tf32;
                 default: mult_result_mux = 'x;
             endcase
         end
