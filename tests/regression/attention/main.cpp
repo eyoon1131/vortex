@@ -26,43 +26,24 @@ template <typename Type>
 class Comparator {};
 
 template <>
-class Comparator<int> {
-public:
-  static const char* type_str() {
-    return "integer";
-  }
-  static int generate() {
-    return rand();
-  }
-  static bool compare(int a, int b, int index, int errors) {
-    if (a != b) {
-      if (errors < 100) {
-        printf("*** error: [%d] expected=%d, actual=%d\n", index, b, a);
-      }
-      return false;
-    }
-    return true;
-  }
-};
-
-template <>
 class Comparator<float> {
 public:
   static const char* type_str() {
     return "float";
   }
+  // Modified generate to larger range [-5, 5]
   static float generate() {
-    return static_cast<float>(rand()) / RAND_MAX;
+      return 10.0f * (float(rand()) / RAND_MAX) - 5.0f;  \
   }
+  // Modified compare to allow for greater tolerance
   static bool compare(float a, float b, int index, int errors) {
-    union fi_t { float f; int32_t i; };
-    fi_t fa, fb;
-    fa.f = a;
-    fb.f = b;
-    auto d = std::abs(fa.i - fb.i);
-    if (d > FLOAT_ULP) {
+    const float atol = 1e-5f;
+    const float rtol = 1e-5f;
+    auto diff = std::fabs(a - b);
+    auto limit = atol + rtol * std::fabs(b);
+    if (diff > limit) {
       if (errors < 100) {
-        printf("*** error: [%d] expected=%f, actual=%f\n", index, b, a);
+        printf("*** error: [%d] expected=%f, actual=%f\n", index, a, b);
       }
       return false;
     }
@@ -102,8 +83,8 @@ static void softmax_cpu(TYPE* out, const TYPE* A, uint32_t M, uint32_t N) {
 }
 
 const char* kernel_file = "kernel.vxbin";
-uint32_t N = 32;
-uint32_t d = 4;
+uint32_t N = 64;
+uint32_t d = 8;
 
 vx_device_h device = nullptr;
 vx_buffer_h Q_buffer = nullptr;

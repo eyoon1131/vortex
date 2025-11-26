@@ -150,7 +150,7 @@ int main(int argc, char *argv[]) {
   //   return -1;
   // }
 
-  std::srand(50);
+  std::srand(10);
 
   // open device connection
   std::cout << "open device connection" << std::endl;
