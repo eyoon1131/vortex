@@ -5,8 +5,6 @@
 #define TYPE float
 #endif
 
-constexpr uint32_t MAX_BUF_SIZE = 16;
-
 typedef struct {
   uint32_t grid_dim[1];
   uint32_t block_dim[1];

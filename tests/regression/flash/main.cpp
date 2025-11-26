@@ -7,8 +7,6 @@
 #include <algorithm>
 #include "common.h"
 
-#define FLOAT_ULP 6
-
 #define RT_CHECK(_expr)                                         \
    do {                                                         \
      int _ret = _expr;                                          \
@@ -52,25 +50,25 @@ public:
   }
 };
 
-static void attention_cpu(TYPE* out, const TYPE* Q, const TYPE* K, const TYPE* V, uint32_t N, uint32_t d) {
-  std::vector<TYPE> scores(N);
-  std::vector<TYPE> probs(N);
+static void attention_cpu(float* out, const float* Q, const float* K, const float* V, uint32_t N, uint32_t d) {
+  std::vector<float> scores(N);
+  std::vector<float> probs(N);
   for (uint32_t i = 0; i < N; ++i) {
     // Compute row of scores
     for (uint32_t j = 0; j < N; ++j) {
-      TYPE sum(0);
+      float sum = 0.0f;
       for (uint32_t k = 0; k < d; ++k) 
         sum += Q[i * d + k] * K[j * d + k];
       scores[j] = sum;
     }
 
     // Compute softmax of row
-    TYPE max(scores[0]);
+    float max = scores[0];
     for (uint32_t j = 1; j < N; ++j)
       max = std::max(max, scores[j]);
-    TYPE exp_sum(0);
+    float exp_sum = 0.0f;
     for (uint32_t j = 0; j < N; ++j) {
-      TYPE exp(std::exp(scores[j] - max));
+      float exp = std::exp(scores[j] - max);
       probs[j] = exp;
       exp_sum += exp;
     }
@@ -79,7 +77,7 @@ static void attention_cpu(TYPE* out, const TYPE* Q, const TYPE* K, const TYPE* V
 
     // Compute row of O
     for (uint32_t k = 0; k < d; ++k) {
-      TYPE sum(0);
+      float sum = 0.0f;
       for (uint32_t j = 0; j < N; ++j) 
         sum += probs[j] * V[j * d + k];
       out[i * d + k] = sum;
@@ -156,11 +154,11 @@ int main(int argc, char *argv[]) {
   std::cout << "open device connection" << std::endl;
   RT_CHECK(vx_dev_open(&device));
   
-  // get size M of SRAM
-  uint64_t local_mem_size;
-  vx_dev_caps(device, VX_CAPS_LOCAL_MEM_SIZE, &local_mem_size);
-  std::cout << "local_mem_size=" << local_mem_size << " bytes" << std::endl;
-  uint32_t M = local_mem_size / sizeof(TYPE);
+  // // get size M of SRAM
+  // uint64_t local_mem_size;
+  // vx_dev_caps(device, VX_CAPS_LOCAL_MEM_SIZE, &local_mem_size);
+  // std::cout << "local_mem_size=" << local_mem_size << " bytes" << std::endl;
+  // uint32_t M = local_mem_size / sizeof(TYPE);
 
   // calculate block sizes
   // uint32_t block_size_c = std::min(static_cast<uint32_t>(std::ceil(M / (4 * d))), N);
@@ -180,7 +178,7 @@ int main(int argc, char *argv[]) {
   std::cout << "occupancy: max_localmem=" << max_localmem << " bytes" << std::endl;
   RT_CHECK(max_localmem < local_mem);
 
-  std::cout << "data type: " << Comparator<TYPE>::type_str() << std::endl;
+  std::cout << "data type: " << Comparator<float>::type_str() << std::endl;
   std::cout << "sequence length: " << N << std::endl;
   std::cout << "head dimension: " << d << std::endl;
   std::cout << "local memory: " << local_mem << " bytes" << std::endl;
@@ -211,17 +209,16 @@ int main(int argc, char *argv[]) {
 
   // allocate host buffers
   std::cout << "allocate host buffers" << std::endl;
-  std::vector<TYPE> h_Q(size);
-  std::vector<TYPE> h_K(size);
-  std::vector<TYPE> h_V(size);
-  std::vector<TYPE> h_O(size);
+  std::vector<float> h_Q(size);
+  std::vector<float> h_K(size);
+  std::vector<float> h_V(size);
+  std::vector<float> h_O(size);
 
   // generate source data
   for (uint32_t i = 0; i < size; ++i) {
-    h_Q[i] = Comparator<TYPE>::generate();
-    h_K[i] = Comparator<TYPE>::generate();
-    h_V[i] = Comparator<TYPE>::generate();
-    h_O[i] = 0;
+    h_Q[i] = Comparator<float>::generate();
+    h_K[i] = Comparator<float>::generate();
+    h_V[i] = Comparator<float>::generate();
   }
 
   // upload source buffer0
