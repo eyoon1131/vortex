@@ -8,6 +8,7 @@
 typedef struct {
   uint32_t grid_dim[1];
   uint32_t block_dim[1];
+  uint32_t kernel_type; // 0: SIMT, 1: tensor core
   uint32_t seq_len;
   uint32_t head_dim;
   uint32_t block_size_r;

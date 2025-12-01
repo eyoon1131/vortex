@@ -88,6 +88,7 @@ static void attention_cpu(float* out, const float* Q, const float* K, const floa
 const char* kernel_file = "kernel.vxbin";
 uint32_t N = 64;
 uint32_t d = 8;
+uint32_t kernel_type = 2; // 0: simt, 1: tensor core, 2: auto
 
 vx_device_h device = nullptr;
 vx_buffer_h Q_buffer = nullptr;
@@ -100,21 +101,24 @@ kernel_arg_t kernel_arg = {};
 
 static void show_usage() {
    std::cout << "Vortex Test." << std::endl;
-   std::cout << "Usage: [-k: kernel] [-n:sequence_len] [-d:head_dim] [-h: help]" << std::endl;
+   std::cout << "Usage: [-k: kernel] [-n:sequence_len] [-d:head_dim] [-t: kernel_type(0=simt,1=tcu,2=auto)] [-h: help]" << std::endl;
 }
 
 static void parse_args(int argc, char **argv) {
   int c;
-  while ((c = getopt(argc, argv, "n:d:k:h")) != -1) {
+  while ((c = getopt(argc, argv, "n:d:k:t:h")) != -1) {
     switch (c) {
     case 'n':
-      // N = atoi(optarg);
+      N = atoi(optarg);
       break;
     case 'd':
-      // d = atoi(optarg);
+      d = atoi(optarg);
       break;
     case 'k':
       kernel_file = optarg;
+      break;
+    case 't':
+      kernel_type = atoi(optarg);
       break;
     case 'h':
       show_usage();
@@ -143,10 +147,12 @@ int main(int argc, char *argv[]) {
   // parse command arguments
   parse_args(argc, argv);
 
-  // if ((size / tile_size) * tile_size != size) {
-  //   printf("Error: matrix size %d must be a multiple of tile size %d\n", size, tile_size);
-  //   return -1;
-  // }
+  const uint32_t HEAD_DIM_MAX = 64;
+  const uint32_t BLOCK_SIZE_C_MAX = 16;
+  if (d == 0 || d > HEAD_DIM_MAX) {
+    std::cout << "Error: head_dim must be in [1," << HEAD_DIM_MAX << "], got " << d << std::endl;
+    return -1;
+  }
 
   std::srand(50);
 
@@ -161,16 +167,43 @@ int main(int argc, char *argv[]) {
   // uint32_t M = local_mem_size / sizeof(TYPE);
 
   // calculate block sizes
-  // uint32_t block_size_c = std::min(static_cast<uint32_t>(std::ceil(M / (4 * d))), N);
-  // uint32_t block_size_r = std::min(block_size_c, d);
   uint32_t block_size_c = 4;
   uint32_t block_size_r = 4;
+  if (kernel_type == 1 || (kernel_type == 2 && d == 8 && N >= 128)) {
+    block_size_c = 8;
+    block_size_r = 8;
+    kernel_type = 1;
+  } else if (kernel_type == 2) {
+    kernel_type = 0; // auto -> simt
+  }
+
+  if (block_size_c > BLOCK_SIZE_C_MAX) {
+    std::cout << "Error: block_size_c exceeds max " << BLOCK_SIZE_C_MAX << std::endl;
+    return -1;
+  }
+
+  if ((N % block_size_r) != 0 || (N % block_size_c) != 0) {
+    std::cout << "Error: sequence length " << N << " must be a multiple of block sizes r=" << block_size_r
+              << ", c=" << block_size_c << std::endl;
+    return -1;
+  }
 
   uint32_t size = N * d;
   uint32_t buf_size = size * sizeof(TYPE);
   uint32_t group_size = block_size_r;
 
-  uint32_t local_mem = (block_size_r + 2 * block_size_c) * d * sizeof(TYPE);
+  uint32_t local_mem = 0;
+  if (kernel_type == 1) {
+    // TCU path: fp16 tiles for Q/K/P/V plus fp32 scores
+    uint32_t qk_fp16_elems = (block_size_r + block_size_c) * d;
+    uint32_t p_fp16_elems  = block_size_r * d;
+    uint32_t v_fp16_elems  = d * d;
+    uint32_t scores_elems  = block_size_r * block_size_c;
+    local_mem = (qk_fp16_elems + p_fp16_elems + v_fp16_elems) * sizeof(uint16_t)
+              + scores_elems * sizeof(float);
+  } else {
+    local_mem = (block_size_r + 2 * block_size_c) * d * sizeof(TYPE);
+  }
 
   // check work group occupancy
   uint32_t max_localmem;
@@ -181,11 +214,13 @@ int main(int argc, char *argv[]) {
   std::cout << "data type: " << Comparator<float>::type_str() << std::endl;
   std::cout << "sequence length: " << N << std::endl;
   std::cout << "head dimension: " << d << std::endl;
+  std::cout << "kernel type: " << (kernel_type == 1 ? "tensor core" : "simt") << std::endl;
   std::cout << "local memory: " << local_mem << " bytes" << std::endl;
 
   // Set kernel args
   kernel_arg.grid_dim[0] = N / block_size_r;
   kernel_arg.block_dim[0] = block_size_r;
+  kernel_arg.kernel_type = kernel_type;
   kernel_arg.seq_len = N;
   kernel_arg.head_dim = d;
   kernel_arg.block_size_r = block_size_r;
