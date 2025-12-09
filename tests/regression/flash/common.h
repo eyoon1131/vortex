@@ -13,6 +13,8 @@ typedef struct {
   uint32_t head_dim;
   uint32_t block_size_r;
   uint32_t block_size_c;
+  float scale;         // softmax scale (usually 1/sqrt(head_dim))
+  uint32_t causal;     // 1 = apply causal mask, 0 = none
   uint64_t Q_addr;
   uint64_t K_addr;
   uint64_t V_addr;

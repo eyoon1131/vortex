@@ -5,6 +5,9 @@
 #include <vortex.h>
 #include <cmath>
 #include <algorithm>
+#include <limits>
+#include <VX_config.h>
+#include <tensor_cfg.h>
 #include "common.h"
 
 #define RT_CHECK(_expr)                                         \
@@ -50,16 +53,20 @@ public:
   }
 };
 
-static void attention_cpu(float* out, const float* Q, const float* K, const float* V, uint32_t N, uint32_t d) {
+static void attention_cpu(float* out, const float* Q, const float* K, const float* V, uint32_t N, uint32_t d, float scale, bool causal_mask) {
   std::vector<float> scores(N);
   std::vector<float> probs(N);
   for (uint32_t i = 0; i < N; ++i) {
     // Compute row of scores
     for (uint32_t j = 0; j < N; ++j) {
+      if (causal_mask && j > i) {
+        scores[j] = -std::numeric_limits<float>::infinity();
+        continue;
+      }
       float sum = 0.0f;
       for (uint32_t k = 0; k < d; ++k) 
         sum += Q[i * d + k] * K[j * d + k];
-      scores[j] = sum;
+      scores[j] = sum * scale;
     }
 
     // Compute softmax of row
@@ -89,6 +96,12 @@ const char* kernel_file = "kernel.vxbin";
 uint32_t N = 64;
 uint32_t d = 8;
 uint32_t kernel_type = 2; // 0: simt, 1: tensor core, 2: auto
+uint32_t causal = 0;
+namespace vt = vortex::tensor;
+using tcu_cfg = vt::wmma_config_t<NUM_THREADS, vt::fp16, vt::fp32>;
+static constexpr uint32_t TCU_TILE_M = tcu_cfg::tileM;
+static constexpr uint32_t TCU_TILE_N = tcu_cfg::tileN;
+static constexpr uint32_t TCU_TILE_K = tcu_cfg::tileK;
 
 vx_device_h device = nullptr;
 vx_buffer_h Q_buffer = nullptr;
@@ -101,17 +114,19 @@ kernel_arg_t kernel_arg = {};
 
 static void show_usage() {
    std::cout << "Vortex Test." << std::endl;
-   std::cout << "Usage: [-k: kernel] [-n:sequence_len] [-d:head_dim] [-t: kernel_type(0=simt,1=tcu,2=auto)] [-h: help]" << std::endl;
+   std::cout << "Usage: [-k: kernel] [-n:sequence_len] [-d:head_dim] [-t: kernel_type(0=simt,1=tcu,2=auto)] [-c: causal mask] [-h: help]" << std::endl;
 }
 
 static void parse_args(int argc, char **argv) {
   int c;
-  while ((c = getopt(argc, argv, "n:d:k:t:h")) != -1) {
+  while ((c = getopt(argc, argv, "n:d:k:t:ch")) != -1) {
     switch (c) {
     case 'n':
       N = atoi(optarg);
+      N = atoi(optarg);
       break;
     case 'd':
+      d = atoi(optarg);
       d = atoi(optarg);
       break;
     case 'k':
@@ -119,6 +134,9 @@ static void parse_args(int argc, char **argv) {
       break;
     case 't':
       kernel_type = atoi(optarg);
+      break;
+    case 'c':
+      causal = 1;
       break;
     case 'h':
       show_usage();
@@ -154,27 +172,42 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
+  float scale = 1.0f / std::sqrt(static_cast<float>(d));
+
   std::srand(50);
 
   // open device connection
   std::cout << "open device connection" << std::endl;
   RT_CHECK(vx_dev_open(&device));
-  
-  // // get size M of SRAM
-  // uint64_t local_mem_size;
-  // vx_dev_caps(device, VX_CAPS_LOCAL_MEM_SIZE, &local_mem_size);
-  // std::cout << "local_mem_size=" << local_mem_size << " bytes" << std::endl;
-  // uint32_t M = local_mem_size / sizeof(TYPE);
+
+  // Check if TCU is supported
+  uint64_t isa_flags;
+  RT_CHECK(vx_dev_caps(device, VX_CAPS_ISA_FLAGS, &isa_flags));
+  bool tcu_supported = (isa_flags & (1 << 10)) != 0; // ISA_EXT_TCU = 10
+  uint64_t num_threads = 0;
+  RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_THREADS, &num_threads));
+  bool warp_match = (num_threads == NUM_THREADS);
 
   // calculate block sizes
   uint32_t block_size_c = 4;
   uint32_t block_size_r = 4;
-  if (kernel_type == 1 || (kernel_type == 2 && d == 8 && N >= 128)) {
-    block_size_c = 8;
-    block_size_r = 8;
+  if (kernel_type == 1 || (kernel_type == 2 && d == TCU_TILE_K && N >= TCU_TILE_N * 16)) {
+    block_size_c = TCU_TILE_N;
+    block_size_r = TCU_TILE_M;
     kernel_type = 1;
   } else if (kernel_type == 2) {
     kernel_type = 0; // auto -> simt
+  }
+
+  // Fall back to SIMT if TCU requested but not supported
+  if (kernel_type == 1 && (!tcu_supported || !warp_match)) {
+    if (!tcu_supported)
+      std::cout << "Warning: TCU not supported by hardware, falling back to SIMT" << std::endl;
+    if (!warp_match)
+      std::cout << "Warning: device warp size (" << num_threads << ") != NUM_THREADS (" << NUM_THREADS << "), falling back to SIMT" << std::endl;
+    kernel_type = 0;
+    block_size_c = 4;
+    block_size_r = 4;
   }
 
   if (block_size_c > BLOCK_SIZE_C_MAX) {
@@ -195,10 +228,11 @@ int main(int argc, char *argv[]) {
   uint32_t local_mem = 0;
   if (kernel_type == 1) {
     // TCU path: fp16 tiles for Q/K/P/V plus fp32 scores
-    uint32_t qk_fp16_elems = (block_size_r + block_size_c) * d;
-    uint32_t p_fp16_elems  = block_size_r * d;
-    uint32_t v_fp16_elems  = d * d;
-    uint32_t scores_elems  = block_size_r * block_size_c;
+    uint32_t padded_head = ((d + TCU_TILE_K - 1) / TCU_TILE_K) * TCU_TILE_K;
+    uint32_t qk_fp16_elems = (block_size_r + block_size_c) * padded_head;
+    uint32_t p_fp16_elems  = block_size_r * block_size_c;
+    uint32_t v_fp16_elems  = block_size_c * padded_head;
+    uint32_t scores_elems  = block_size_r * padded_head;
     local_mem = (qk_fp16_elems + p_fp16_elems + v_fp16_elems) * sizeof(uint16_t)
               + scores_elems * sizeof(float);
   } else {
@@ -215,16 +249,22 @@ int main(int argc, char *argv[]) {
   std::cout << "sequence length: " << N << std::endl;
   std::cout << "head dimension: " << d << std::endl;
   std::cout << "kernel type: " << (kernel_type == 1 ? "tensor core" : "simt") << std::endl;
+  std::cout << "kernel type: " << (kernel_type == 1 ? "tensor core" : "simt") << std::endl;
   std::cout << "local memory: " << local_mem << " bytes" << std::endl;
+  std::cout << "scale: " << scale << std::endl;
+  std::cout << "causal: " << (causal ? "true" : "false") << std::endl;
 
   // Set kernel args
   kernel_arg.grid_dim[0] = N / block_size_r;
   kernel_arg.block_dim[0] = block_size_r;
   kernel_arg.kernel_type = kernel_type;
+  kernel_arg.kernel_type = kernel_type;
   kernel_arg.seq_len = N;
   kernel_arg.head_dim = d;
   kernel_arg.block_size_r = block_size_r;
   kernel_arg.block_size_c = block_size_c;
+  kernel_arg.scale = scale;
+  kernel_arg.causal = causal;
 
   // allocate device memory
   std::cout << "allocate device memory" << std::endl;
@@ -297,7 +337,7 @@ int main(int argc, char *argv[]) {
   int errors = 0;
   {
     std::vector<TYPE> h_ref(size);
-    attention_cpu(h_ref.data(), h_Q.data(), h_K.data(), h_V.data(), N, d);
+    attention_cpu(h_ref.data(), h_Q.data(), h_K.data(), h_V.data(), N, d, scale, causal != 0);
 
     for (uint32_t i = 0; i < h_ref.size(); ++i) {
       if (!Comparator<TYPE>::compare(h_O[i], h_ref[i], i, errors)) {
@@ -320,3 +360,4 @@ int main(int argc, char *argv[]) {
 
   return 0;
 }
+
