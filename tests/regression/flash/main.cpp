@@ -176,18 +176,34 @@ int main(int argc, char *argv[]) {
     block_size_c = 8;
     block_size_r = 8;
   }
+  std::cout << "backend: " << (kernel_type_flag == 1 ? "TCU" : "SIMT") << std::endl;
 
   uint32_t size = N * d;
   uint32_t buf_size = size * sizeof(TYPE);
   uint32_t group_size = block_size_r;
 
-  uint32_t local_mem = (block_size_r + 2 * block_size_c) * d * sizeof(TYPE);
+  // Calculate local memory requirements based on kernel type
+  uint32_t local_mem;
+  if (kernel_type_flag == 1) {
+    // TCU path: 3x8x8 fp16 + 8x8 fp32 + 8 fp32 + 8 fp32 + 64 fp32
+    local_mem = 3 * 8 * 8 * 2 + 8 * 8 * 4 + 8 * 4 + 8 * 4 + 64 * 4;  // 960 bytes
+  } else {
+    // SIMT path: (block_size_r + 2 * block_size_c) * d * sizeof(float)
+    local_mem = (block_size_r + 2 * block_size_c) * d * sizeof(TYPE);
+  }
 
   // check work group occupancy
   uint32_t max_localmem;
   RT_CHECK(vx_check_occupancy(device, group_size, &max_localmem));
   std::cout << "occupancy: max_localmem=" << max_localmem << " bytes" << std::endl;
-  RT_CHECK(max_localmem < local_mem);
+  
+  // Check if we have enough local memory (fix backwards logic)
+  if (local_mem > max_localmem) {
+    std::cout << "Error: required local_mem (" << local_mem 
+              << " bytes) exceeds max_localmem (" << max_localmem << " bytes)" << std::endl;
+    cleanup();
+    exit(-1);
+  }
 
   std::cout << "data type: " << Comparator<float>::type_str() << std::endl;
   std::cout << "sequence length: " << N << std::endl;

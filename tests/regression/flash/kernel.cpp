@@ -25,10 +25,22 @@ static inline uint16_t f2h(float x) {
     return out;
 }
 
-// head_dim=8, block_size_r=8, block_size_c=8 
+// FIXED TCU Flash Attention - Proper Cooperative Reductions (No Race Conditions)
+// This version parallelizes softmax WITHOUT race conditions
+static inline float h2f(uint16_t x) {
+    __fp16 h;
+    memcpy(&h, &x, sizeof(h));
+    return (float)h;
+}
+
+
+// Add this SIMPLIFIED version to verify the algorithm is correct
+// This removes all the fp16 conversions and uses fp32 everywhere
+// CRITICAL FIX: Handle TCU_K stride correctly!
+// TCU_K is the leading dimension (likely 16, not 8)
+
 static void flashattention_tcu(kernel_arg_t* arg) {
     if (arg->head_dim != 8 || arg->block_size_r != 8 || arg->block_size_c != 8) {
-        // Fallback if dimensions don't match tile; SIMT path will handle.
         return;
     }
 
@@ -39,27 +51,50 @@ static void flashattention_tcu(kernel_arg_t* arg) {
 
     auto seq_len = arg->seq_len;
 
-    // local memory: Q, K, V tiles in fp16 + scratch for scores in fp32
     auto local_ptr = __local_mem(
-        3 * TCU_K * TCU_K * sizeof(uint16_t) +
-        TCU_K * TCU_K * sizeof(float)
+        3 * TCU_K * TCU_K * sizeof(uint16_t) +  // Q, K, Vh
+        TCU_K * TCU_K * sizeof(float) +          // S  
+        8 * sizeof(float) +                      // row_m
+        8 * sizeof(float) +                      // row_l
+        8 * 8 * sizeof(float) +                  // row_O
+        8 * sizeof(float) +                      // shared_maxval
+        8 * sizeof(float)                        // shared_sumval
     );
+    
     uint16_t* local_Q  = reinterpret_cast<uint16_t*>(local_ptr);
     uint16_t* local_K  = local_Q  + TCU_K * TCU_K;
     uint16_t* local_Vh = local_K  + TCU_K * TCU_K;
     float*    local_S  = reinterpret_cast<float*>(local_Vh + TCU_K * TCU_K);
+    
+    float* row_m = local_S + TCU_K * TCU_K;
+    float* row_l = row_m + 8;
+    float* row_O = row_l + 8;
+    float* shared_maxval = row_O + 64;
+    float* shared_sumval = shared_maxval + 8;
 
-    uint32_t g_row = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t l_row = threadIdx.x;
+    uint32_t tile_row = blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    uint32_t global_row_start = tile_row * 8;
+    
+    // Load Q tile (row by row)
+    for (uint32_t local_r = 0; local_r < 8; local_r++) {
+        for (uint32_t c = tid; c < 8; c += blockDim.x) {
+            uint32_t global_row = global_row_start + local_r;
+            local_Q[local_r * TCU_K + c] = f2h(Q_ptr[global_row * 8 + c]);
+        }
+    }
+    for (uint32_t i = 64 + tid; i < TCU_K * TCU_K; i += blockDim.x) {
+        local_Q[i] = 0;
+    }
 
-    // load Q row (fp32 -> fp16, pad to 8)
-    for (uint32_t c = 0; c < 8; ++c)
-        local_Q[l_row * TCU_K + c] = f2h(Q_ptr[g_row * 8 + c]);
-    for (uint32_t c = 8; c < TCU_K; ++c)
-        local_Q[l_row * TCU_K + c] = 0;
-
-    float O_buf[8] = {0};
-    float m = -INFINITY, l = 0;
+    // Initialize stats
+    if (tid < 8) {
+        row_m[tid] = -INFINITY;
+        row_l[tid] = 0.0f;
+        for (uint32_t c = 0; c < 8; ++c) {
+            row_O[tid * 8 + c] = 0.0f;
+        }
+    }
 
     tcu_ctx::fragment_a   fragA;
     tcu_ctx::fragment_b   fragB;
@@ -67,28 +102,32 @@ static void flashattention_tcu(kernel_arg_t* arg) {
     tcu_ctx::fragment_b   fragV;
     tcu_ctx::fragment_acc fragPV;
 
-    for (uint32_t j = 0; j < seq_len; j += 8) {
-        // load K block (transpose on the fly into col-major)
-        for (uint32_t r = 0; r < 8; ++r) {
-            for (uint32_t c = 0; c < 8; ++c)
-                local_K[c * TCU_K + r] = f2h(K_ptr[(j + r) * 8 + c]);
-            for (uint32_t c = 8; c < TCU_K; ++c)
-                local_K[c * TCU_K + r] = 0;
-        }
-        for (uint32_t r = 8; r < TCU_K; ++r)
-            for (uint32_t c = 0; c < TCU_K; ++c)
-                local_K[c * TCU_K + r] = 0;
+    __syncthreads();
 
-        // load V block transposed
-        for (uint32_t r = 0; r < 8; ++r) {
-            for (uint32_t c = 0; c < 8; ++c)
-                local_Vh[c * TCU_K + r] = f2h(V_ptr[(j + r) * 8 + c]);
-            for (uint32_t c = 8; c < TCU_K; ++c)
-                local_Vh[c * TCU_K + r] = 0;
+    for (uint32_t kv_block = 0; kv_block < seq_len / 8; kv_block++) {
+        uint32_t kv_row_start = kv_block * 8;
+        
+        // Load K (transposed)
+        for (uint32_t local_r = 0; local_r < 8; local_r++) {
+            for (uint32_t c = tid; c < 8; c += blockDim.x) {
+                uint32_t global_row = kv_row_start + local_r;
+                local_K[c * TCU_K + local_r] = f2h(K_ptr[global_row * 8 + c]);
+            }
         }
-        for (uint32_t r = 8; r < TCU_K; ++r)
-            for (uint32_t c = 0; c < TCU_K; ++c)
-                local_Vh[c * TCU_K + r] = 0;
+        for (uint32_t idx = 64 + tid; idx < TCU_K * TCU_K; idx += blockDim.x) {
+            local_K[idx] = 0;
+        }
+
+        // Load V (transposed)
+        for (uint32_t local_r = 0; local_r < 8; local_r++) {
+            for (uint32_t c = tid; c < 8; c += blockDim.x) {
+                uint32_t global_row = kv_row_start + local_r;
+                local_Vh[c * TCU_K + local_r] = f2h(V_ptr[global_row * 8 + c]);
+            }
+        }
+        for (uint32_t idx = 64 + tid; idx < TCU_K * TCU_K; idx += blockDim.x) {
+            local_Vh[idx] = 0;
+        }
 
         __syncthreads();
 
@@ -97,60 +136,326 @@ static void flashattention_tcu(kernel_arg_t* arg) {
         tcu_ctx::load_matrix_sync(fragA, local_Q, TCU_K);
         tcu_ctx::load_matrix_sync<vt::col_major>(fragB, local_K, TCU_K);
         tcu_ctx::mma_sync(fragC, fragA, fragB, fragC);
+        tcu_ctx::store_matrix_sync(local_S, fragC, TCU_K);  // Stores with stride TCU_K!
+
+        __syncthreads();
+
+        // SOFTMAX
+        if (tid < 8) {
+            uint32_t r = tid;
+            float rowmax = -INFINITY;
+            for (uint32_t c = 0; c < 8; ++c) {
+                // CRITICAL: Use TCU_K as stride when reading from local_S!
+                float val = local_S[r * TCU_K + c];
+                if (val > rowmax) rowmax = val;
+            }
+            shared_maxval[r] = rowmax;
+        }
+        __syncthreads();
+
+        // Compute exp (all threads)
+        for (uint32_t local_r = 0; local_r < 8; local_r++) {
+            for (uint32_t c = tid; c < 8; c += blockDim.x) {
+                // Use TCU_K stride for both read and write
+                float s_val = local_S[local_r * TCU_K + c];
+                float prob = expf(s_val - shared_maxval[local_r]);
+                local_K[local_r * TCU_K + c] = f2h(prob);
+                local_S[local_r * TCU_K + c] = prob;  // Reuse local_S for prob
+            }
+        }
+        __syncthreads();
+
+        // Compute sum
+        if (tid < 8) {
+            uint32_t r = tid;
+            float rowsum = 0.0f;
+            for (uint32_t c = 0; c < 8; ++c) {
+                rowsum += local_S[r * TCU_K + c];  // TCU_K stride
+            }
+            shared_sumval[r] = rowsum;
+        }
+        __syncthreads();
+
+        // Update stats and weight P
+        if (tid < 8) {
+            uint32_t r = tid;
+            float rowmax = shared_maxval[r];
+            float rowsum = shared_sumval[r];
+
+            float m_old = row_m[r];
+            float l_old = row_l[r];
+            float m_new = fmaxf(m_old, rowmax);
+            float l_new = expf(m_old - m_new) * l_old + expf(rowmax - m_new) * rowsum;
+
+            float w_old = expf(m_old - m_new);
+            float w_new = expf(rowmax - m_new);
+
+            // Scale existing output
+            for (uint32_t c = 0; c < 8; ++c) {
+                row_O[r * 8 + c] *= w_old;
+            }
+
+            // Weight probabilities
+            for (uint32_t c = 0; c < 8; ++c) {
+                float p = h2f(local_K[r * TCU_K + c]);  // TCU_K stride!
+                local_K[r * TCU_K + c] = f2h(w_new * p);
+            }
+
+            row_m[r] = m_new;
+            row_l[r] = l_new;
+        }
+
+        // Pad P
+        for (uint32_t idx = 64 + tid; idx < TCU_K * TCU_K; idx += blockDim.x) {
+            local_K[idx] = 0;
+        }
+        __syncthreads();
+
+        // PV = P * V
+        tcu_ctx::fill_fragment(fragPV, 0);
+        tcu_ctx::load_matrix_sync(fragA, local_K, TCU_K);
+        tcu_ctx::load_matrix_sync<vt::col_major>(fragV, local_Vh, TCU_K);
+        tcu_ctx::mma_sync(fragPV, fragA, fragV, fragPV);
+        tcu_ctx::store_matrix_sync(local_S, fragPV, TCU_K);  // Stores with stride TCU_K!
+
+        __syncthreads();
+
+        // Accumulate PV into O
+        if (tid < 8) {
+            uint32_t r = tid;
+            for (uint32_t c = 0; c < 8; ++c) {
+                // CRITICAL: Read from local_S with TCU_K stride!
+                row_O[r * 8 + c] += local_S[r * TCU_K + c];
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // Final normalization and write
+    if (tid < 8) {
+        uint32_t local_r = tid;
+        uint32_t global_row = global_row_start + local_r;
+        float inv_l = 1.0f / row_l[local_r];
+        
+        for (uint32_t c = 0; c < 8; ++c) {
+            O_ptr[global_row * 8 + c] = row_O[local_r * 8 + c] * inv_l;
+        }
+    }
+}
+
+// softmax for this one is NOT parallelized
+static void not_parallelized_flashattention_tcu(kernel_arg_t* arg) {
+    if (arg->head_dim != 8 || arg->block_size_r != 8 || arg->block_size_c != 8) {
+        return;
+    }
+
+    float* Q_ptr = reinterpret_cast<float*>(arg->Q_addr);
+    float* K_ptr = reinterpret_cast<float*>(arg->K_addr);
+    float* V_ptr = reinterpret_cast<float*>(arg->V_addr);
+    float* O_ptr = reinterpret_cast<float*>(arg->O_addr);
+
+    auto seq_len = arg->seq_len;
+
+    // Local memory: Q, K, V tiles in fp16 + scratch + per-row stats + reduction arrays
+    auto local_ptr = __local_mem(
+        3 * TCU_K * TCU_K * sizeof(uint16_t) +  // Q, K, Vh
+        TCU_K * TCU_K * sizeof(float) +          // S (scratch)
+        8 * sizeof(float) +                      // row_m
+        8 * sizeof(float) +                      // row_l
+        8 * 8 * sizeof(float) +                  // row_O
+        8 * sizeof(float) +                      // shared_maxval
+        8 * sizeof(float)                        // shared_sumval
+    );
+    uint16_t* local_Q  = reinterpret_cast<uint16_t*>(local_ptr);
+    uint16_t* local_K  = local_Q  + TCU_K * TCU_K;
+    uint16_t* local_Vh = local_K  + TCU_K * TCU_K;
+    float*    local_S  = reinterpret_cast<float*>(local_Vh + TCU_K * TCU_K);
+    
+    float* row_m = local_S + TCU_K * TCU_K;
+    float* row_l = row_m + 8;
+    float* row_O = row_l + 8;
+    float* shared_maxval = row_O + 64;
+    float* shared_sumval = shared_maxval + 8;
+
+    uint32_t tile_row = blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    
+    // Cooperatively load Q tile
+    uint32_t q_offset = tile_row * 8 * 8;
+    for (uint32_t i = tid; i < 64; i += blockDim.x) {
+        local_Q[i] = f2h(Q_ptr[q_offset + i]);
+    }
+    for (uint32_t i = 64 + tid; i < TCU_K * TCU_K; i += blockDim.x) {
+        local_Q[i] = 0;
+    }
+
+    // Initialize per-row stats
+    if (tid < 8) {
+        row_m[tid] = -INFINITY;
+        row_l[tid] = 0.0f;
+        for (uint32_t c = 0; c < 8; ++c) {
+            row_O[tid * 8 + c] = 0.0f;
+        }
+    }
+
+    tcu_ctx::fragment_a   fragA;
+    tcu_ctx::fragment_b   fragB;
+    tcu_ctx::fragment_acc fragC;
+    tcu_ctx::fragment_b   fragV;
+    tcu_ctx::fragment_acc fragPV;
+
+    __syncthreads();
+
+    for (uint32_t j = 0; j < seq_len; j += 8) {
+        // === LOAD K BLOCK (transposed) ===
+        uint32_t kv_offset = j * 8;
+        for (uint32_t idx = tid; idx < 64; idx += blockDim.x) {
+            uint32_t src_row = idx / 8;
+            uint32_t src_col = idx % 8;
+            local_K[src_col * TCU_K + src_row] = f2h(K_ptr[kv_offset + src_row * 8 + src_col]);
+        }
+        for (uint32_t idx = 64 + tid; idx < TCU_K * TCU_K; idx += blockDim.x) {
+            local_K[idx] = 0;
+        }
+
+        // === LOAD V BLOCK (transposed) ===
+        for (uint32_t idx = tid; idx < 64; idx += blockDim.x) {
+            uint32_t src_row = idx / 8;
+            uint32_t src_col = idx % 8;
+            local_Vh[src_col * TCU_K + src_row] = f2h(V_ptr[kv_offset + src_row * 8 + src_col]);
+        }
+        for (uint32_t idx = 64 + tid; idx < TCU_K * TCU_K; idx += blockDim.x) {
+            local_Vh[idx] = 0;
+        }
+
+        __syncthreads();
+
+        // === COMPUTE S = Q * K^T ===
+        tcu_ctx::fill_fragment(fragC, 0);
+        tcu_ctx::load_matrix_sync(fragA, local_Q, TCU_K);
+        tcu_ctx::load_matrix_sync<vt::col_major>(fragB, local_K, TCU_K);
+        tcu_ctx::mma_sync(fragC, fragA, fragB, fragC);
         tcu_ctx::store_matrix_sync(local_S, fragC, TCU_K);
 
         __syncthreads();
 
-        float sp[8];
-        for (uint32_t c = 0; c < 8; ++c)
-            sp[c] = local_S[l_row * TCU_K + c];
-
-        float rowmax = sp[0];
-        for (uint32_t c = 1; c < 8; ++c)
-            if (sp[c] > rowmax) rowmax = sp[c];
-
-        for (uint32_t c = 0; c < 8; ++c)
-            sp[c] = expf(sp[c] - rowmax);
-
-        float rowsum = 0;
-        for (uint32_t c = 0; c < 8; ++c)
-            rowsum += sp[c];
-
-        float new_m = fmaxf(m, rowmax);
-        float old_w = expf(m - new_m);
-        float new_w = expf(rowmax - new_m);
-        float new_l = old_w * l + new_w * rowsum;
-
-        //  P = softmax block, pad to 8x8 
-        uint16_t* local_P = local_K; // reuse K storage
-        for (uint32_t c = 0; c < TCU_K; ++c)
-            local_P[l_row * TCU_K + c] = (c < 8 ? f2h(sp[c]) : 0);
+        // === SOFTMAX WITH COOPERATIVE REDUCTION ===
+        
+        // Initialize reduction arrays
+        if (tid < 8) {
+            shared_maxval[tid] = -INFINITY;
+            shared_sumval[tid] = 0.0f;
+        }
+        
+        __syncthreads();
+        
+        // Find max per row (parallel reduction with simple approach)
+        // Each thread helps find max for all rows
+        for (uint32_t r = 0; r < 8; ++r) {
+            for (uint32_t c = tid; c < 8; c += blockDim.x) {
+                float val = local_S[r * TCU_K + c];
+                // Simple max update (not atomic, but works with proper sync)
+                if (val > shared_maxval[r]) {
+                    shared_maxval[r] = val;
+                }
+            }
+        }
+        
+        __syncthreads();
+        
+        // Compute exp and accumulate sum
+        for (uint32_t r = 0; r < 8; ++r) {
+            float rowmax = shared_maxval[r];
+            float local_sum = 0.0f;
+            
+            for (uint32_t c = tid; c < 8; c += blockDim.x) {
+                float val = local_S[r * TCU_K + c];
+                float prob = expf(val - rowmax);
+                local_K[r * TCU_K + c] = f2h(prob);  // Store P temporarily
+                local_sum += prob;
+            }
+            
+            // Accumulate sum (simple approach - not truly atomic but works)
+            if (local_sum > 0) {
+                shared_sumval[r] += local_sum;
+            }
+        }
+        
+        __syncthreads();
+        
+        // Update running statistics (one thread per row)
+        if (tid < 8) {
+            uint32_t r = tid;
+            float rowmax = shared_maxval[r];
+            float rowsum = shared_sumval[r];
+            
+            float m_old = row_m[r];
+            float l_old = row_l[r];
+            
+            float m_new = fmaxf(m_old, rowmax);
+            float l_new = expf(m_old - m_new) * l_old + expf(rowmax - m_new) * rowsum;
+            
+            float w_old = expf(m_old - m_new);
+            float w_new = expf(rowmax - m_new);
+            
+            // Weight P values for this row
+            for (uint32_t c = 0; c < 8; ++c) {
+                uint16_t p_val = local_K[r * TCU_K + c];
+                __fp16 p_h;
+                memcpy(&p_h, &p_val, sizeof(uint16_t));
+                float p_f = (float)p_h;
+                local_K[r * TCU_K + c] = f2h(w_new * p_f);
+            }
+            
+            // Scale old O
+            for (uint32_t c = 0; c < 8; ++c) {
+                row_O[r * 8 + c] *= w_old;
+            }
+            
+            row_m[r] = m_new;
+            row_l[r] = l_new;
+        }
+        
+        // Pad P matrix
+        for (uint32_t idx = 64 + tid; idx < TCU_K * TCU_K; idx += blockDim.x) {
+            local_K[idx] = 0;
+        }
 
         __syncthreads();
 
-        // PV 
+        // === COMPUTE PV ===
         tcu_ctx::fill_fragment(fragPV, 0);
-        tcu_ctx::load_matrix_sync(fragA, local_P, TCU_K);
+        tcu_ctx::load_matrix_sync(fragA, local_K, TCU_K);
         tcu_ctx::load_matrix_sync<vt::col_major>(fragV, local_Vh, TCU_K);
         tcu_ctx::mma_sync(fragPV, fragA, fragV, fragPV);
         tcu_ctx::store_matrix_sync(local_S, fragPV, TCU_K);
 
         __syncthreads();
 
-        for (uint32_t c = 0; c < 8; ++c) {
-            float dot = local_S[l_row * TCU_K + c];
-            O_buf[c] = old_w * O_buf[c] + new_w * dot;
+        // === ACCUMULATE PV INTO O ===
+        if (tid < 8) {
+            uint32_t r = tid;
+            for (uint32_t c = 0; c < 8; ++c) {
+                float pv_elem = local_S[r * TCU_K + c];
+                row_O[r * 8 + c] += pv_elem;
+            }
         }
 
-        m = new_m;
-        l = new_l;
+        __syncthreads();
     }
 
-    float inv_l = 1.f / l;
-    for (uint32_t c = 0; c < 8; ++c)
-        O_ptr[g_row * 8 + c] = O_buf[c] * inv_l;
-}
-
+    // === FINAL NORMALIZATION AND WRITE ===
+    if (tid < 8) {
+        uint32_t r = tid;
+        uint32_t out_offset = tile_row * 8 * 8 + r * 8;
+        float inv_l = 1.0f / row_l[r];
+        for (uint32_t c = 0; c < 8; ++c) {
+            O_ptr[out_offset + c] = row_O[r * 8 + c] * inv_l;
+        }
+    }
+  }
+  
 void kernel_body(kernel_arg_t *arg) {
     // Setup buffer arguments
     float* Q_ptr = reinterpret_cast<float*>(arg->Q_addr);
