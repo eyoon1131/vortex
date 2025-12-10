@@ -1,4 +1,5 @@
 #include <vx_spawn.h>
+#include <vx_print.h>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -6,11 +7,8 @@
 #include <cstdio>
 #include "common.h"
 
-// Need to be known at compile-time
-static constexpr uint32_t HEAD_DIM = 8;
-static constexpr uint32_t BLOCK_SIZE_C = 4;
-
-void kernel_body(kernel_arg_t *arg) {
+template<uint32_t HEAD_DIM, uint32_t BLOCK_SIZE_C>
+void flash_kernel_body(kernel_arg_t *arg) {
     // Setup buffer arguments
     float* Q_ptr = reinterpret_cast<float*>(arg->Q_addr);
     float* K_ptr = reinterpret_cast<float*>(arg->K_addr);
@@ -35,13 +33,11 @@ void kernel_body(kernel_arg_t *arg) {
     auto l_row_offset = l_row * HEAD_DIM;
 
     // Load Q_i from HBM
-    #pragma clang loop unroll(full)
     for (uint32_t col = 0; col < HEAD_DIM; ++col)
         local_Q[l_row_offset + col] = Q_ptr[g_row_offset + col];
 
     // Initialize O_i in registers
     float O_buf[HEAD_DIM];
-    #pragma clang loop unroll(full)
     for (uint32_t col = 0; col < HEAD_DIM; ++col)
       O_buf[col] = 0.0f;
 
@@ -60,7 +56,6 @@ void kernel_body(kernel_arg_t *arg) {
         uint32_t block_offset = j * HEAD_DIM;
 
         // Load K_j and V_j^T
-        // BLOCK_SIZE_C % block_size_r = 0
         for (uint32_t k = 0; k < BLOCK_SIZE_C / block_size_r; ++k) {
           auto row = k * block_size_r + l_row;
           auto row_offset = row * HEAD_DIM;
@@ -74,30 +69,25 @@ void kernel_body(kernel_arg_t *arg) {
 
         __syncthreads();
 
-        // Thread's row of S_ij = Q_i · K_j^T
         // Compute dot product of thread's Q row and each row of K_j
-        #pragma clang loop unroll(full)
+        for (uint32_t k = 0; k < BLOCK_SIZE_C; ++k)
+          sp_buf[k] = 0;
         for (uint32_t k = 0; k < BLOCK_SIZE_C; ++k) {
-          // sp_buf[k] = 0;
-          #pragma clang loop unroll(full)
           for (uint32_t elem = 0; elem < HEAD_DIM; ++elem)
             sp_buf[k] += Q_row[elem] * local_K[k * HEAD_DIM + elem];
         }
 
         // Row max
         float rowmax = sp_buf[0];
-        #pragma clang loop unroll(full)
         for (uint32_t k = 1; k < BLOCK_SIZE_C; ++k)
-          if (sp_buf[k] > rowmax) rowmax = sp_buf[k];
+          rowmax = (sp_buf[k] > rowmax ? sp_buf[k] : rowmax);
 
         // Threads row of P_ij
-        #pragma clang loop unroll(full)
         for (uint32_t k = 0; k < BLOCK_SIZE_C; ++k)
           sp_buf[k] = expf(sp_buf[k] - rowmax);
 
         // Row sum
         float rowsum = 0;
-        #pragma clang loop unroll(full)
         for (uint32_t k = 0; k < BLOCK_SIZE_C; ++k)
           rowsum += sp_buf[k];
 
@@ -110,13 +100,12 @@ void kernel_body(kernel_arg_t *arg) {
         float new_weight = expf(rowmax - new_m);
 
         // Update O
-        #pragma clang loop unroll(full)
         for (uint32_t k = 0; k < HEAD_DIM; ++k) {
           // Compute dot product of thread's P_ij row and each col of V_j
           float dot = 0;
-          #pragma clang loop unroll(full)
-          for (uint32_t elem = 0; elem < BLOCK_SIZE_C; ++elem)
+          for (uint32_t elem = 0; elem < BLOCK_SIZE_C; ++elem) {
             dot += sp_buf[elem] * local_V[k * BLOCK_SIZE_C + elem];
+          }
           O_buf[k] = old_weight * O_buf[k] + new_weight * dot;
         }
 
@@ -124,21 +113,88 @@ void kernel_body(kernel_arg_t *arg) {
         m = new_m;
         l = new_l;
 
-        // #pragma clang loop unroll(full)
-        // for (uint32_t k = 0; k < BLOCK_SIZE_C; ++k)
-        //     sp_buf[k] = 0;
-
-        // __syncthreads();
+        __syncthreads();
     }
 
     // Normalize O and write back to HBM
     float inv_l = 1.0f / l;
-    #pragma clang loop unroll(full)
     for (uint32_t k = 0; k < HEAD_DIM; ++k)
       O_ptr[g_row_offset + k] = O_buf[k] * inv_l;
 }
 
+void flash_kernel_entry(kernel_arg_t* arg) {
+  switch (arg->head_dim) {
+    case 1:
+      switch (arg->block_size_c) {
+        case 4:
+          flash_kernel_body<1,4>(arg);
+          return;
+        case 8:
+          flash_kernel_body<1,8>(arg);
+          return;
+        case 16:
+          flash_kernel_body<1,16>(arg);
+          return;
+      }
+      break;
+    case 2:
+      switch (arg->block_size_c) {
+        case 4:
+          flash_kernel_body<2,4>(arg);
+          return;
+        case 8:
+          flash_kernel_body<2,8>(arg);
+          return;
+        case 16:
+          flash_kernel_body<2,16>(arg);
+          return;
+      }
+      break;
+    case 4:
+      switch (arg->block_size_c) {
+        case 4:
+          flash_kernel_body<4,4>(arg);
+          return;
+        case 8:
+          flash_kernel_body<4,8>(arg);
+          return;
+        case 16:
+          flash_kernel_body<4,16>(arg);
+          return;
+      }
+      break;
+    case 8:
+      switch (arg->block_size_c) {
+        case 4:
+          flash_kernel_body<8,4>(arg);
+          return;
+        case 8:
+          flash_kernel_body<8,8>(arg);
+          return;
+        case 16:
+          flash_kernel_body<8,16>(arg);
+          return;
+      }
+      break;
+    case 16:
+      switch (arg->block_size_c) {
+        case 4:
+          flash_kernel_body<16,4>(arg);
+          return;
+        case 8:
+          flash_kernel_body<16,8>(arg);
+          return;
+        case 16:
+          flash_kernel_body<16,16>(arg);
+          return;
+      }
+      break;
+    }
+  
+  vx_printf("Unsupported HEAD_DIM or BLOCK_SIZE_C\n");
+}
+
 int main() {
   auto arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
-	return vx_spawn_threads(1, arg->grid_dim, arg->block_dim, (vx_kernel_func_cb)kernel_body, arg);
+	return vx_spawn_threads(1, arg->grid_dim, arg->block_dim, (vx_kernel_func_cb)flash_kernel_entry, arg);
 }

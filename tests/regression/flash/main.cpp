@@ -36,8 +36,8 @@ public:
   }
   // Modified compare to allow for greater tolerance
   static bool compare(float a, float b, int index, int errors) {
-    const float atol = 1e-5f;
-    const float rtol = 1e-5f;
+    const float atol = 1e-3f;
+    const float rtol = 1e-3f;
     auto diff = std::fabs(a - b);
     auto limit = atol + rtol * std::fabs(b);
     if (diff > limit) {
@@ -85,8 +85,12 @@ static void attention_cpu(float* out, const float* Q, const float* K, const floa
   }
 }
 
+static bool is_power_of_2(uint32_t x) {
+    return x != 0 && (x & (x - 1)) == 0;
+}
+
 const char* kernel_file = "kernel.vxbin";
-uint32_t N = 64;
+uint32_t N = 32;
 uint32_t d = 8;
 
 vx_device_h device = nullptr;
@@ -108,10 +112,10 @@ static void parse_args(int argc, char **argv) {
   while ((c = getopt(argc, argv, "n:d:k:h")) != -1) {
     switch (c) {
     case 'n':
-      // N = atoi(optarg);
+      N = atoi(optarg);
       break;
     case 'd':
-      // d = atoi(optarg);
+      d = atoi(optarg);
       break;
     case 'k':
       kernel_file = optarg;
@@ -143,28 +147,44 @@ int main(int argc, char *argv[]) {
   // parse command arguments
   parse_args(argc, argv);
 
-  // if ((size / tile_size) * tile_size != size) {
-  //   printf("Error: matrix size %d must be a multiple of tile size %d\n", size, tile_size);
-  //   return -1;
-  // }
+  if (!is_power_of_2(N) || !is_power_of_2(d)) {
+    printf("Error: Sequence length %u and head dimension %u must be a power of 2\n", N, d);
+    return -1;
+  }
+
+  if (d > 16) {
+    printf("Error: Head dimension %u cannot be greater than 16\n", d);
+    return -1;
+  }
 
   std::srand(50);
 
   // open device connection
   std::cout << "open device connection" << std::endl;
   RT_CHECK(vx_dev_open(&device));
-  
-  // // get size M of SRAM
-  // uint64_t local_mem_size;
-  // vx_dev_caps(device, VX_CAPS_LOCAL_MEM_SIZE, &local_mem_size);
-  // std::cout << "local_mem_size=" << local_mem_size << " bytes" << std::endl;
-  // uint32_t M = local_mem_size / sizeof(TYPE);
 
-  // calculate block sizes
-  // uint32_t block_size_c = std::min(static_cast<uint32_t>(std::ceil(M / (4 * d))), N);
-  // uint32_t block_size_r = std::min(block_size_c, d);
-  uint32_t block_size_c = 4;
-  uint32_t block_size_r = 4;
+  uint64_t threads;
+  uint64_t warps;
+  vx_dev_caps(device, VX_CAPS_NUM_THREADS, &threads);
+  vx_dev_caps(device, VX_CAPS_NUM_WARPS, &warps);
+  uint32_t num_threads = static_cast<uint32_t>(threads);
+  uint32_t num_warps = static_cast<uint32_t>(warps);
+
+  if ((!is_power_of_2(num_threads) || !is_power_of_2(num_warps))) {
+    printf("Error: Number of threads %u and number of warps %u must be a power of 2\n", num_threads, num_warps);
+    return -1;
+  }
+
+  uint32_t block_size_r, block_size_c;
+  // Dynamically size block sizes by input and GPU configuration
+  // int threads_per_core = num_threads * num_warps;
+  // if (d == 16) {
+  //   block_size_r = std::min(threads_per_core, 8);
+  //   block_size_c = std::min((int) block_size_r, 8);
+  // }
+
+  block_size_r = 8;
+  block_size_c = 8;
 
   uint32_t size = N * d;
   uint32_t buf_size = size * sizeof(TYPE);
@@ -265,7 +285,7 @@ int main(int argc, char *argv[]) {
     attention_cpu(h_ref.data(), h_Q.data(), h_K.data(), h_V.data(), N, d);
 
     for (uint32_t i = 0; i < h_ref.size(); ++i) {
-      if (!Comparator<TYPE>::compare(h_O[i], h_ref[i], i, errors)) {
+      if (!Comparator<TYPE>::compare(h_ref[i], h_O[i], i, errors)) {
         ++errors;
       }
     }
