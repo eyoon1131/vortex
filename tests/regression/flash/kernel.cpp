@@ -1,14 +1,155 @@
 #include <vx_spawn.h>
+#include <vx_tensor.h>
+#include <VX_config.h>
 #include <cmath>
 #include <limits>
 #include <numeric>
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include "common.h"
 
-// Need to be known at compile-time
+// SIMT path constants (need to know at compile time for unrolling)
 static constexpr uint32_t HEAD_DIM = 8;
 static constexpr uint32_t BLOCK_SIZE_C = 4;
+
+// TCU tile shape (8x8x8 fp16 inputs, fp32 accumulate)
+namespace vt = vortex::tensor;
+using tcu_ctx = vt::wmma_context<8, vt::fp16, vt::fp32>;
+static constexpr uint32_t TCU_K = tcu_ctx::tileK;
+
+static inline uint16_t f2h(float x) {
+    __fp16 h = (__fp16)x;
+    uint16_t out;
+    memcpy(&out, &h, sizeof(out));
+    return out;
+}
+
+// head_dim=8, block_size_r=8, block_size_c=8 
+static void flashattention_tcu(kernel_arg_t* arg) {
+    if (arg->head_dim != 8 || arg->block_size_r != 8 || arg->block_size_c != 8) {
+        // Fallback if dimensions don't match tile; SIMT path will handle.
+        return;
+    }
+
+    float* Q_ptr = reinterpret_cast<float*>(arg->Q_addr);
+    float* K_ptr = reinterpret_cast<float*>(arg->K_addr);
+    float* V_ptr = reinterpret_cast<float*>(arg->V_addr);
+    float* O_ptr = reinterpret_cast<float*>(arg->O_addr);
+
+    auto seq_len = arg->seq_len;
+
+    // local memory: Q, K, V tiles in fp16 + scratch for scores in fp32
+    auto local_ptr = __local_mem(
+        3 * TCU_K * TCU_K * sizeof(uint16_t) +
+        TCU_K * TCU_K * sizeof(float)
+    );
+    uint16_t* local_Q  = reinterpret_cast<uint16_t*>(local_ptr);
+    uint16_t* local_K  = local_Q  + TCU_K * TCU_K;
+    uint16_t* local_Vh = local_K  + TCU_K * TCU_K;
+    float*    local_S  = reinterpret_cast<float*>(local_Vh + TCU_K * TCU_K);
+
+    uint32_t g_row = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t l_row = threadIdx.x;
+
+    // load Q row (fp32 -> fp16, pad to 8)
+    for (uint32_t c = 0; c < 8; ++c)
+        local_Q[l_row * TCU_K + c] = f2h(Q_ptr[g_row * 8 + c]);
+    for (uint32_t c = 8; c < TCU_K; ++c)
+        local_Q[l_row * TCU_K + c] = 0;
+
+    float O_buf[8] = {0};
+    float m = -INFINITY, l = 0;
+
+    tcu_ctx::fragment_a   fragA;
+    tcu_ctx::fragment_b   fragB;
+    tcu_ctx::fragment_acc fragC;
+    tcu_ctx::fragment_b   fragV;
+    tcu_ctx::fragment_acc fragPV;
+
+    for (uint32_t j = 0; j < seq_len; j += 8) {
+        // load K block (transpose on the fly into col-major)
+        for (uint32_t r = 0; r < 8; ++r) {
+            for (uint32_t c = 0; c < 8; ++c)
+                local_K[c * TCU_K + r] = f2h(K_ptr[(j + r) * 8 + c]);
+            for (uint32_t c = 8; c < TCU_K; ++c)
+                local_K[c * TCU_K + r] = 0;
+        }
+        for (uint32_t r = 8; r < TCU_K; ++r)
+            for (uint32_t c = 0; c < TCU_K; ++c)
+                local_K[c * TCU_K + r] = 0;
+
+        // load V block transposed
+        for (uint32_t r = 0; r < 8; ++r) {
+            for (uint32_t c = 0; c < 8; ++c)
+                local_Vh[c * TCU_K + r] = f2h(V_ptr[(j + r) * 8 + c]);
+            for (uint32_t c = 8; c < TCU_K; ++c)
+                local_Vh[c * TCU_K + r] = 0;
+        }
+        for (uint32_t r = 8; r < TCU_K; ++r)
+            for (uint32_t c = 0; c < TCU_K; ++c)
+                local_Vh[c * TCU_K + r] = 0;
+
+        __syncthreads();
+
+        // S = Q * K^T
+        tcu_ctx::fill_fragment(fragC, 0);
+        tcu_ctx::load_matrix_sync(fragA, local_Q, TCU_K);
+        tcu_ctx::load_matrix_sync<vt::col_major>(fragB, local_K, TCU_K);
+        tcu_ctx::mma_sync(fragC, fragA, fragB, fragC);
+        tcu_ctx::store_matrix_sync(local_S, fragC, TCU_K);
+
+        __syncthreads();
+
+        float sp[8];
+        for (uint32_t c = 0; c < 8; ++c)
+            sp[c] = local_S[l_row * TCU_K + c];
+
+        float rowmax = sp[0];
+        for (uint32_t c = 1; c < 8; ++c)
+            if (sp[c] > rowmax) rowmax = sp[c];
+
+        for (uint32_t c = 0; c < 8; ++c)
+            sp[c] = expf(sp[c] - rowmax);
+
+        float rowsum = 0;
+        for (uint32_t c = 0; c < 8; ++c)
+            rowsum += sp[c];
+
+        float new_m = fmaxf(m, rowmax);
+        float old_w = expf(m - new_m);
+        float new_w = expf(rowmax - new_m);
+        float new_l = old_w * l + new_w * rowsum;
+
+        //  P = softmax block, pad to 8x8 
+        uint16_t* local_P = local_K; // reuse K storage
+        for (uint32_t c = 0; c < TCU_K; ++c)
+            local_P[l_row * TCU_K + c] = (c < 8 ? f2h(sp[c]) : 0);
+
+        __syncthreads();
+
+        // PV 
+        tcu_ctx::fill_fragment(fragPV, 0);
+        tcu_ctx::load_matrix_sync(fragA, local_P, TCU_K);
+        tcu_ctx::load_matrix_sync<vt::col_major>(fragV, local_Vh, TCU_K);
+        tcu_ctx::mma_sync(fragPV, fragA, fragV, fragPV);
+        tcu_ctx::store_matrix_sync(local_S, fragPV, TCU_K);
+
+        __syncthreads();
+
+        for (uint32_t c = 0; c < 8; ++c) {
+            float dot = local_S[l_row * TCU_K + c];
+            O_buf[c] = old_w * O_buf[c] + new_w * dot;
+        }
+
+        m = new_m;
+        l = new_l;
+    }
+
+    float inv_l = 1.f / l;
+    for (uint32_t c = 0; c < 8; ++c)
+        O_ptr[g_row * 8 + c] = O_buf[c] * inv_l;
+}
 
 void kernel_body(kernel_arg_t *arg) {
     // Setup buffer arguments
@@ -123,12 +264,6 @@ void kernel_body(kernel_arg_t *arg) {
         // Update m and l for next block
         m = new_m;
         l = new_l;
-
-        // #pragma clang loop unroll(full)
-        // for (uint32_t k = 0; k < BLOCK_SIZE_C; ++k)
-        //     sp_buf[k] = 0;
-
-        // __syncthreads();
     }
 
     // Normalize O and write back to HBM
@@ -138,7 +273,22 @@ void kernel_body(kernel_arg_t *arg) {
       O_ptr[g_row_offset + k] = O_buf[k] * inv_l;
 }
 
+// TCU when kernel_type == 1 and dims match, else SIMT.
+void kernel_body_dispatch(kernel_arg_t* arg) {
+    if (arg->kernel_type == 1 && arg->head_dim == 8 && arg->block_size_r == 8 && arg->block_size_c == 8) {
+        flashattention_tcu(arg);
+    } else {
+        kernel_body(arg);
+    }
+}
+
 int main() {
-  auto arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
-	return vx_spawn_threads(1, arg->grid_dim, arg->block_dim, (vx_kernel_func_cb)kernel_body, arg);
+    auto arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
+    return vx_spawn_threads(
+        1,
+        arg->grid_dim,
+        arg->block_dim,
+        (vx_kernel_func_cb)kernel_body_dispatch,
+        arg
+    );
 }

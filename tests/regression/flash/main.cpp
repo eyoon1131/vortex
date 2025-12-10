@@ -5,6 +5,7 @@
 #include <vortex.h>
 #include <cmath>
 #include <algorithm>
+#include <cstring>
 #include "common.h"
 
 #define RT_CHECK(_expr)                                         \
@@ -96,16 +97,17 @@ vx_buffer_h V_buffer = nullptr;
 vx_buffer_h O_buffer = nullptr;
 vx_buffer_h krnl_buffer = nullptr;
 vx_buffer_h args_buffer = nullptr;
+int kernel_type_flag = 0;   // default: SIMT backend
 kernel_arg_t kernel_arg = {};
 
 static void show_usage() {
    std::cout << "Vortex Test." << std::endl;
-   std::cout << "Usage: [-k: kernel] [-n:sequence_len] [-d:head_dim] [-h: help]" << std::endl;
+   std::cout << "Usage: [-k: kernel] [-n:sequence_len] [-d:head_dim] [-t: kernel_type (0=SIMT,1=TCU)] [-h: help]" << std::endl;
 }
 
 static void parse_args(int argc, char **argv) {
   int c;
-  while ((c = getopt(argc, argv, "n:d:k:h")) != -1) {
+  while ((c = getopt(argc, argv, "n:d:k:t:h")) != -1) {
     switch (c) {
     case 'n':
       // N = atoi(optarg);
@@ -115,6 +117,9 @@ static void parse_args(int argc, char **argv) {
       break;
     case 'k':
       kernel_file = optarg;
+      break;
+    case 't':
+      kernel_type_flag = atoi(optarg);   // 0 = SIMT, 1 = TCU
       break;
     case 'h':
       show_usage();
@@ -166,6 +171,12 @@ int main(int argc, char *argv[]) {
   uint32_t block_size_c = 4;
   uint32_t block_size_r = 4;
 
+  // For TCU path, enforce 8x8 tiles (matches kernel expectations)
+  if (kernel_type_flag == 1) {
+    block_size_c = 8;
+    block_size_r = 8;
+  }
+
   uint32_t size = N * d;
   uint32_t buf_size = size * sizeof(TYPE);
   uint32_t group_size = block_size_r;
@@ -190,6 +201,9 @@ int main(int argc, char *argv[]) {
   kernel_arg.head_dim = d;
   kernel_arg.block_size_r = block_size_r;
   kernel_arg.block_size_c = block_size_c;
+  kernel_arg.kernel_type = kernel_type_flag;
+
+  std::cout << "kernel_type: " << kernel_arg.kernel_type << std::endl;
 
   // allocate device memory
   std::cout << "allocate device memory" << std::endl;
