@@ -89,8 +89,9 @@ static bool is_power_of_2(uint32_t x) {
 }
 
 const char* kernel_file = "kernel.vxbin";
-uint32_t N = 32;
+uint32_t N = 64;
 uint32_t d = 8;
+uint32_t kernel_type_flag = 0;   // default: SIMT backend
 
 vx_device_h device = nullptr;
 vx_buffer_h Q_buffer = nullptr;
@@ -103,12 +104,12 @@ kernel_arg_t kernel_arg = {};
 
 static void show_usage() {
    std::cout << "Vortex Test." << std::endl;
-   std::cout << "Usage: [-k: kernel] [-n:sequence_len] [-d:head_dim] [-h: help]" << std::endl;
+   std::cout << "Usage: [-k: kernel] [-n:sequence_len] [-d:head_dim] [-t: kernel_type (0=SIMT, 1=TCU)] [-h: help]" << std::endl;
 }
 
 static void parse_args(int argc, char **argv) {
   int c;
-  while ((c = getopt(argc, argv, "n:d:k:h")) != -1) {
+  while ((c = getopt(argc, argv, "n:d:k:t:h")) != -1) {
     switch (c) {
     case 'n':
       N = atoi(optarg);
@@ -118,6 +119,9 @@ static void parse_args(int argc, char **argv) {
       break;
     case 'k':
       kernel_file = optarg;
+      break;
+    case 't':
+      kernel_type_flag = atoi(optarg);   // 0 = SIMT, 1 = TCU
       break;
     case 'h':
       show_usage();
@@ -146,6 +150,11 @@ int main(int argc, char *argv[]) {
   // parse command arguments
   parse_args(argc, argv);
 
+  if (kernel_type_flag && d != 8) {
+    printf("Error: Head dimension %u must be 8 for TCU\n", d);
+    return -1;
+  }
+
   if (!is_power_of_2(N) || !is_power_of_2(d)) {
     printf("Error: Sequence length %u and head dimension %u must be a power of 2\n", N, d);
     return -1;
@@ -169,35 +178,63 @@ int main(int argc, char *argv[]) {
   uint32_t num_threads = static_cast<uint32_t>(threads);
   uint32_t num_warps = static_cast<uint32_t>(warps);
 
+  if (kernel_type_flag && num_threads != 8) {
+    printf("Error: Number of threads %u must be 8 for TCU\n", num_threads);
+    return -1;
+  }
+
   if ((!is_power_of_2(num_threads) || !is_power_of_2(num_warps))) {
     printf("Error: Number of threads %u and number of warps %u must be a power of 2\n", num_threads, num_warps);
     return -1;
   }
 
-  // Dynamically size block sizes by input and GPU configuration
-  auto threads_per_core = num_threads * num_warps;
-  // Large head dimension leads to register spilling and memory conflicts when multiple blocks share an SM
-  if (threads_per_core > 128 / d) {
-    printf("Error: Incompatible number of threads per core %d with head dimension %u\n", threads_per_core, d);
-    return -1;
+  uint32_t block_size_r, block_size_c;
+  if (kernel_type_flag) {
+    block_size_c = 8;
+    block_size_r = 8;
   }
-  // Enforce one R block per SM
-  uint32_t block_size_r = std::min(threads_per_core, N);
-  // C block size must be greater than or equal to R block size
-  uint32_t block_size_c = std::max(block_size_r, (uint32_t)8);
+  else {
+    // Dynamically size block sizes by input and GPU configuration
+    auto threads_per_core = num_threads * num_warps;
+    // Large head dimension leads to register spilling and memory conflicts when multiple blocks share an SM
+    if (threads_per_core > 128 / d) {
+      printf("Error: Incompatible number of threads per core %d with head dimension %u\n", threads_per_core, d);
+      return -1;
+    }
+    // Enforce one R block per SM
+    block_size_r = std::min(threads_per_core, N);
+    // C block size must be greater than or equal to R block size
+    block_size_c = std::max(block_size_r, (uint32_t)8);
+  }
+
+  std::cout << "backend: " << (kernel_type_flag == 1 ? "TCU" : "SIMT") << std::endl;
 
   uint32_t size = N * d;
   uint32_t buf_size = size * sizeof(float);
   uint32_t group_size = block_size_r;
 
-  // Tiles of Q, K, V stored in local memory
-  uint32_t local_mem = (block_size_r + 2 * block_size_c) * d * sizeof(float);
+  // Calculate local memory requirements based on kernel type
+  uint32_t local_mem;
+  if (kernel_type_flag == 1) {
+    // TCU path: 3x8x8 fp16 + 8x8 fp32 + 8 fp32 + 8 fp32 + 64 fp32
+    local_mem = 3 * 8 * 8 * 2 + 8 * 8 * 4 + 8 * 4 + 8 * 4 + 64 * 4;  // 960 bytes
+  } else {
+    // SIMT path: (block_size_r + 2 * block_size_c) * d * sizeof(float)
+    local_mem = (block_size_r + 2 * block_size_c) * d * sizeof(float);
+  }
 
   // check work group occupancy
   uint32_t max_localmem;
   RT_CHECK(vx_check_occupancy(device, group_size, &max_localmem));
   std::cout << "occupancy: max_localmem=" << max_localmem << " bytes" << std::endl;
-  RT_CHECK(max_localmem < local_mem);
+  
+  // Check if we have enough local memory (fix backwards logic)
+  if (local_mem > max_localmem) {
+    std::cout << "Error: required local_mem (" << local_mem 
+              << " bytes) exceeds max_localmem (" << max_localmem << " bytes)" << std::endl;
+    cleanup();
+    exit(-1);
+  }
 
   std::cout << "data type: " << Comparator<float>::type_str() << std::endl;
   std::cout << "sequence length: " << N << std::endl;
@@ -211,6 +248,7 @@ int main(int argc, char *argv[]) {
   kernel_arg.head_dim = d;
   kernel_arg.block_size_r = block_size_r;
   kernel_arg.block_size_c = block_size_c;
+  kernel_arg.kernel_type = kernel_type_flag;
 
   // allocate device memory
   std::cout << "allocate device memory" << std::endl;
