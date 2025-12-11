@@ -4,7 +4,6 @@
 #include <vector>
 #include <vortex.h>
 #include <cmath>
-#include <algorithm>
 #include "common.h"
 
 #define RT_CHECK(_expr)                                         \
@@ -175,22 +174,24 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
-  uint32_t block_size_r, block_size_c;
   // Dynamically size block sizes by input and GPU configuration
-  // int threads_per_core = num_threads * num_warps;
-  // if (d == 16) {
-  //   block_size_r = std::min(threads_per_core, 8);
-  //   block_size_c = std::min((int) block_size_r, 8);
-  // }
-
-  block_size_r = 8;
-  block_size_c = 8;
+  auto threads_per_core = num_threads * num_warps;
+  // Large head dimension leads to register spilling and memory conflicts when multiple blocks share an SM
+  if (threads_per_core > 128 / d) {
+    printf("Error: Incompatible number of threads per core %d with head dimension %u\n", threads_per_core, d);
+    return -1;
+  }
+  // Enforce one R block per SM
+  uint32_t block_size_r = std::min(threads_per_core, N);
+  // C block size must be greater than or equal to R block size
+  uint32_t block_size_c = std::max(block_size_r, (uint32_t)8);
 
   uint32_t size = N * d;
-  uint32_t buf_size = size * sizeof(TYPE);
+  uint32_t buf_size = size * sizeof(float);
   uint32_t group_size = block_size_r;
 
-  uint32_t local_mem = (block_size_r + 2 * block_size_c) * d * sizeof(TYPE);
+  // Tiles of Q, K, V stored in local memory
+  uint32_t local_mem = (block_size_r + 2 * block_size_c) * d * sizeof(float);
 
   // check work group occupancy
   uint32_t max_localmem;
