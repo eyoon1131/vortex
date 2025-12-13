@@ -1,3 +1,35 @@
+# Flash Attention on Vortex
+
+This project implements [FlashAttention](https://github.com/Dao-AILab/flash-attention) on the Vortex GPGPU. More information can be found in the [report](flash_info/FINAL%20REPORT.pdf). 
+
+The FlashAttention program can be found in [`tests/regression`](tests/regression) under `flash`. 
+
+## Running the program
+
+### Baseline
+
+The `regression` folder also includes a basic attention program that computes the standard attention algorithm. This program is divided into 3 kernels that operate sequentially: GEMM, softmax, and GEMM. Each kernel outputs its own performance metrics and the overall performance metrics can be obtained by summing them. The results from the report were obtained by the command
+```sh
+CONFIGS="-DNUM_CORES=4 -DNUM_WARPS=2 -DNUM_THREADS=8 -DMEM_CLOCK_RATIO=4" ./ci/blackbox.sh --driver=simx --app=attention --args="-n 64 -d 8" --perf=2
+```
+The `-DMEM_CLOCK_RATIO` CONFIG argument can be adjusted to modify the difference in latency between global and local memory. The `--perf` flag is set to 2 to obtain memory perfomance metrics.
+
+### Standard Flash
+
+To reproduce the configuration and results from the report, run
+```sh
+CONFIGS="-DNUM_CORES=4 -DNUM_WARPS=2 -DNUM_THREADS=8 -DMEM_CLOCK_RATIO=4" ./ci/blackbox.sh --driver=simx --app=flash --args="-n 64 -d 8" --perf=2
+```
+Although the configuration of cores, warps, and threads is modifiable, the program restricts certain configurations based on the input size `d` and the number of warps and threads. Due to issues such as register spilling and local memory corruption when multiple thread blocks are active on a single core, the program chooses the group size such that each core is only given 1 thread block at a time. 
+
+### Flash TCU
+
+The TCU Flash implementation can be run by enabling the TCU and adding an argument `-t 1`
+```sh
+CONFIGS="-DNUM_CORES=4 -DNUM_WARPS=2 -DNUM_THREADS=8 -DMEM_CLOCK_RATIO=4 -DEXT_TCU_ENABLE" ./ci/blackbox.sh --driver=simx --app=flash --args="-n 64 -d 8 -t 1" --perf=2
+```
+The default value of `t` is 0, which activates the standard version. Currently the TCU kernel only supports inputs with `-DNUM_THREADS=8` and `-d 8`.
+
 # Vortex GPGPU
 
 Vortex is a full-stack open-source RISC-V GPGPU. Vortex supports multiple **backend drivers**, including our C++ simulator (simx), an RTL simulator, and physical Xilinx and Altera FPGAs-- all controlled by a single driver script. The chosen driver determines the corresponding code invoked to run Vortex. Generally, developers will prototype their intended design in simx, before completing going forward with an RTL implementation. Alternatively, you can get up and running by selecting a driver of your choice and running a demo program.

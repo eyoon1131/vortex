@@ -6,6 +6,7 @@
 #include <vortex.h>
 #include <cmath>
 #include <algorithm>
+#include <stdio.h>
 #include "common.h"
 
 #define FLOAT_ULP 6
@@ -99,15 +100,18 @@ kernel_arg_t kernel_arg = {};
 
 static void show_usage() {
    std::cout << "Vortex Test." << std::endl;
-   std::cout << "Usage: [-k: kernel] [-n size] [-h: help]" << std::endl;
+   std::cout << "Usage: [-k: kernel] [-n: sequence_length] [-d: head_dim] [-h: help]" << std::endl;
 }
 
 static void parse_args(int argc, char **argv) {
   int c;
-  while ((c = getopt(argc, argv, "n:k:h")) != -1) {
+  while ((c = getopt(argc, argv, "n:d:k:h")) != -1) {
     switch (c) {
     case 'n':
-      // size = atoi(optarg);
+      N = atoi(optarg);
+      break;
+    case 'd':
+      d = atoi(optarg);
       break;
     case 'k':
       kernel_file = optarg;
@@ -240,6 +244,9 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  // Dump performance
+  vx_dump_perf(device, stdout);
+
   // -------------------------------------------------------------------------------------------------
   // P = softmax(S)
 
@@ -306,6 +313,9 @@ int main(int argc, char *argv[]) {
       }
     }
   }
+
+  // Dump performance
+  vx_dump_perf(device, stdout);
 
   // -------------------------------------------------------------------------------------------------
   // O = PV
