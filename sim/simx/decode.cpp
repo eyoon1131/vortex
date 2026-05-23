@@ -1321,6 +1321,75 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
         }
       } break;
     #endif // TCU_WGMMA_ENABLE
+    #ifdef TCU_TMEM_ENABLE
+      case 2: { // TMEM_ALLOC
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        instr->setOpType(TcuType::TMEM_ALLOC);
+        instr->setArgs(IntrTcuArgs{});
+        instr->setSrcReg(0, rs1, RegType::Integer);
+        instr->setParentUUID(uuid);
+        ibuffer.push_back(instr);
+      } break;
+      case 3: { // TMEM_DEALLOC
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        instr->setOpType(TcuType::TMEM_DEALLOC);
+        instr->setArgs(IntrTcuArgs{});
+        instr->setParentUUID(uuid);
+        ibuffer.push_back(instr);
+      } break;
+      case 4: { // TMEM_ST
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        instr->setOpType(TcuType::TMEM_ST);
+        instr->setArgs(IntrTcuArgs{});
+        instr->setSrcReg(0, rs1, RegType::Integer);
+        instr->setSrcReg(1, rs2, RegType::Float);
+        instr->setParentUUID(uuid);
+        ibuffer.push_back(instr);
+      } break;
+      case 5: { // TMEM_LD
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        instr->setOpType(TcuType::TMEM_LD);
+        instr->setArgs(IntrTcuArgs{});
+        instr->setDestReg(rd, RegType::Float);
+        instr->setSrcReg(0, rs1, RegType::Integer);
+        instr->setParentUUID(uuid);
+        ibuffer.push_back(instr);
+      } break;
+      case 6: { // UMMA - Mostly repurposed from WGMMA
+        namespace vt = vortex::tensor;
+        // Reused for UMMA geometry — NRC encodes tile width, not register count
+        using wg_cfg = vt::wgmma_config_t<NUM_THREADS, vt::fp32, vt::fp32>;
+        constexpr uint32_t m_steps = wg_cfg::m_steps;   // always 2
+        constexpr uint32_t k_steps = wg_cfg::k_steps;   // always 2
+        uint32_t fmt_d = rd;
+        uint32_t fmt_s = rs1;
+        constexpr uint32_t a0 = 10, a1 = 11;
+        uint32_t n_steps = wg_cfg::NRC / m_steps;
+        uint32_t total_uops = k_steps * wg_cfg::NRC;
+        uint32_t steps_shift = (total_uops > 1) ? (32 - log2ceil(total_uops)) : 0;
+        uint32_t uuid_hi = (uuid >> 32) & 0xffffffff;
+        uint32_t uuid_lo = uuid & 0xffffffff;
+        // Loop order: m (inner) → k → n (outer), matching RTL
+        uint32_t uop_idx = 0;
+        for (uint32_t n = 0; n < n_steps; ++n) {
+          for (uint32_t k = 0; k < k_steps; ++k) {
+            for (uint32_t m = 0; m < m_steps; ++m) {
+              uint32_t uuid_lo_x = (uop_idx++ << steps_shift) | uuid_lo;
+              uint64_t uuid_x = (static_cast<uint64_t>(uuid_hi) << 32) | uuid_lo_x;
+              auto uop = std::allocate_shared<Instr>(instr_pool_, uuid_x, FUType::TCU);
+              uop->setOpType(TcuType::UMMA);
+              uop->setArgs(IntrTcuArgs{0, 1u, 0, fmt_s, fmt_d, m, n, k, 0});
+              if (uop_idx == 1) {
+                uop->setSrcReg(0, a0, RegType::Integer);
+                uop->setSrcReg(1, a1, RegType::Integer);
+              }
+              uop->setParentUUID(uuid);
+              ibuffer.push_back(uop);
+            }
+          }
+        }
+      } break;
+    #endif // TCU_TMEM_ENABLE
       default:
         std::abort();
       }

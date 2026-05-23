@@ -714,6 +714,11 @@ inline std::ostream &operator<<(std::ostream &os, const VpuOpType& type) {
 enum class TcuType {
   WMMA,
   WGMMA,
+  TMEM_ALLOC,
+  TMEM_DEALLOC,
+  TMEM_LD,
+  TMEM_ST,
+  UMMA,
   META_STORE,
 };
 

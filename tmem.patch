@@ -1,0 +1,682 @@
+diff --git a/kernel/include/vx_tensor.h b/kernel/include/vx_tensor.h
+index 1a1467646..008df32af 100644
+--- a/kernel/include/vx_tensor.h
++++ b/kernel/include/vx_tensor.h
+@@ -1026,5 +1026,170 @@ public:
+   }
+ };
+ 
++#ifdef TCU_TMEM_ENABLE
++
++// ─── TMEM ISA constants ───────────────────────────────────────────────────────
++// funct7=2 (TCU), funct3=2..6 for TMEM/UMMA instructions
++#define VX_TMEM_FUNCT7  2
++#define VX_TMEM_ALLOC   2
++#define VX_TMEM_DEALLOC 3
++#define VX_TMEM_ST      4
++#define VX_TMEM_LD      5
++#define VX_UMMA         6
++
++// ─── TMEM address helpers ─────────────────────────────────────────────────────
++// TMEM address format: bits[15:0] = column index
++// Lane is implicit from warp_id * NUM_THREADS + thread_id
++// Upper bits unused in base implementation
++static __attribute__((always_inline)) uint32_t vx_make_tmem_addr(uint32_t col) {
++  return col & 0xFFFF;
++}
++
++// ─── TMEM management ─────────────────────────────────────────────────────────
++
++// Allocate ncols columns of TMEM for this CTA
++// Must be called by one elected warp before any TMEM operations
++static __attribute__((always_inline)) void vx_tmem_alloc(uint32_t ncols) {
++  register uint32_t r_ncols __asm__("a0") = ncols;
++  __asm__ volatile (
++    ".insn r %[insn], %[f3], %[f7], x0, %[ncols], x0\n\t"
++    :
++    : [insn]"i"(RISCV_CUSTOM0),
++      [f3]"i"(VX_TMEM_ALLOC),
++      [f7]"i"(VX_TMEM_FUNCT7),
++      [ncols]"r"(r_ncols)
++    : "memory"
++  );
++}
++
++// Deallocate TMEM for this CTA
++static __attribute__((always_inline)) void vx_tmem_dealloc() {
++  __asm__ volatile (
++    ".insn r %[insn], %[f3], %[f7], x0, x0, x0\n\t"
++    :
++    : [insn]"i"(RISCV_CUSTOM0),
++      [f3]"i"(VX_TMEM_DEALLOC),
++      [f7]"i"(VX_TMEM_FUNCT7)
++    : "memory"
++  );
++}
++
++// Store a float value from this thread's register into TMEM at [lane][col]
++// Each thread stores to its own lane (lane = wid * NT + tid)
++// tmem_addr encodes the column: vx_make_tmem_addr(col)
++static __attribute__((always_inline)) void vx_tmem_st(uint32_t tmem_addr, float value) {
++  register uint32_t r_addr  __asm__("a0") = tmem_addr;
++  register float    r_value __asm__("f0") = value;
++  __asm__ volatile (
++    ".insn r %[insn], %[f3], %[f7], x0, %[addr], %[val]\n\t"
++    :
++    : [insn]"i"(RISCV_CUSTOM0),
++      [f3]"i"(VX_TMEM_ST),
++      [f7]"i"(VX_TMEM_FUNCT7),
++      [addr]"r"(r_addr),
++      [val]"f"(r_value)
++    : "memory"
++  );
++}
++
++// Load a float value from TMEM at [lane][col] into this thread's register
++// Each thread loads from its own lane (lane = wid * NT + tid)
++// tmem_addr encodes the column: vx_make_tmem_addr(col)
++static __attribute__((always_inline)) float vx_tmem_ld(uint32_t tmem_addr) {
++  register uint32_t r_addr   __asm__("a0") = tmem_addr;
++  register float    r_result __asm__("f0");
++  __asm__ volatile (
++    ".insn r %[insn], %[f3], %[f7], %[result], %[addr], x0\n\t"
++    : [result]"=f"(r_result)
++    : [insn]"i"(RISCV_CUSTOM0),
++      [f3]"i"(VX_TMEM_LD),
++      [f7]"i"(VX_TMEM_FUNCT7),
++      [addr]"r"(r_addr)
++    : "memory"
++  );
++  return r_result;
++}
++
++// ─── umma_context ─────────────────────────────────────────────────────────────
++// UMMA: A and B from SMEM via descriptors, C/D accumulator in TMEM
++template <uint32_t NT,
++          typename It,
++          typename Ot,
++          uint32_t NRC_ = 8>
++struct umma_context {
++private:
++  using cfg = wgmma_config_t<NT, It, Ot, NRC_>;
++
++public:
++  using input_t  = typename It::dtype;
++  using output_t = typename Ot::dtype;
++
++  static constexpr uint32_t tileM  = cfg::xtileM;
++  static constexpr uint32_t tileN  = cfg::xtileN;
++  static constexpr uint32_t tileK  = cfg::tileK;
++  static constexpr uint32_t xtileM = cfg::xtileM;
++  static constexpr uint32_t xtileN = cfg::xtileN;
++  static constexpr uint32_t xtileK = cfg::xtileK;
++  static constexpr uint32_t NRC    = NRC_;
++
++  // Initialize accumulator in TMEM to zero (or any value)
++  // Each thread initializes its own lane across all xtileN columns
++  static __attribute__((always_inline)) void fill_tmem(output_t value) {
++    for (uint32_t col = 0; col < xtileN; ++col) {
++      vx_tmem_st(vx_make_tmem_addr(col), static_cast<float>(value));
++    }
++  }
++
++  // ── SMEM load helpers ─────────────────────────────────────────────────────
++  // Cooperatively load A and B tiles into SMEM — same as wgmma_context
++  // (reuse store_matrix_sync from wgmma_context for output)
++
++  // ── UMMA sync ─────────────────────────────────────────────────────────────
++  // A and B both from SMEM descriptors, C/D in TMEM
++  static __attribute__((always_inline)) void umma_sync(smem_matrix_desc desc_a,
++                                                       smem_matrix_desc desc_b) {
++    register uint32_t ra __asm__("a0") = desc_a.value;
++    register uint32_t rb __asm__("a1") = desc_b.value;
++
++    __asm__ volatile (
++      ".insn r %[insn], %[f3], %[f7], x%[fmd], x%[fms], x0\n\t"
++      :
++      : [insn]"i"(RISCV_CUSTOM0),
++        [f3]"i"(VX_UMMA),
++        [f7]"i"(VX_TMEM_FUNCT7),
++        [fmd]"i"(Ot::id),
++        [fms]"i"(It::id),
++        "r"(ra), "r"(rb)
++      : "memory"
++    );
++  }
++
++  // ── Post-processing: TMEM → registers → global memory ────────────────────
++  // Load one column of the accumulator from TMEM into a register per thread.
++  // Call for each col in [0, xtileN) and store to global memory.
++  static __attribute__((always_inline)) float tmem_ld_col(uint32_t col) {
++    return vx_tmem_ld(vx_make_tmem_addr(col));
++  }
++
++  // Store the output tile to global memory.
++  // Each warp calls this after loading all columns from TMEM.
++  // out: pointer to this warp's output tile base
++  // N: leading dimension of the output matrix
++  static __attribute__((always_inline)) void store_output(
++      output_t* out, uint32_t N, uint32_t warp_rank) {
++    uint32_t tid = vx_thread_id();
++    // thread tid owns lane (warp_rank * NT + tid) → output row tid within xtileM
++    // But since xtileM rows are spread across m_steps * tcM lanes,
++    // and each thread covers tcM/NT rows... simplify: one row per thread per warp
++    for (uint32_t col = 0; col < xtileN; ++col) {
++      float val = tmem_ld_col(col);
++      // thread tid → output row tid (within this warp's xtileM slice)
++      out[tid * N + col] = static_cast<output_t>(val);
++    }
++  }
++};
++
++#endif // TCU_TMEM_ENABLE
++
+ } // namespace tensor
+ } // namespace vortex
+\ No newline at end of file
+diff --git a/sim/simx/decode.cpp b/sim/simx/decode.cpp
+index 8ac436e16..5b6979045 100644
+--- a/sim/simx/decode.cpp
++++ b/sim/simx/decode.cpp
+@@ -1321,6 +1321,75 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
+         }
+       } break;
+     #endif // TCU_WGMMA_ENABLE
++    #ifdef TCU_TMEM_ENABLE
++      case 2: { // TMEM_ALLOC
++        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
++        instr->setOpType(TcuType::TMEM_ALLOC);
++        instr->setArgs(IntrTcuArgs{});
++        instr->setSrcReg(0, rs1, RegType::Integer);
++        instr->setParentUUID(uuid);
++        ibuffer.push_back(instr);
++      } break;
++      case 3: { // TMEM_DEALLOC
++        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
++        instr->setOpType(TcuType::TMEM_DEALLOC);
++        instr->setArgs(IntrTcuArgs{});
++        instr->setParentUUID(uuid);
++        ibuffer.push_back(instr);
++      } break;
++      case 4: { // TMEM_ST
++        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
++        instr->setOpType(TcuType::TMEM_ST);
++        instr->setArgs(IntrTcuArgs{});
++        instr->setSrcReg(0, rs1, RegType::Integer);
++        instr->setSrcReg(1, rs2, RegType::Float);
++        instr->setParentUUID(uuid);
++        ibuffer.push_back(instr);
++      } break;
++      case 5: { // TMEM_LD
++        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
++        instr->setOpType(TcuType::TMEM_LD);
++        instr->setArgs(IntrTcuArgs{});
++        instr->setDestReg(rd, RegType::Float);
++        instr->setSrcReg(0, rs1, RegType::Integer);
++        instr->setParentUUID(uuid);
++        ibuffer.push_back(instr);
++      } break;
++      case 6: { // UMMA - Mostly repurposed from WGMMA
++        namespace vt = vortex::tensor;
++        // Reused for UMMA geometry — NRC encodes tile width, not register count
++        using wg_cfg = vt::wgmma_config_t<NUM_THREADS, vt::fp32, vt::fp32>;
++        constexpr uint32_t m_steps = wg_cfg::m_steps;   // always 2
++        constexpr uint32_t k_steps = wg_cfg::k_steps;   // always 2
++        uint32_t fmt_d = rd;
++        uint32_t fmt_s = rs1;
++        constexpr uint32_t a0 = 10, a1 = 11;
++        uint32_t n_steps = wg_cfg::NRC / m_steps;
++        uint32_t total_uops = k_steps * wg_cfg::NRC;
++        uint32_t steps_shift = (total_uops > 1) ? (32 - log2ceil(total_uops)) : 0;
++        uint32_t uuid_hi = (uuid >> 32) & 0xffffffff;
++        uint32_t uuid_lo = uuid & 0xffffffff;
++        // Loop order: m (inner) → k → n (outer), matching RTL
++        uint32_t uop_idx = 0;
++        for (uint32_t n = 0; n < n_steps; ++n) {
++          for (uint32_t k = 0; k < k_steps; ++k) {
++            for (uint32_t m = 0; m < m_steps; ++m) {
++              uint32_t uuid_lo_x = (uop_idx++ << steps_shift) | uuid_lo;
++              uint64_t uuid_x = (static_cast<uint64_t>(uuid_hi) << 32) | uuid_lo_x;
++              auto uop = std::allocate_shared<Instr>(instr_pool_, uuid_x, FUType::TCU);
++              uop->setOpType(TcuType::UMMA);
++              uop->setArgs(IntrTcuArgs{0, 1u, 0, fmt_s, fmt_d, m, n, k, 0});
++              if (uop_idx == 1) {
++                uop->setSrcReg(0, a0, RegType::Integer);
++                uop->setSrcReg(1, a1, RegType::Integer);
++              }
++              uop->setParentUUID(uuid);
++              ibuffer.push_back(uop);
++            }
++          }
++        }
++      } break;
++    #endif // TCU_TMEM_ENABLE
+       default:
+         std::abort();
+       }
+diff --git a/sim/simx/execute.cpp b/sim/simx/execute.cpp
+index 0dd60b339..d92127ec7 100644
+--- a/sim/simx/execute.cpp
++++ b/sim/simx/execute.cpp
+@@ -1675,6 +1675,45 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
+         rd_write = true;
+       } break;
+   #endif // TCU_WGMMA_ENABLE
++  #ifdef TCU_TMEM_ENABLE
++      case TcuType::TMEM_ALLOC: {
++        auto trace_data = std::make_shared<TensorUnit::ExeTraceData>();
++        trace->data = trace_data;
++        uint32_t ncols = rs1_data.at(thread_start).u32;
++        core_->tensor_unit()->tmem_alloc(ncols, trace_data.get());
++      } break;
++      case TcuType::TMEM_DEALLOC: {
++        auto trace_data = std::make_shared<TensorUnit::ExeTraceData>();
++        trace->data = trace_data;
++        core_->tensor_unit()->tmem_dealloc(trace_data.get());
++      } break;
++      case TcuType::TMEM_ST: {
++        auto trace_data = std::make_shared<TensorUnit::ExeTraceData>();
++        trace->data = trace_data;
++        assert(operand_tmask.count() == num_threads);
++        uint32_t tmem_addr = rs1_data.at(thread_start).u32;
++        core_->tensor_unit()->tmem_st(wid, tmem_addr, rs2_data, trace_data.get());
++      } break;
++      case TcuType::TMEM_LD: {
++        auto trace_data = std::make_shared<TensorUnit::ExeTraceData>();
++        trace->data = trace_data;
++        assert(operand_tmask.count() == num_threads);
++        uint32_t tmem_addr = rs1_data.at(thread_start).u32;
++        core_->tensor_unit()->tmem_ld(wid, tmem_addr, rd_data, trace_data.get());
++        rd_write = true;
++      } break;
++      case TcuType::UMMA: {
++        auto trace_data = std::make_shared<TensorUnit::ExeTraceData>();
++        trace->data = trace_data;
++        assert(operand_tmask.count() == num_threads);
++        assert(exec_tmask.count() == num_threads);
++        uint32_t a_desc = rs1_data.empty() ? 0 : rs1_data.at(0).u32;
++        uint32_t b_desc = rs2_data.empty() ? 0 : rs2_data.at(0).u32;
++        core_->tensor_unit()->umma(wid, tpuArgs.fmt_s, tpuArgs.fmt_d,
++                                    tpuArgs.step_m, tpuArgs.step_n, tpuArgs.step_k,
++                                    a_desc, b_desc, trace_data.get());
++      } break;
++  #endif // TCU_TMEM_ENABLE
+       case TcuType::META_STORE: {
+         auto trace_data = std::make_shared<TensorUnit::ExeTraceData>();
+         trace->data = trace_data;
+diff --git a/sim/simx/tensor_unit.cpp b/sim/simx/tensor_unit.cpp
+index 20ac5e9fb..bede76af7 100644
+--- a/sim/simx/tensor_unit.cpp
++++ b/sim/simx/tensor_unit.cpp
+@@ -26,6 +26,7 @@ using namespace vortex;
+ namespace vt = vortex::tensor;
+ using cfg    = vt::wmma_config_t<NUM_THREADS>;
+ using wg_cfg = vt::wgmma_config_t<NUM_THREADS, vt::fp32, vt::fp32>;
++using umma_cfg = vt::wgmma_config_t<NUM_THREADS, vt::fp32, vt::fp32, UMMA_NRC>;
+ 
+ inline uint64_t nan_box(uint32_t value) {
+   return value | 0xffffffff00000000;
+@@ -573,6 +574,9 @@ public:
+ 
+   void reset() {
+     perf_stats_ = PerfStats();
++    tmem_.data = {};
++    tmem_.ncols_allocated = 0;
++    tmem_.allocated = false;
+     for (auto& sparse_meta : sparse_meta_) {
+       std::fill(sparse_meta.begin(), sparse_meta.end(), 0);
+     }
+@@ -594,6 +598,17 @@ public:
+       case TcuType::WGMMA:
+         delay = 4;
+         break;
++      case TcuType::TMEM_ALLOC:
++      case TcuType::TMEM_DEALLOC:
++      case TcuType::TMEM_ST:
++          delay = 1;
++          break;
++      case TcuType::TMEM_LD:
++          delay = 2;
++          break;
++      case TcuType::UMMA:
++        delay = 4;
++        break;
+       case TcuType::META_STORE:
+         delay = 1;
+         break;
+@@ -929,6 +944,150 @@ public:
+     }
+   }
+ 
++  void tmem_alloc(uint32_t ncols,
++                  ExeTraceData* trace_data) {
++    __unused(trace_data);
++
++    if (tmem_.allocated) {
++      std::cout << "Error: TMEM already allocated" << std::endl;
++      std::abort();
++    }
++    if (ncols > kTmemCols) {
++      std::cout << "Error: TMEM ncols " << ncols 
++                << " exceeds capacity " << kTmemCols << std::endl;
++      std::abort();
++    }
++    tmem_.ncols_allocated = ncols;
++    tmem_.allocated = true;
++    for (auto& row : tmem_.data) {
++      row.fill(0);
++    }
++  }
++
++	void tmem_dealloc(ExeTraceData* trace_data) {
++    __unused(trace_data);
++
++    if (!tmem_.allocated) {
++      std::cout << "Error: TMEM not allocated" << std::endl;
++      std::abort();
++    }
++    tmem_.allocated = false;
++    tmem_.ncols_allocated = 0;
++  }
++
++	void tmem_st(uint32_t wid,
++				       uint32_t tmem_addr,
++				       const std::vector<reg_data_t>& rs1_data,
++               ExeTraceData* trace_data) {
++    __unused(trace_data);
++
++    if (!tmem_.allocated) {
++      std::cout << "Error: TMEM not allocated" << std::endl;
++      std::abort();
++    }
++    // tmem_addr is uniform
++    uint32_t col = tmem_addr & 0xFFFF;
++    // Each thread stores to its own lane, one column
++    for (uint32_t t = 0; t < rs1_data.size(); ++t) {
++        uint32_t lane = wid * NUM_THREADS + t;
++        tmem_.data[lane][col] = rs1_data.at(t).u32;
++    }
++  }
++
++	void tmem_ld(uint32_t wid,
++				       uint32_t tmem_addr,
++				       std::vector<reg_data_t>& rd_data,
++               ExeTraceData* trace_data) {
++    __unused(trace_data);
++
++    if (!tmem_.allocated) {
++      std::cout << "Error: TMEM not allocated" << std::endl;
++      std::abort();
++    }
++    // tmem_addr is uniform
++    uint32_t col = tmem_addr & 0xFFFF;
++    // Each thread loads from its own lane, one column
++    for (uint32_t t = 0; t < rd_data.size(); ++t) {
++      uint32_t lane = wid * NUM_THREADS + t;
++      rd_data.at(t).u64 = nan_box(tmem_.data[lane][col]);
++    }
++  }
++
++	void umma(uint32_t wid,
++            uint32_t fmt_s,
++            uint32_t fmt_d,
++            uint32_t step_m,
++            uint32_t step_n,
++            uint32_t step_k,
++            uint32_t a_desc,
++            uint32_t b_desc,
++            ExeTraceData* trace_data) {
++    __unused(trace_data);
++
++    if (!tmem_.allocated) {
++      std::cout << "Error: TMEM not allocated" << std::endl;
++      std::abort();
++    }
++    auto fedp = select_FEDP(fmt_s, fmt_d);
++    uint32_t ratio   = elem_ratio(fmt_s);
++    uint32_t k_words = cfg::tcK;
++    uint32_t e_bytes = elem_bits(fmt_s) / 8;
++
++    // Decode smem descriptors
++    lmem_desc_t sd_a, sd_b;
++    if (step_k == 0 && step_m == 0 && step_n == 0) {
++      sd_a = {LMEM_BASE_ADDR + (a_desc & 0xFFFF), (a_desc >> 16) / e_bytes, false};
++      lmem_desc_[wid][0] = sd_a;
++      sd_b = {LMEM_BASE_ADDR + (b_desc & 0xFFFF), (b_desc >> 16) / e_bytes, false};
++      lmem_desc_[wid][1] = sd_b;
++    } else {
++      sd_a = lmem_desc_[wid][0];
++      sd_b = lmem_desc_[wid][1];
++    }
++
++    // Dense UMMA
++    for (uint32_t i = 0; i < cfg::tcM; ++i) {
++      for (uint32_t j = 0; j < cfg::tcN; ++j) {
++        reg_data_t a_row[cfg::tcK];
++        reg_data_t b_col[cfg::tcK];
++        for (uint32_t z = 0; z < k_words; ++z) {
++          uint32_t a_row_idx = step_m * cfg::tcM + i;
++          uint32_t b_col_idx = step_n * cfg::tcN + j;
++          uint32_t k_elem = (step_k * k_words + z) * ratio;
++          // Load A
++          a_row[z].u32 = load_lmem_word(sd_a, a_row_idx, k_elem, fmt_s, false);
++          // Load B
++          b_col[z].u32 = load_lmem_word(sd_b, k_elem, b_col_idx, fmt_s, true);
++        }
++        uint32_t lane = step_m * cfg::tcM + i;
++        uint32_t col  = step_n * cfg::tcN + j;
++        uint32_t c_val = tmem_.data[lane][col];
++        uint32_t d_val = fedp(a_row, b_col, c_val);
++        tmem_.data[lane][col] = d_val;
++
++        DTH(3, simobject_->name() << " FEDP: wid=" << wid
++            << ", i=" << i << ", j=" << j
++            << ", m=" << step_m << ", n=" << step_n << ", k=" << step_k << std::hex
++            << ", a_row[0]=0x" << a_row[0].u32 << ", b_col[0]=0x" << b_col[0].u32
++            << ", tmem[" << lane << "][" << col << "]=0x" << c_val
++            << ", d=0x" << d_val << std::dec << std::endl); 
++      }
++    }
++
++    // Performance counters.
++    ++perf_stats_.umma_instrs;
++    if (step_m == 0 && step_n == 0 && step_k == 0) {
++        uint32_t b_total = umma_cfg::xtileK * umma_cfg::xtileN;
++        uint32_t b_bank_rows = (b_total + LMEM_NUM_BANKS - 1) / LMEM_NUM_BANKS;
++        perf_stats_.lmem_reads += b_bank_rows;
++        constexpr uint32_t a_bank_rows = (umma_cfg::xtileM * umma_cfg::xtileK + LMEM_NUM_BANKS - 1) / LMEM_NUM_BANKS;
++        perf_stats_.lmem_reads += a_bank_rows;
++        uint32_t acc_size = umma_cfg::xtileM * umma_cfg::xtileN;
++        perf_stats_.tmem_reads  += acc_size;
++        perf_stats_.tmem_writes += acc_size;
++    }
++  }
++
+   const PerfStats& perf_stats() const {
+     return perf_stats_;
+   }
+@@ -984,17 +1143,45 @@ private:
+     return packed;
+   }
+ 
++  void validate_tmem_access(uint32_t wid, uint32_t lane, uint32_t col) {
++    uint32_t lane_base = wid * NUM_THREADS;
++    uint32_t lane_end = lane_base + NUM_THREADS;
++    if (lane < lane_base || lane >= lane_end) {
++      std::cout << "Error: warp " << wid << " accessing lane " << lane
++                << " outside its range [" << lane_base << "," << lane_end 
++                << ")" << std::endl;
++      std::abort();
++    }
++    if (col >= tmem_.ncols_allocated) {
++      std::cout << "Error: TMEM column " << col
++                << " out of allocated range " << tmem_.ncols_allocated 
++                << std::endl;
++      std::abort();
++    }
++  }
++
+   static constexpr uint32_t kSparseKSteps = cfg::k_steps / 2;
+   static constexpr uint32_t kMetaBanks = cfg::m_steps * kSparseKSteps;
+   static constexpr uint32_t kMaxMetaCols = NUM_THREADS / 2;
+   static constexpr uint32_t kMxMetaWords = 8;
+ 
++  static constexpr uint32_t kTmemCols = 256;
++  static constexpr uint32_t kTmemLanes = NUM_THREADS * NUM_WARPS;
++  static_assert(kTmemLanes <= 128, "TMEM lanes exceed cap");
++
++  struct tmem_t {
++    std::array<std::array<uint32_t, kTmemCols>, kTmemLanes> data{};
++    uint32_t ncols_allocated = 0;
++    bool allocated = false;
++  };
++
+   TensorUnit*   simobject_;
+   Core*         core_;
+   Arch          arch_;
+   std::vector<std::vector<uint32_t>> sparse_meta_;
+   std::vector<std::array<uint32_t, kMxMetaWords>> mx_meta_;
+   std::unordered_map<uint32_t, lmem_desc_t[2]> lmem_desc_;
++  tmem_t tmem_;
+   PerfStats     perf_stats_;
+ };
+ 
+@@ -1014,6 +1201,21 @@ op_string_t vortex::op_string(TcuType tcu_type, IntrTcuArgs args) {
+              + "." + std::to_string(args.step_m) + "." + std::to_string(args.step_n)
+              + "." + std::to_string(args.step_k), ""};
+   }
++  case TcuType::TMEM_ALLOC:
++    return {"TMEM_ALLOC", ""};
++  case TcuType::TMEM_DEALLOC:
++      eturn {"TMEM_DEALLOC", ""};
++  case TcuType::TMEM_ST:
++    return {"TMEM_ST", ""};
++  case TcuType::TMEM_LD:
++    return {"TMEM_LD", ""};
++  case TcuType::UMMA: {
++    return {"UMMA." + std::string(vt::fmt_string(args.fmt_s)) + "."
++            + std::string(vt::fmt_string(args.fmt_d))
++            + "." + std::to_string(args.step_m)
++            + "." + std::to_string(args.step_n)
++            + "." + std::to_string(args.step_k), ""};
++  }
+   case TcuType::META_STORE:
+     return {"META_STORE." + std::string(vt::fmt_string(args.fmt_s)) + "." + std::to_string(args.fmt_d), ""};
+   default:
+@@ -1086,6 +1288,42 @@ void TensorUnit::wgmma(uint32_t wid,
+                is_sparse, cd_nregs, is_a_smem);
+ }
+ 
++void TensorUnit::tmem_alloc(uint32_t ncols,
++                            ExeTraceData* trace_data) {
++  impl_->tmem_alloc(ncols, trace_data);
++}
++
++void TensorUnit::tmem_dealloc(ExeTraceData* trace_data) {
++  impl_->tmem_dealloc(trace_data);
++}
++
++void TensorUnit::tmem_st(uint32_t wid, 
++                         uint32_t tmem_addr,
++                         const std::vector<reg_data_t>& rs1_data,
++                         ExeTraceData* trace_data) {
++  impl_->tmem_st(wid, tmem_addr, rs1_data, trace_data);
++}
++
++void TensorUnit::tmem_ld(uint32_t wid, 
++                         uint32_t tmem_addr,
++                         std::vector<reg_data_t>& rd_data,
++                         ExeTraceData* trace_data) {
++  impl_->tmem_ld(wid, tmem_addr, rd_data, trace_data);
++}
++
++void TensorUnit::umma(uint32_t wid,
++                      uint32_t fmt_s,
++                      uint32_t fmt_d,
++                      uint32_t step_m,
++                      uint32_t step_n,
++                      uint32_t step_k,
++                      uint32_t a_desc,
++                      uint32_t b_desc,
++                      ExeTraceData* trace_data) {
++  impl_->umma(wid, fmt_s, fmt_d, step_m, step_n, step_k,
++                a_desc, b_desc, trace_data);
++}
++
+ void TensorUnit::meta_store(uint32_t wid,
+                             uint32_t fmt_s,
+                             uint32_t col_idx,
+diff --git a/sim/simx/tensor_unit.h b/sim/simx/tensor_unit.h
+index 538b87dc4..a5f7615ed 100644
+--- a/sim/simx/tensor_unit.h
++++ b/sim/simx/tensor_unit.h
+@@ -34,7 +34,10 @@ public:
+ 		uint64_t tbuf_fetch_stalls = 0;
+ 		uint64_t wgmma_instrs = 0; // WGMMA µops executed
+ 		uint64_t wgmma_stalls = 0; // not cycle-accurate in simx (always 0)
+-		uint64_t lmem_reads   = 0; // LMEM read transactions per wgmma() call
++		uint64_t lmem_reads   = 0; // LMEM read transactions per wgmma()/umma() call
++		uint64_t umma_instrs  = 0; // UMMA µops executed
++		uint64_t tmem_reads	  = 0; // TMEM read transactions per umma() call
++		uint64_t tmem_writes  = 0; // TMEM write transactions per umma() call
+ 
+ 		PerfStats& operator+=(const PerfStats& rhs) {
+ 			this->latency          += rhs.latency;
+@@ -42,6 +45,9 @@ public:
+ 			this->wgmma_instrs     += rhs.wgmma_instrs;
+ 			this->wgmma_stalls     += rhs.wgmma_stalls;
+ 			this->lmem_reads       += rhs.lmem_reads;
++			this->umma_instrs 	   += rhs.umma_instrs;
++			this->tmem_reads  	   += rhs.tmem_reads;
++			this->tmem_writes 	   += rhs.tmem_writes;
+ 			return *this;
+ 		}
+ 	};
+@@ -86,6 +92,31 @@ public:
+ 	           uint32_t cd_nregs,
+ 	           uint32_t is_a_smem);
+ 
++	void tmem_alloc(uint32_t ncols,
++					ExeTraceData* trace_data);
++
++	void tmem_dealloc(ExeTraceData* trace_data);
++
++	void tmem_st(uint32_t wid,
++				 uint32_t tmem_addr,
++				 const std::vector<reg_data_t>& rs1_data,
++				 ExeTraceData* trace_data);
++
++	void tmem_ld(uint32_t wid,
++				 uint32_t tmem_addr,
++				 std::vector<reg_data_t>& rd_data,
++				 ExeTraceData* trace_data);
++
++	void umma(uint32_t wid,
++			  uint32_t fmt_s,
++			  uint32_t fmt_d,
++			  uint32_t step_m,
++			  uint32_t step_n,
++			  uint32_t step_k,
++			  uint32_t a_desc,
++			  uint32_t b_desc,
++			  ExeTraceData* trace_data);
++
+ 	void meta_store(uint32_t wid,
+ 					uint32_t fmt_s,
+ 					uint32_t col_idx,
+diff --git a/sim/simx/types.h b/sim/simx/types.h
+index 50316823b..2d9db150a 100644
+--- a/sim/simx/types.h
++++ b/sim/simx/types.h
+@@ -714,6 +714,11 @@ inline std::ostream &operator<<(std::ostream &os, const VpuOpType& type) {
+ enum class TcuType {
+   WMMA,
+   WGMMA,
++  TMEM_ALLOC,
++  TMEM_DEALLOC,
++  TMEM_LD,
++  TMEM_ST,
++  UMMA,
+   META_STORE,
+ };
+ 

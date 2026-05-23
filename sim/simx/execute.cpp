@@ -1675,6 +1675,45 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         rd_write = true;
       } break;
   #endif // TCU_WGMMA_ENABLE
+  #ifdef TCU_TMEM_ENABLE
+      case TcuType::TMEM_ALLOC: {
+        auto trace_data = std::make_shared<TensorUnit::ExeTraceData>();
+        trace->data = trace_data;
+        uint32_t ncols = rs1_data.at(thread_start).u32;
+        core_->tensor_unit()->tmem_alloc(ncols, trace_data.get());
+      } break;
+      case TcuType::TMEM_DEALLOC: {
+        auto trace_data = std::make_shared<TensorUnit::ExeTraceData>();
+        trace->data = trace_data;
+        core_->tensor_unit()->tmem_dealloc(trace_data.get());
+      } break;
+      case TcuType::TMEM_ST: {
+        auto trace_data = std::make_shared<TensorUnit::ExeTraceData>();
+        trace->data = trace_data;
+        assert(operand_tmask.count() == num_threads);
+        uint32_t tmem_addr = rs1_data.at(thread_start).u32;
+        core_->tensor_unit()->tmem_st(wid, tmem_addr, rs2_data, trace_data.get());
+      } break;
+      case TcuType::TMEM_LD: {
+        auto trace_data = std::make_shared<TensorUnit::ExeTraceData>();
+        trace->data = trace_data;
+        assert(operand_tmask.count() == num_threads);
+        uint32_t tmem_addr = rs1_data.at(thread_start).u32;
+        core_->tensor_unit()->tmem_ld(wid, tmem_addr, rd_data, trace_data.get());
+        rd_write = true;
+      } break;
+      case TcuType::UMMA: {
+        auto trace_data = std::make_shared<TensorUnit::ExeTraceData>();
+        trace->data = trace_data;
+        assert(operand_tmask.count() == num_threads);
+        assert(exec_tmask.count() == num_threads);
+        uint32_t a_desc = rs1_data.empty() ? 0 : rs1_data.at(0).u32;
+        uint32_t b_desc = rs2_data.empty() ? 0 : rs2_data.at(0).u32;
+        core_->tensor_unit()->umma(wid, tpuArgs.fmt_s, tpuArgs.fmt_d,
+                                    tpuArgs.step_m, tpuArgs.step_n, tpuArgs.step_k,
+                                    a_desc, b_desc, trace_data.get());
+      } break;
+  #endif // TCU_TMEM_ENABLE
       case TcuType::META_STORE: {
         auto trace_data = std::make_shared<TensorUnit::ExeTraceData>();
         trace->data = trace_data;

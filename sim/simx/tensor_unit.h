@@ -34,7 +34,10 @@ public:
 		uint64_t tbuf_fetch_stalls = 0;
 		uint64_t wgmma_instrs = 0; // WGMMA µops executed
 		uint64_t wgmma_stalls = 0; // not cycle-accurate in simx (always 0)
-		uint64_t lmem_reads   = 0; // LMEM read transactions per wgmma() call
+		uint64_t lmem_reads   = 0; // LMEM read transactions per wgmma()/umma() call
+		uint64_t umma_instrs  = 0; // UMMA µops executed
+		uint64_t tmem_reads	  = 0; // TMEM read transactions per umma() call
+		uint64_t tmem_writes  = 0; // TMEM write transactions per umma() call
 
 		PerfStats& operator+=(const PerfStats& rhs) {
 			this->latency          += rhs.latency;
@@ -42,6 +45,9 @@ public:
 			this->wgmma_instrs     += rhs.wgmma_instrs;
 			this->wgmma_stalls     += rhs.wgmma_stalls;
 			this->lmem_reads       += rhs.lmem_reads;
+			this->umma_instrs 	   += rhs.umma_instrs;
+			this->tmem_reads  	   += rhs.tmem_reads;
+			this->tmem_writes 	   += rhs.tmem_writes;
 			return *this;
 		}
 	};
@@ -85,6 +91,31 @@ public:
 	           bool is_sparse,
 	           uint32_t cd_nregs,
 	           uint32_t is_a_smem);
+
+	void tmem_alloc(uint32_t ncols,
+					ExeTraceData* trace_data);
+
+	void tmem_dealloc(ExeTraceData* trace_data);
+
+	void tmem_st(uint32_t wid,
+				 uint32_t tmem_addr,
+				 const std::vector<reg_data_t>& rs1_data,
+				 ExeTraceData* trace_data);
+
+	void tmem_ld(uint32_t wid,
+				 uint32_t tmem_addr,
+				 std::vector<reg_data_t>& rd_data,
+				 ExeTraceData* trace_data);
+
+	void umma(uint32_t wid,
+			  uint32_t fmt_s,
+			  uint32_t fmt_d,
+			  uint32_t step_m,
+			  uint32_t step_n,
+			  uint32_t step_k,
+			  uint32_t a_desc,
+			  uint32_t b_desc,
+			  ExeTraceData* trace_data);
 
 	void meta_store(uint32_t wid,
 					uint32_t fmt_s,

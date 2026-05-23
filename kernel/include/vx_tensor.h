@@ -1026,5 +1026,153 @@ public:
   }
 };
 
+#ifdef TCU_TMEM_ENABLE
+
+// ─── TMEM ISA constants ───────────────────────────────────────────────────────
+// funct7=2 (TCU), funct3=2..6 for TMEM/UMMA instructions
+#define VX_TMEM_FUNCT7  2
+#define VX_TMEM_ALLOC   2
+#define VX_TMEM_DEALLOC 3
+#define VX_TMEM_ST      4
+#define VX_TMEM_LD      5
+#define VX_UMMA         6
+
+// ─── TMEM address helpers ─────────────────────────────────────────────────────
+// TMEM address format: bits[15:0] = column index
+// Lane is implicit from warp_id * NUM_THREADS + thread_id
+// Upper bits unused in base implementation
+static __attribute__((always_inline)) uint32_t vx_make_tmem_addr(uint32_t col) {
+  return col & 0xFFFF;
+}
+
+// ─── TMEM management ─────────────────────────────────────────────────────────
+
+// Allocate ncols columns of TMEM for this CTA
+// Must be called by one elected warp before any TMEM operations
+static __attribute__((always_inline)) void vx_tmem_alloc(uint32_t ncols) {
+  register uint32_t r_ncols __asm__("a0") = ncols;
+  __asm__ volatile (
+    ".insn r %[insn], %[f3], %[f7], x0, %[ncols], x0\n\t"
+    :
+    : [insn]"i"(RISCV_CUSTOM0),
+      [f3]"i"(VX_TMEM_ALLOC),
+      [f7]"i"(VX_TMEM_FUNCT7),
+      [ncols]"r"(r_ncols)
+    : "memory"
+  );
+}
+
+// Deallocate TMEM for this CTA
+static __attribute__((always_inline)) void vx_tmem_dealloc() {
+  __asm__ volatile (
+    ".insn r %[insn], %[f3], %[f7], x0, x0, x0\n\t"
+    :
+    : [insn]"i"(RISCV_CUSTOM0),
+      [f3]"i"(VX_TMEM_DEALLOC),
+      [f7]"i"(VX_TMEM_FUNCT7)
+    : "memory"
+  );
+}
+
+// Store a float value from this thread's register into TMEM at [lane][col]
+// Each thread stores to its own lane (lane = wid * NT + tid)
+// tmem_addr encodes the column: vx_make_tmem_addr(col)
+static __attribute__((always_inline)) void vx_tmem_st(uint32_t tmem_addr, float value) {
+  register uint32_t r_addr  __asm__("a0") = tmem_addr;
+  register float    r_value __asm__("f0") = value;
+  __asm__ volatile (
+    ".insn r %[insn], %[f3], %[f7], x0, %[addr], %[val]\n\t"
+    :
+    : [insn]"i"(RISCV_CUSTOM0),
+      [f3]"i"(VX_TMEM_ST),
+      [f7]"i"(VX_TMEM_FUNCT7),
+      [addr]"r"(r_addr),
+      [val]"f"(r_value)
+    : "memory"
+  );
+}
+
+// Load a float value from TMEM at [lane][col] into this thread's register
+// Each thread loads from its own lane (lane = wid * NT + tid)
+// tmem_addr encodes the column: vx_make_tmem_addr(col)
+static __attribute__((always_inline)) float vx_tmem_ld(uint32_t tmem_addr) {
+  register uint32_t r_addr   __asm__("a0") = tmem_addr;
+  register float    r_result __asm__("f0");
+  __asm__ volatile (
+    ".insn r %[insn], %[f3], %[f7], %[result], %[addr], x0\n\t"
+    : [result]"=f"(r_result)
+    : [insn]"i"(RISCV_CUSTOM0),
+      [f3]"i"(VX_TMEM_LD),
+      [f7]"i"(VX_TMEM_FUNCT7),
+      [addr]"r"(r_addr)
+    : "memory"
+  );
+  return r_result;
+}
+
+// ─── umma_context ─────────────────────────────────────────────────────────────
+// UMMA: A and B from SMEM via descriptors, C/D accumulator in TMEM
+template <uint32_t NT,
+          typename It,
+          typename Ot,
+          uint32_t NRC_ = 8>
+struct umma_context {
+private:
+  using cfg = wgmma_config_t<NT, It, Ot, NRC_>;
+
+public:
+  using input_t  = typename It::dtype;
+  using output_t = typename Ot::dtype;
+
+  static constexpr uint32_t tileM  = cfg::xtileM;
+  static constexpr uint32_t tileN  = cfg::xtileN;
+  static constexpr uint32_t tileK  = cfg::tileK;
+  static constexpr uint32_t xtileM = cfg::xtileM;
+  static constexpr uint32_t xtileN = cfg::xtileN;
+  static constexpr uint32_t xtileK = cfg::xtileK;
+  static constexpr uint32_t NRC    = NRC_;
+
+  // Initialize accumulator in TMEM to zero (or any value)
+  // Each thread initializes its own lane across all xtileN columns
+  static __attribute__((always_inline)) void fill_tmem(output_t value) {
+    for (uint32_t col = 0; col < xtileN; ++col) {
+      vx_tmem_st(vx_make_tmem_addr(col), static_cast<float>(value));
+    }
+  }
+
+  // ── SMEM load helpers ─────────────────────────────────────────────────────
+  // Cooperatively load A and B tiles into SMEM — same as wgmma_context
+  // (reuse store_matrix_sync from wgmma_context for output)
+
+  // ── UMMA sync ─────────────────────────────────────────────────────────────
+  // A and B both from SMEM descriptors, C/D in TMEM
+  static __attribute__((always_inline)) void umma_sync(smem_matrix_desc desc_a,
+                                                       smem_matrix_desc desc_b) {
+    register uint32_t ra __asm__("a0") = desc_a.value;
+    register uint32_t rb __asm__("a1") = desc_b.value;
+
+    __asm__ volatile (
+      ".insn r %[insn], %[f3], %[f7], x%[fmd], x%[fms], x0\n\t"
+      :
+      : [insn]"i"(RISCV_CUSTOM0),
+        [f3]"i"(VX_UMMA),
+        [f7]"i"(VX_TMEM_FUNCT7),
+        [fmd]"i"(Ot::id),
+        [fms]"i"(It::id),
+        "r"(ra), "r"(rb)
+      : "memory"
+    );
+  }
+
+  // ── Post-processing: TMEM → registers → global memory ────────────────────
+  // Load one column of the accumulator from TMEM into a register per thread.
+  // Call for each col in [0, xtileN) and store to global memory.
+  static __attribute__((always_inline)) float tmem_ld_col(uint32_t col) {
+    return vx_tmem_ld(vx_make_tmem_addr(col));
+  }
+};
+
+#endif // TCU_TMEM_ENABLE
+
 } // namespace tensor
 } // namespace vortex
