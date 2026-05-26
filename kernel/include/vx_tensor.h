@@ -1038,11 +1038,14 @@ public:
 #define VX_UMMA         6
 
 // ─── TMEM address helpers ─────────────────────────────────────────────────────
-// TMEM address format: bits[15:0] = column index
-// Lane is implicit from warp_id * NUM_THREADS + thread_id
-// Upper bits unused in base implementation
-static __attribute__((always_inline)) uint32_t vx_make_tmem_addr(uint32_t col) {
-  return col & 0xFFFF;
+// TMEM address format:
+//   bits[31:16] = lane base (explicit base row for tmem_ld/tmem_st)
+//   bits[15:0]  = column index
+// The lane accessed by each thread is: lane_base + thread_id
+// This allows a warp to access any contiguous range of NUM_THREADS lanes,
+// not just its implicit wid * NUM_THREADS range.
+static __attribute__((always_inline)) uint32_t vx_make_tmem_addr(uint32_t lane_base, uint32_t col) {
+    return ((lane_base & 0xFFFF) << 16) | (col & 0xFFFF);
 }
 
 // ─── TMEM management ─────────────────────────────────────────────────────────
@@ -1075,8 +1078,7 @@ static __attribute__((always_inline)) void vx_tmem_dealloc() {
 }
 
 // Store a float value from this thread's register into TMEM at [lane][col]
-// Each thread stores to its own lane (lane = wid * NT + tid)
-// tmem_addr encodes the column: vx_make_tmem_addr(col)
+// tmem_addr encodes the lane base and column: vx_make_tmem_addr(lane_base, col)
 static __attribute__((always_inline)) void vx_tmem_st(uint32_t tmem_addr, float value) {
   register uint32_t r_addr  __asm__("a0") = tmem_addr;
   register float    r_value __asm__("f0") = value;
@@ -1093,8 +1095,7 @@ static __attribute__((always_inline)) void vx_tmem_st(uint32_t tmem_addr, float 
 }
 
 // Load a float value from TMEM at [lane][col] into this thread's register
-// Each thread loads from its own lane (lane = wid * NT + tid)
-// tmem_addr encodes the column: vx_make_tmem_addr(col)
+// tmem_addr encodes the lane base and column: vx_make_tmem_addr(lane_base, col)
 static __attribute__((always_inline)) float vx_tmem_ld(uint32_t tmem_addr) {
   register uint32_t r_addr   __asm__("a0") = tmem_addr;
   register float    r_result __asm__("f0");
@@ -1124,32 +1125,33 @@ public:
   using input_t  = typename It::dtype;
   using output_t = typename Ot::dtype;
 
-  static constexpr uint32_t tileM  = cfg::xtileM;
-  static constexpr uint32_t tileN  = cfg::xtileN;
-  static constexpr uint32_t tileK  = cfg::tileK;
   static constexpr uint32_t xtileM = cfg::xtileM;
   static constexpr uint32_t xtileN = cfg::xtileN;
   static constexpr uint32_t xtileK = cfg::xtileK;
+  static constexpr uint32_t tileK  = cfg::tileK;
   static constexpr uint32_t NRC    = NRC_;
 
-  // Initialize accumulator in TMEM to zero (or any value)
-  // Each thread initializes its own lane across all xtileN columns
-  static __attribute__((always_inline)) void fill_tmem(output_t value) {
+  // Initialize the accumulator tile in TMEM to a given value.
+  // Must be called by every warp before the K-loop.
+  static __attribute__((always_inline)) void fill_tmem(output_t value, uint32_t warp_rank) {
+    uint32_t lane_base = warp_rank * xtileM;
     for (uint32_t col = 0; col < xtileN; ++col) {
-      vx_tmem_st(vx_make_tmem_addr(col), static_cast<float>(value));
+        vx_tmem_st(vx_make_tmem_addr(lane_base, col), static_cast<float>(value));
     }
   }
 
-  // ── SMEM load helpers ─────────────────────────────────────────────────────
-  // Cooperatively load A and B tiles into SMEM — same as wgmma_context
-  // (reuse store_matrix_sync from wgmma_context for output)
-
   // ── UMMA sync ─────────────────────────────────────────────────────────────
-  // A and B both from SMEM descriptors, C/D in TMEM
+  // Issues a UMMA operation with A and B sourced from SMEM via descriptors
+  // and the accumulator implicitly read/written in TMEM.
+  // warp_rank is passed explicitly so device can correctly map each warp's
+  // accumulator to its lane range in TMEM (lane_base = warp_rank * xtileM),
+  // since the hardware warp ID (wid) may not match warp_rank
   static __attribute__((always_inline)) void umma_sync(smem_matrix_desc desc_a,
-                                                       smem_matrix_desc desc_b) {
+                                                       smem_matrix_desc desc_b,
+                                                       uint32_t warp_rank) {
     register uint32_t ra __asm__("a0") = desc_a.value;
     register uint32_t rb __asm__("a1") = desc_b.value;
+    register uint32_t rw __asm__("a2") = warp_rank;
 
     __asm__ volatile (
       ".insn r %[insn], %[f3], %[f7], x%[fmd], x%[fms], x0\n\t"
@@ -1159,16 +1161,17 @@ public:
         [f7]"i"(VX_TMEM_FUNCT7),
         [fmd]"i"(Ot::id),
         [fms]"i"(It::id),
-        "r"(ra), "r"(rb)
+        "r"(ra), "r"(rb), "r"(rw)
       : "memory"
     );
   }
 
   // ── Post-processing: TMEM → registers → global memory ────────────────────
-  // Load one column of the accumulator from TMEM into a register per thread.
-  // Call for each col in [0, xtileN) and store to global memory.
-  static __attribute__((always_inline)) float tmem_ld_col(uint32_t col) {
-    return vx_tmem_ld(vx_make_tmem_addr(col));
+  // Loads one column of the accumulator tile from TMEM into a register per
+  // thread. Thread t reads from lane (lane_base + t), where lane_base =
+  // warp_rank * xtileM + r * NUM_THREADS for m-step r.
+  static __attribute__((always_inline)) float accum_ld(uint32_t lane_base, uint32_t col) {
+    return vx_tmem_ld(vx_make_tmem_addr(lane_base, col));
   }
 };
 

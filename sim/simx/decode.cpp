@@ -30,6 +30,10 @@
 #include "tensor_cfg.h"
 #endif
 
+#ifndef UMMA_NRC
+#define UMMA_NRC 8
+#endif
+
 using namespace vortex;
 
 static op_string_t op_string(const Instr &instr) {
@@ -1358,14 +1362,14 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
       case 6: { // UMMA - Mostly repurposed from WGMMA
         namespace vt = vortex::tensor;
         // Reused for UMMA geometry — NRC encodes tile width, not register count
-        using wg_cfg = vt::wgmma_config_t<NUM_THREADS, vt::fp32, vt::fp32>;
-        constexpr uint32_t m_steps = wg_cfg::m_steps;   // always 2
-        constexpr uint32_t k_steps = wg_cfg::k_steps;   // always 2
+        using umma_cfg = vt::wgmma_config_t<NUM_THREADS, vt::fp32, vt::fp32, UMMA_NRC>;
+        constexpr uint32_t m_steps = umma_cfg::m_steps;   // always 2
+        constexpr uint32_t k_steps = umma_cfg::k_steps;   // always 2
         uint32_t fmt_d = rd;
         uint32_t fmt_s = rs1;
-        constexpr uint32_t a0 = 10, a1 = 11;
-        uint32_t n_steps = wg_cfg::NRC / m_steps;
-        uint32_t total_uops = k_steps * wg_cfg::NRC;
+        constexpr uint32_t a0 = 10, a1 = 11, a2 = 12;
+        constexpr uint32_t n_steps = umma_cfg::NRC / m_steps;
+        constexpr uint32_t total_uops = k_steps * umma_cfg::NRC;
         uint32_t steps_shift = (total_uops > 1) ? (32 - log2ceil(total_uops)) : 0;
         uint32_t uuid_hi = (uuid >> 32) & 0xffffffff;
         uint32_t uuid_lo = uuid & 0xffffffff;
@@ -1383,6 +1387,7 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
                 uop->setSrcReg(0, a0, RegType::Integer);
                 uop->setSrcReg(1, a1, RegType::Integer);
               }
+              uop->setSrcReg(2, a2, RegType::Integer);  // a2 = warp_rank
               uop->setParentUUID(uuid);
               ibuffer.push_back(uop);
             }

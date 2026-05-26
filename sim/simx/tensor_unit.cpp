@@ -599,21 +599,16 @@ public:
       switch (tcu_type) {
       case TcuType::WMMA:
       case TcuType::WGMMA:
-        delay = 4;
-        break;
-      case TcuType::TMEM_ALLOC:
-      case TcuType::TMEM_DEALLOC:
-      case TcuType::TMEM_ST:
-          delay = 1;
-          break;
-      case TcuType::TMEM_LD:
-          delay = 2;
-          break;
       case TcuType::UMMA:
         delay = 4;
         break;
+      case TcuType::TMEM_ST:
+      case TcuType::TMEM_LD:
       case TcuType::META_STORE:
         delay = 1;
+        break;
+      case TcuType::TMEM_ALLOC:
+      case TcuType::TMEM_DEALLOC:
         break;
       default:
         std::abort();
@@ -978,8 +973,7 @@ public:
     tmem_.ncols_allocated = 0;
   }
 
-	void tmem_st(uint32_t wid,
-				       uint32_t tmem_addr,
+	void tmem_st(uint32_t tmem_addr,
 				       const std::vector<reg_data_t>& rs1_data,
                ExeTraceData* trace_data) {
     __unused(trace_data);
@@ -988,17 +982,16 @@ public:
       std::cout << "Error: TMEM not allocated" << std::endl;
       std::abort();
     }
-    // tmem_addr is uniform
+    // tmem_addr is uniform per warp and encodes lane_base and col
+    uint32_t lane_base = (tmem_addr >> 16) & 0xFFFF;
     uint32_t col = tmem_addr & 0xFFFF;
     // Each thread stores to its own lane, one column
     for (uint32_t t = 0; t < rs1_data.size(); ++t) {
-        uint32_t lane = wid * NUM_THREADS + t;
-        tmem_.data[lane][col] = rs1_data.at(t).u32;
+      tmem_.data[lane_base + t][col] = rs1_data.at(t).u32;
     }
   }
 
-	void tmem_ld(uint32_t wid,
-				       uint32_t tmem_addr,
+	void tmem_ld(uint32_t tmem_addr,
 				       std::vector<reg_data_t>& rd_data,
                ExeTraceData* trace_data) {
     __unused(trace_data);
@@ -1007,16 +1000,17 @@ public:
       std::cout << "Error: TMEM not allocated" << std::endl;
       std::abort();
     }
-    // tmem_addr is uniform
+    // tmem_addr is uniform per warp and encodes lane_base and col
+    uint32_t lane_base = (tmem_addr >> 16) & 0xFFFF;
     uint32_t col = tmem_addr & 0xFFFF;
     // Each thread loads from its own lane, one column
     for (uint32_t t = 0; t < rd_data.size(); ++t) {
-      uint32_t lane = wid * NUM_THREADS + t;
-      rd_data.at(t).u64 = nan_box(tmem_.data[lane][col]);
+      rd_data.at(t).u64 = nan_box(tmem_.data[lane_base + t][col]);
     }
   }
 
 	void umma(uint32_t wid,
+            uint32_t warp_rank,
             uint32_t fmt_s,
             uint32_t fmt_d,
             uint32_t step_m,
@@ -1062,7 +1056,8 @@ public:
           // Load B
           b_col[z].u32 = load_lmem_word(sd_b, k_elem, b_col_idx, fmt_s, true);
         }
-        uint32_t lane = step_m * cfg::tcM + i;
+        uint32_t lane = warp_rank * umma_cfg::xtileM + step_m * cfg::tcM + i; // Calculated with warp_rank, not wid
+                                                                              // warp_rank = tid / NUM_THREADS not guaranteed to match wid
         uint32_t col  = step_n * cfg::tcN + j;
         uint32_t c_val = tmem_.data[lane][col];
         uint32_t d_val = fedp(a_row, b_col, c_val);
@@ -1146,20 +1141,18 @@ private:
     return packed;
   }
 
-  void validate_tmem_access(uint32_t wid, uint32_t lane, uint32_t col) {
-    uint32_t lane_base = wid * NUM_THREADS;
-    uint32_t lane_end = lane_base + NUM_THREADS;
-    if (lane < lane_base || lane >= lane_end) {
-      std::cout << "Error: warp " << wid << " accessing lane " << lane
-                << " outside its range [" << lane_base << "," << lane_end 
-                << ")" << std::endl;
-      std::abort();
+  void validate_tmem_access(uint32_t lane_base, uint32_t col) {
+    if (lane_base + NUM_THREADS > kTmemLanes) {
+        std::cout << "Error: TMEM lane_base " << lane_base
+                  << " + NUM_THREADS exceeds kTmemLanes=" << kTmemLanes
+                  << std::endl;
+        std::abort();
     }
     if (col >= tmem_.ncols_allocated) {
-      std::cout << "Error: TMEM column " << col
-                << " out of allocated range " << tmem_.ncols_allocated 
-                << std::endl;
-      std::abort();
+        std::cout << "Error: TMEM column " << col
+                  << " out of allocated range " << tmem_.ncols_allocated
+                  << std::endl;
+        std::abort();
     }
   }
 
@@ -1302,21 +1295,20 @@ void TensorUnit::tmem_dealloc(ExeTraceData* trace_data) {
   impl_->tmem_dealloc(trace_data);
 }
 
-void TensorUnit::tmem_st(uint32_t wid, 
-                         uint32_t tmem_addr,
+void TensorUnit::tmem_st(uint32_t tmem_addr,
                          const std::vector<reg_data_t>& rs1_data,
                          ExeTraceData* trace_data) {
-  impl_->tmem_st(wid, tmem_addr, rs1_data, trace_data);
+  impl_->tmem_st(tmem_addr, rs1_data, trace_data);
 }
 
-void TensorUnit::tmem_ld(uint32_t wid, 
-                         uint32_t tmem_addr,
+void TensorUnit::tmem_ld(uint32_t tmem_addr,
                          std::vector<reg_data_t>& rd_data,
                          ExeTraceData* trace_data) {
-  impl_->tmem_ld(wid, tmem_addr, rd_data, trace_data);
+  impl_->tmem_ld(tmem_addr, rd_data, trace_data);
 }
 
 void TensorUnit::umma(uint32_t wid,
+                      uint32_t warp_rank,
                       uint32_t fmt_s,
                       uint32_t fmt_d,
                       uint32_t step_m,
@@ -1325,7 +1317,7 @@ void TensorUnit::umma(uint32_t wid,
                       uint32_t a_desc,
                       uint32_t b_desc,
                       ExeTraceData* trace_data) {
-  impl_->umma(wid, fmt_s, fmt_d, step_m, step_n, step_k,
+  impl_->umma(wid, warp_rank, fmt_s, fmt_d, step_m, step_n, step_k,
                 a_desc, b_desc, trace_data);
 }
 

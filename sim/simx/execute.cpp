@@ -1692,14 +1692,14 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         trace->data = trace_data;
         assert(operand_tmask.count() == num_threads);
         uint32_t tmem_addr = rs1_data.at(thread_start).u32;
-        core_->tensor_unit()->tmem_st(wid, tmem_addr, rs2_data, trace_data.get());
+        core_->tensor_unit()->tmem_st(tmem_addr, rs2_data, trace_data.get());
       } break;
       case TcuType::TMEM_LD: {
         auto trace_data = std::make_shared<TensorUnit::ExeTraceData>();
         trace->data = trace_data;
         assert(operand_tmask.count() == num_threads);
         uint32_t tmem_addr = rs1_data.at(thread_start).u32;
-        core_->tensor_unit()->tmem_ld(wid, tmem_addr, rd_data, trace_data.get());
+        core_->tensor_unit()->tmem_ld(tmem_addr, rd_data, trace_data.get());
         rd_write = true;
       } break;
       case TcuType::UMMA: {
@@ -1709,7 +1709,8 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         assert(exec_tmask.count() == num_threads);
         uint32_t a_desc = rs1_data.empty() ? 0 : rs1_data.at(0).u32;
         uint32_t b_desc = rs2_data.empty() ? 0 : rs2_data.at(0).u32;
-        core_->tensor_unit()->umma(wid, tpuArgs.fmt_s, tpuArgs.fmt_d,
+        uint32_t warp_rank = rs3_data.empty() ? wid : rs3_data.at(0).u32;
+        core_->tensor_unit()->umma(wid, warp_rank, tpuArgs.fmt_s, tpuArgs.fmt_d,
                                     tpuArgs.step_m, tpuArgs.step_n, tpuArgs.step_k,
                                     a_desc, b_desc, trace_data.get());
       } break;

@@ -97,17 +97,16 @@ public:
 
 	void tmem_dealloc(ExeTraceData* trace_data);
 
-	void tmem_st(uint32_t wid,
-				 uint32_t tmem_addr,
+	void tmem_st(uint32_t tmem_addr,
 				 const std::vector<reg_data_t>& rs1_data,
 				 ExeTraceData* trace_data);
 
-	void tmem_ld(uint32_t wid,
-				 uint32_t tmem_addr,
+	void tmem_ld(uint32_t tmem_addr,
 				 std::vector<reg_data_t>& rd_data,
 				 ExeTraceData* trace_data);
 
 	void umma(uint32_t wid,
+			  uint32_t warp_rank,
 			  uint32_t fmt_s,
 			  uint32_t fmt_d,
 			  uint32_t step_m,
