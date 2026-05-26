@@ -732,7 +732,7 @@ struct IntrTcuArgs {
   uint32_t fmt_s     : 5;
   uint32_t fmt_d     : 5;
   uint32_t step_m    : 4;
-  uint32_t step_n    : 4;
+  uint32_t step_n    : 7; // max 128
   uint32_t step_k    : 4;
   uint32_t meta_kind : 1; // 0=sparse, 1=mx
 };
