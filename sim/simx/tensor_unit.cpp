@@ -951,8 +951,8 @@ public:
       std::abort();
     }
     if (ncols > kTmemCols) {
-      std::cout << "Error: TMEM ncols " << ncols 
-                << " exceeds capacity " << kTmemCols << std::endl;
+      std::cout << "Error: TMEM ncols " << std::dec << ncols 
+                << " exceeds capacity " << std::dec << kTmemCols << std::endl;
       std::abort();
     }
     tmem_.ncols_allocated = ncols;
