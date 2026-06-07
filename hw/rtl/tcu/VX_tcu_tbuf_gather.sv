@@ -48,9 +48,9 @@ module VX_tcu_tbuf_gather import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 `endif
 ) (
     // Step and format inputs
-    input  wire [3:0]               req_step_m,
-    input  wire [3:0]               req_step_n,
-    input  wire [3:0]               req_step_k,
+    input  wire [2:0]               req_step_m,
+    input  wire [6:0]               req_step_n,
+    input  wire [2:0]               req_step_k,
     input  wire [4:0]               req_fmt_s,
     input  wire [1:0]               req_cd_nregs,
 

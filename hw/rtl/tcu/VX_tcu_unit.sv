@@ -39,9 +39,14 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     localparam BLOCK_SIZE = `NUM_TCU_BLOCKS;
     localparam NUM_LANES  = `NUM_TCU_LANES;
 
+    `STATIC_ASSERT(BLOCK_SIZE == 1, ("TMEM only supports BLOCK_SIZE=1"))
     `STATIC_ASSERT (BLOCK_SIZE == `ISSUE_WIDTH, ("must be full issue execution"));
     `STATIC_ASSERT (NUM_LANES == `NUM_THREADS, ("must be full warp execution"));
     `SCOPE_IO_SWITCH (BLOCK_SIZE);
+
+`ifdef TCU_TMEM_ENABLE
+    `STATIC_ASSERT(TCU_TMEM_LANES <= 128, ("TMEM lanes exceed cap"))
+`endif
 
     VX_execute_if #(
         .data_t (tcu_execute_t)
@@ -101,8 +106,15 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         assign blk_lmem_if.req_ready      = per_blk_rd_ready[block_idx];
         assign per_blk_rd_addr[block_idx] = blk_lmem_if.req_addr;
 
+    `ifdef TCU_TMEM_ENABLE
+        wire is_wgmma_or_umma_b = (per_block_execute_if[block_idx].data.op_type == INST_TCU_WGMMA)
+                               || (per_block_execute_if[block_idx].data.op_type == INST_TCU_UMMA);
+        wire req_valid_b = per_block_execute_if[block_idx].valid && is_wgmma_or_umma_b;
+        wire req_fire_b  = per_block_execute_if[block_idx].valid
+                        && per_block_execute_if[block_idx].ready
+                        && is_wgmma_or_umma_b;
+    `else
         wire is_wgmma_b = (per_block_execute_if[block_idx].data.op_type == INST_TCU_WGMMA);
-
         wire req_valid_b = per_block_execute_if[block_idx].valid && is_wgmma_b;
         // req_fire: the execute unit actually consumed this µop this cycle.
         // Used by tile_buf to clear warp_alloc_pending at the right time,
@@ -110,6 +122,7 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         wire req_fire_b  = per_block_execute_if[block_idx].valid
                         && per_block_execute_if[block_idx].ready
                         && is_wgmma_b;
+    `endif
 
         VX_tcu_tbuf #(
             .INSTANCE_ID    (`SFORMATF(("%s-tbuf%0d", INSTANCE_ID, block_idx))),
@@ -237,6 +250,162 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
 `endif // TCU_WGMMA_ENABLE
 
+`ifdef TCU_TMEM_ENABLE
+    // -----------------------------------------------------------------------
+    // TMEM storage and management
+    // -----------------------------------------------------------------------
+
+    logic [31:0]    tmem_data [TCU_TMEM_LANES][TCU_TMEM_COLS];
+    logic           tmem_allocated;
+    logic [7:0]     tmem_ncols;
+
+    `UNUSED_VAR(tmem_allocated);
+    `UNUSED_VAR(tmem_ncols);
+
+    // TMEM read output
+    wire [31:0] tmem_rd_data [BLOCK_SIZE][`NUM_THREADS];
+    wire        tmem_rd_valid[BLOCK_SIZE];
+
+    // Per-block outputs from tcu_core
+    wire                                    tmem_wr_en        [BLOCK_SIZE];
+    wire [TCU_TMEM_LANE_BITS-1:0]           tmem_wr_lane_base [BLOCK_SIZE];
+    wire [TCU_TMEM_COL_BITS-1:0]            tmem_wr_col_base  [BLOCK_SIZE];
+    wire [TCU_TC_M-1:0][TCU_TC_N-1:0][31:0] tmem_wr_data      [BLOCK_SIZE];
+    wire [TCU_TMEM_LANE_BITS-1:0]           tmem_warp_rank    [BLOCK_SIZE];  
+
+    for (genvar block_idx = 0; block_idx < BLOCK_SIZE; ++block_idx) begin : g_tmem_warp_rank
+        assign tmem_warp_rank[block_idx] = TCU_TMEM_LANE_BITS'(per_block_execute_if[block_idx].data.rs3_data[0]);
+    end
+
+    for (genvar block_idx = 0; block_idx < BLOCK_SIZE; ++block_idx) begin : g_tmem_mgmt
+        always_ff @(posedge clk) begin
+            if (reset) begin
+                tmem_allocated <= 0;
+                tmem_ncols     <= '0;
+            end else begin
+                if (per_block_execute_if[block_idx].valid && per_block_execute_if[block_idx].ready) begin
+                    case (per_block_execute_if[block_idx].data.op_type)
+                        INST_TCU_TMEM_ALLOC: begin
+                            tmem_allocated <= 1'b1;
+                            tmem_ncols     <= per_block_execute_if[block_idx].data.rs1_data[0][7:0];
+                            for (int l = 0; l < TCU_TMEM_LANES; ++l)
+                                for (int c = 0; c < TCU_TMEM_COLS; ++c)
+                                    tmem_data[l][c] <= '0;
+                        end
+                        INST_TCU_TMEM_DEALLOC: begin
+                            tmem_allocated <= 1'b0;
+                            tmem_ncols     <= '0;
+                        end
+                        INST_TCU_TMEM_ST: begin
+                            for (int t = 0; t < `NUM_THREADS; ++t) begin
+                                if (per_block_execute_if[block_idx].data.header.tmask[t]) begin
+                                    automatic logic [TCU_TMEM_LANE_BITS-1:0] lane_base =
+                                        TCU_TMEM_LANE_BITS'(per_block_execute_if[block_idx].data.rs1_data[0][31:16]);
+                                    automatic logic [TCU_TMEM_COL_BITS-1:0] col =
+                                        TCU_TMEM_COL_BITS'(per_block_execute_if[block_idx].data.rs1_data[0][15:0]);
+                                    tmem_data[TCU_TMEM_LANE_BITS'(lane_base) + TCU_TMEM_LANE_BITS'(t)][col] <=
+                                        per_block_execute_if[block_idx].data.rs2_data[t][31:0];
+                                end
+                            end
+                        end
+                        default:;
+                    endcase
+                end
+            end
+        end
+    end
+
+    // TMEM_LD
+    for (genvar block_idx = 0; block_idx < BLOCK_SIZE; ++block_idx) begin : g_tmem_ld
+        wire is_tmem_ld = per_block_execute_if[block_idx].valid 
+                       && (per_block_execute_if[block_idx].data.op_type == INST_TCU_TMEM_LD);
+        for (genvar t = 0; t < `NUM_THREADS; ++t) begin : g_tmem_ld_t
+            wire [TCU_TMEM_LANE_BITS-1:0] lane_base = 
+                TCU_TMEM_LANE_BITS'(per_block_execute_if[block_idx].data.rs1_data[0][31:16]);
+            wire [TCU_TMEM_COL_BITS-1:0] col = 
+                TCU_TMEM_COL_BITS'(per_block_execute_if[block_idx].data.rs1_data[0][15:0]);
+            assign tmem_rd_data[block_idx][t] = is_tmem_ld ? tmem_data[lane_base + t][col] : '0;
+        end
+        assign tmem_rd_valid[block_idx] = is_tmem_ld;
+    end
+
+    // UMMA d_val writeback to TMEM
+    for (genvar block_idx = 0; block_idx < BLOCK_SIZE; ++block_idx) begin : g_tmem_wr
+        always_ff @(posedge clk) begin
+            if (tmem_wr_en[block_idx]) begin
+                for (int i = 0; i < TCU_TC_M; ++i) begin
+                    for (int j = 0; j < TCU_TC_N; ++j) begin
+                        tmem_data   [TCU_TMEM_LANE_BITS'(tmem_wr_lane_base[block_idx]) + TCU_TMEM_LANE_BITS'(i)]
+                                    [TCU_TMEM_COL_BITS'(tmem_wr_col_base[block_idx])   + TCU_TMEM_COL_BITS'(j)]
+                            <= tmem_wr_data[block_idx][i][j];
+                    end
+                end
+            end
+        end
+    end
+
+    // -----------------------------------------------------------------------
+    // TMEM bypass, routes ALLOC/DEALLOC/ST/LD around tcu_core
+    // -----------------------------------------------------------------------
+
+    VX_execute_if #(.data_t(tcu_execute_t)) core_execute_if[BLOCK_SIZE]();
+    VX_result_if  #(.data_t(tcu_result_t))  tmem_result_if[BLOCK_SIZE]();
+
+    for (genvar block_idx = 0; block_idx < BLOCK_SIZE; ++block_idx) begin : g_tmem_bypass
+        wire is_tmem_mgmt = (per_block_execute_if[block_idx].data.op_type == INST_TCU_TMEM_ALLOC)
+                         || (per_block_execute_if[block_idx].data.op_type == INST_TCU_TMEM_DEALLOC)
+                         || (per_block_execute_if[block_idx].data.op_type == INST_TCU_TMEM_ST)
+                         || (per_block_execute_if[block_idx].data.op_type == INST_TCU_TMEM_LD);
+
+        // Route TMEM management instructions directly to bypass result, everything else to tcu_core
+        assign core_execute_if[block_idx].valid = per_block_execute_if[block_idx].valid && ~is_tmem_mgmt;
+        assign core_execute_if[block_idx].data = per_block_execute_if[block_idx].data;
+
+        // TMEM ALLOC/DEALLOC/ST ready immediately, results fire same cycle
+        assign tmem_result_if[block_idx].valid = per_block_execute_if[block_idx].valid && is_tmem_mgmt;
+        assign tmem_result_if[block_idx].data.header = per_block_execute_if[block_idx].data.header;
+
+        // TMEM LD puts result data into result
+        for (genvar t = 0; t < `NUM_THREADS; ++t) begin : g_tmem_ld_result
+            if (`XLEN > 32) begin : g_nanbox
+                assign tmem_result_if[block_idx].data.data[t] = tmem_rd_valid[block_idx]
+                                                              ? {32'hffffffff, tmem_rd_data[block_idx][t]}
+                                                              : '0;
+            end else begin : g_pass
+                assign tmem_result_if[block_idx].data.data[t] = tmem_rd_valid[block_idx]
+                                                              ? `XLEN'(tmem_rd_data[block_idx][t])
+                                                              : '0;
+            end
+        end
+
+        assign per_block_execute_if[block_idx].ready = is_tmem_mgmt
+                                                     ? tmem_result_if[block_idx].ready
+                                                     : core_execute_if[block_idx].ready;
+    end
+
+    // -----------------------------------------------------------------------
+    // TMEM write pending register stalls UMMA until previous write completes
+    // -----------------------------------------------------------------------
+
+    localparam TMEM_PIPE_LATENCY = FEDP_LATENCY + 1;
+    
+    reg [TMEM_PIPE_LATENCY-1:0] tmem_wr_pending [BLOCK_SIZE];
+    wire tmem_wr_busy [BLOCK_SIZE];
+    
+    for (genvar block_idx = 0; block_idx < BLOCK_SIZE; ++block_idx) begin : g_tmem_hazard
+        wire umma_fire = core_execute_if[block_idx].valid 
+                      && core_execute_if[block_idx].ready
+                      && (core_execute_if[block_idx].data.op_type == INST_TCU_UMMA);
+        always_ff @(posedge clk) begin
+            if (reset)
+                tmem_wr_pending[block_idx] <= '0;
+            else
+                tmem_wr_pending[block_idx] <= {tmem_wr_pending[block_idx][TMEM_PIPE_LATENCY-2:0], umma_fire};
+        end
+        assign tmem_wr_busy[block_idx] = |tmem_wr_pending[block_idx];
+    end
+`endif // TCU_TMEM_ENABLE
+
     // -----------------------------------------------------------------------
     // TCU core instances
     // -----------------------------------------------------------------------
@@ -256,10 +425,40 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         `endif
             .tbuf_ready (tbuf_ready[block_idx]),
         `endif
-            .execute_if (per_block_execute_if[block_idx]),
-            .result_if  (per_block_result_if[block_idx])
+        `ifdef TCU_TMEM_ENABLE
+            .tmem_data          (tmem_data),
+            .tmem_warp_rank     (tmem_warp_rank[block_idx]),
+            .tmem_wr_busy       (tmem_wr_busy[block_idx]),
+            .tmem_wr_en         (tmem_wr_en[block_idx]),
+            .tmem_wr_lane_base  (tmem_wr_lane_base[block_idx]),
+            .tmem_wr_col_base   (tmem_wr_col_base[block_idx]),
+            .tmem_wr_data       (tmem_wr_data[block_idx]),
+            .execute_if         (core_execute_if[block_idx]),
+        `else
+            .execute_if         (per_block_execute_if[block_idx]),
+        `endif
+            .result_if          (per_block_result_if[block_idx])
         );
     end
+
+    // -----------------------------------------------------------------------
+    // Merge result streams (core and bypass)
+    // -----------------------------------------------------------------------
+
+`ifdef TCU_TMEM_ENABLE
+    VX_result_if #(.data_t(tcu_result_t)) merged_result_if[BLOCK_SIZE]();
+
+    for (genvar block_idx = 0; block_idx < BLOCK_SIZE; ++block_idx) begin : g_merge
+        assign merged_result_if[block_idx].valid = per_block_result_if[block_idx].valid 
+                                                || tmem_result_if[block_idx].valid;
+        assign merged_result_if[block_idx].data = tmem_result_if[block_idx].valid 
+                                                ? tmem_result_if[block_idx].data
+                                                : per_block_result_if[block_idx].data;
+        assign per_block_result_if[block_idx].ready = merged_result_if[block_idx].ready 
+                                                   && ~tmem_result_if[block_idx].valid;
+        assign tmem_result_if[block_idx].ready = merged_result_if[block_idx].ready;
+    end
+`endif
 
     // -----------------------------------------------------------------------
     // Lane gather
@@ -272,7 +471,11 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     ) lane_gather (
         .clk       (clk),
         .reset     (reset),
+    `ifdef TCU_TMEM_ENABLE
+        .result_if (merged_result_if),
+    `else
         .result_if (per_block_result_if),
+    `endif
         .commit_if (commit_if)
     );
 

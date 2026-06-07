@@ -68,9 +68,9 @@ module VX_tcu_tbuf_fetch import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     input  wire                     req_fire,   // execute consumed current µop
     input  wire [NW_WIDTH-1:0]      req_wid,
     input  wire                     req_is_sparse,
-    input  wire [3:0]               req_step_m,
-    input  wire [3:0]               req_step_n,
-    input  wire [3:0]               req_step_k,
+    input  wire [2:0]               req_step_m,
+    input  wire [6:0]               req_step_n,
+    input  wire [2:0]               req_step_k,
     input  wire [4:0]               req_fmt_s,
     input  wire [`XLEN-1:0]         req_desc_a,
     input  wire [`XLEN-1:0]         req_desc_b,

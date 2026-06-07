@@ -38,6 +38,12 @@
 `endif
 `endif
 
+`ifdef TCU_TMEM_ENABLE
+    `ifndef TCU_WGMMA_ENABLE
+        `define TCU_WGMMA_ENABLE
+    `endif
+`endif
+
 ///////////////////////////////////////////////////////////////////////////////
 
 `define __used_reg_rv_rd  RV_RD

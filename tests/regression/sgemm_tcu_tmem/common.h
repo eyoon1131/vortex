@@ -3,6 +3,14 @@
 
 #include <stdint.h>
 
+#ifdef TCU_TMEM_ENABLE
+  #ifndef TCU_WGMMA_ENABLE
+    #define TCU_WGMMA_ENABLE
+  #endif
+#else 
+  #error "sgemm_tcu_tmem requires TCU_TMEM_ENABLE"
+#endif
+
 #ifndef NUM_THREADS
 #define NUM_THREADS 4
 #endif

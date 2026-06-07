@@ -10,14 +10,6 @@
 #include <vector>
 #include <vortex.h>
 
-#ifndef TCU_WGMMA_ENABLE
-#error "sgemm_tcu_umma requires TCU_WGMMA_ENABLE"
-#endif
-
-#ifndef TCU_TMEM_ENABLE
-#error "sgemm_tcu_umma requires TCU_TMEM_ENABLE"
-#endif
-
 #define FLOAT_ULP 6
 #define MAX_ERRORS 100
 

@@ -48,6 +48,10 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     `STATIC_ASSERT(`LMEM_ENABLED, ("TCU_WGMMA_ENABLE requires LMEM_ENABLE"))
 `endif
 
+`ifdef TCU_TMEM_ENABLE
+    `STATIC_ASSERT(`LMEM_ENABLED, ("TCU_TMEM_ENABLE requires LMEM_ENABLE"))
+`endif
+
 `ifdef LMEM_ENABLE
 
     `STATIC_ASSERT(`IS_DIVISBLE((1 << `LMEM_LOG_SIZE), `MEM_BLOCK_SIZE), ("invalid parameter"))

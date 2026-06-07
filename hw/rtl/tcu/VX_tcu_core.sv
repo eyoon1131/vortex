@@ -30,6 +30,17 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     input wire          tbuf_ready,
 `endif
 
+`ifdef TCU_TMEM_ENABLE
+    // TMEM read/write ports
+    input wire [31:0]                               tmem_data[TCU_TMEM_LANES][TCU_TMEM_COLS],
+    input wire [TCU_TMEM_LANE_BITS-1:0]             tmem_warp_rank,
+    input wire                                      tmem_wr_busy,
+    output wire                                     tmem_wr_en,
+    output wire [TCU_TMEM_LANE_BITS-1:0]            tmem_wr_lane_base,
+    output wire [TCU_TMEM_COL_BITS-1:0]             tmem_wr_col_base,
+    output wire [TCU_TC_M-1:0][TCU_TC_N-1:0][31:0]  tmem_wr_data,
+`endif
+
     // Inputs
     VX_execute_if.slave execute_if,
 
@@ -37,35 +48,6 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     VX_result_if.master result_if
 );
     `UNUSED_SPARAM (INSTANCE_ID);
-
-`ifdef TCU_TYPE_DSP
-    localparam FCVT_LATENCY = 1;
-    localparam FMUL_LATENCY = 8;
-    localparam FADD_LATENCY = 11;
-    localparam FACC_LATENCY = $clog2(2 * TCU_TC_K + 1) * FADD_LATENCY;
-    localparam FEDP_LATENCY = FCVT_LATENCY + FMUL_LATENCY + FACC_LATENCY;
-`elsif TCU_TYPE_BHF
-    localparam FMUL_LATENCY = 2;
-    localparam FADD_LATENCY = 2;
-    localparam FRND_LATENCY = 1;
-    localparam FACC_LATENCY  = $clog2(2 * TCU_TC_K + 1) * (FADD_LATENCY + FRND_LATENCY);
-    localparam FEDP_LATENCY = (FMUL_LATENCY + FRND_LATENCY) + 1 + FACC_LATENCY;
-`elsif TCU_TYPE_FPNEW
-    localparam FMUL_LATENCY = 2;
-    localparam FADD_LATENCY = 2;
-    localparam FACC_LATENCY  = $clog2(2 * TCU_TC_K) * FADD_LATENCY;
-    localparam FEDP_LATENCY = FMUL_LATENCY + 1 + FACC_LATENCY + FADD_LATENCY;
-`elsif TCU_TYPE_DPI
-    localparam FMUL_LATENCY = 2;
-    localparam FACC_LATENCY = 2;
-    localparam FEDP_LATENCY = FMUL_LATENCY + FACC_LATENCY;
-`else // TCU_TYPE_TFR
-    localparam FMUL_LATENCY = 1;
-    localparam FALN_LATENCY = 1;
-    localparam FACC_LATENCY = 1;
-    localparam FRND_LATENCY = 1;
-    localparam FEDP_LATENCY = FMUL_LATENCY + FALN_LATENCY + FACC_LATENCY + FRND_LATENCY;
-`endif
 
     localparam PIPE_LATENCY = FEDP_LATENCY + 1;
     localparam MDATA_QUEUE_DEPTH = 1 << $clog2(PIPE_LATENCY);
@@ -89,19 +71,30 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
 `ifdef TCU_WGMMA_ENABLE
     wire is_wgmma = (execute_if.data.op_type == INST_TCU_WGMMA);
+`ifdef TCU_TMEM_ENABLE
+    wire is_umma  = (execute_if.data.op_type == INST_TCU_UMMA);
+`endif
     wire wg_a_smem = execute_if.data.op_args.tcu.a_from_smem;
     // A source: tile buffer (smem) or register file
-    assign rs1_data = (is_wgmma && wg_a_smem) ? tbuf_rs1_data : execute_if.data.rs1_data;
-    // B source: always tile buffer (smem) for WGMMA
-    assign rs2_data = is_wgmma ? tbuf_rs2_data[TCU_BLOCK_CAP-1:0] : execute_if.data.rs2_data;
+    assign rs1_data = ((is_wgmma && wg_a_smem) 
+`ifdef TCU_TMEM_ENABLE
+                    || is_umma
+`endif
+                    ) ? tbuf_rs1_data : execute_if.data.rs1_data;
+    // B source: always tile buffer (smem) for WGMMA/UMMA
+    assign rs2_data = (is_wgmma
+`ifdef TCU_TMEM_ENABLE
+                    || is_umma
+`endif
+                    ) ? tbuf_rs2_data[TCU_BLOCK_CAP-1:0] : execute_if.data.rs2_data;
 `else
     assign rs1_data = execute_if.data.rs1_data;
     assign rs2_data = execute_if.data.rs2_data;
 `endif
 
-    wire [3:0] step_m = execute_if.data.op_args.tcu.step_m;
-    wire [3:0] step_n = execute_if.data.op_args.tcu.step_n;
-    wire [3:0] step_k = execute_if.data.op_args.tcu.step_k;
+    wire [2:0] step_m = execute_if.data.op_args.tcu.step_m;
+    wire [6:0] step_n = execute_if.data.op_args.tcu.step_n;
+    wire [2:0] step_k = execute_if.data.op_args.tcu.step_k;
 
     wire [4:0] fmt_s = execute_if.data.op_args.tcu.fmt_s;
     wire [4:0] fmt_d = execute_if.data.op_args.tcu.fmt_d;
@@ -131,7 +124,11 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     end
 `endif
 
+`ifdef TCU_TMEM_ENABLE
+    `UNUSED_VAR ({step_k, fmt_s, fmt_d, execute_if.data});
+`else
     `UNUSED_VAR ({step_m, step_n, step_k, fmt_s, fmt_d, execute_if.data});
+`endif
 
     // -----------------------------------------------------------------------
     // Pipeline control
@@ -160,7 +157,13 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     assign result_if.valid  = fedp_done;
     assign fedp_enable      = ~result_if.valid || result_if.ready;
 `ifdef TCU_WGMMA_ENABLE
+`ifdef TCU_TMEM_ENABLE
+    assign execute_if.ready = ~mdata_queue_full && fedp_enable 
+                           && (~(is_wgmma || is_umma) || tbuf_ready)
+                           && ~(is_umma && tmem_wr_busy);;
+`else
     assign execute_if.ready = ~mdata_queue_full && fedp_enable && (~is_wgmma || tbuf_ready);
+`endif
 `else
     assign execute_if.ready = ~mdata_queue_full && fedp_enable;
 `endif
@@ -267,7 +270,17 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             `endif
             end
 
+        `ifdef TCU_TMEM_ENABLE
+            wire [TCU_TMEM_LANE_BITS-1:0] tmem_lane = TCU_TMEM_LANE_BITS'(tmem_warp_rank) * TCU_TMEM_LANE_BITS'(TCU_WG_TILE_M)
+                                                    + TCU_TMEM_LANE_BITS'(step_m) * TCU_TMEM_LANE_BITS'(TCU_TC_M)
+                                                    + TCU_TMEM_LANE_BITS'(i);
+            wire [TCU_TMEM_COL_BITS-1:0]  tmem_col  = TCU_TMEM_COL_BITS'(step_n) * TCU_TMEM_COL_BITS'(TCU_TC_N)
+                                                    + TCU_TMEM_COL_BITS'(j);
+            wire [31:0] c_val = is_umma ? tmem_data[tmem_lane][tmem_col]
+                                        : 32'(execute_if.data.rs3_data[i * TCU_TC_N + j]);
+        `else
             wire [31:0] c_val = 32'(execute_if.data.rs3_data[i * TCU_TC_N + j]);
+        `endif
 
         `ifdef TCU_SPARSE_ENABLE
             VX_tcu_sp_mux #(
@@ -401,5 +414,40 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         `endif // DBG_TRACE_TCU
         end
     end
+
+`ifdef TCU_TMEM_ENABLE
+    // -----------------------------------------------------------------------
+    // TMEM write: delay pipe carries write address through FEDP latency
+    // -----------------------------------------------------------------------
+    typedef struct packed {
+        logic                           valid;
+        logic [TCU_TMEM_LANE_BITS-1:0]  lane_base;  // warp_rank * xtileM + step_m * tcM
+        logic [TCU_TMEM_COL_BITS-1:0]   col_base;   // step_n * tcN
+    } tmem_addr_t;
+
+    tmem_addr_t tmem_addr_pipe [PIPE_LATENCY];
+
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            for (int p = 0; p < PIPE_LATENCY; ++p)
+                tmem_addr_pipe[p] <= '0;
+        end else if (fedp_enable) begin
+            for (int p = 0; p < PIPE_LATENCY-1; ++p)
+                tmem_addr_pipe[p] <= tmem_addr_pipe[p+1];
+            tmem_addr_pipe[PIPE_LATENCY-1].valid        <= execute_fire && is_umma;
+            tmem_addr_pipe[PIPE_LATENCY-1].lane_base    <= TCU_TMEM_LANE_BITS'(TCU_TMEM_LANE_BITS'(tmem_warp_rank) 
+                                                         * TCU_TMEM_LANE_BITS'(TCU_WG_TILE_M)
+                                                         + TCU_TMEM_LANE_BITS'(step_m) 
+                                                         * TCU_TMEM_LANE_BITS'(TCU_TC_M));
+            tmem_addr_pipe[PIPE_LATENCY-1].col_base     <= TCU_TMEM_COL_BITS'(TCU_TMEM_COL_BITS'(step_n) 
+                                                         * TCU_TMEM_COL_BITS'(TCU_TC_N));
+        end
+    end
+
+    assign tmem_wr_en        = tmem_addr_pipe[0].valid;
+    assign tmem_wr_lane_base = tmem_addr_pipe[0].lane_base;
+    assign tmem_wr_col_base  = tmem_addr_pipe[0].col_base;
+    assign tmem_wr_data      = d_val;  // d_val is available when fedp_done fires
+`endif
 
 endmodule

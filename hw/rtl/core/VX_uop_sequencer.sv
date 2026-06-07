@@ -130,6 +130,9 @@ module VX_uop_sequencer import
     `ifdef TCU_WGMMA_ENABLE
         || uop_in_data.op_type == INST_TCU_WGMMA
     `endif
+    `ifdef TCU_TMEM_ENABLE
+        || uop_in_data.op_type == INST_TCU_UMMA
+    `endif
         );
     VX_tcu_uops tcu_uops (
         .clk       (clk),

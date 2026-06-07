@@ -59,6 +59,9 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
 
 `ifdef TCU_WGMMA_ENABLE
     wire is_wgmma = (ibuf_in.op_type == INST_TCU_WGMMA);
+`ifdef TCU_TMEM_ENABLE
+    wire is_umma = (ibuf_in.op_type == INST_TCU_UMMA);
+`endif
     wire wg_a_from_smem = ibuf_in.op_args.tcu.a_from_smem;
 
     // Variable NRC based on cd_nregs: 0→8, 1→16, 2→32
@@ -141,6 +144,9 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
 `endif
 
     assign uop_count =
+`ifdef TCU_TMEM_ENABLE
+        is_umma ? wg_uop_cnt :
+`endif
 `ifdef TCU_WGMMA_ENABLE
         is_wgmma ? (
     `ifdef TCU_SPARSE_ENABLE
@@ -266,9 +272,9 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
     `endif
     `ifdef TCU_WGMMA_ENABLE
         if (is_wgmma) begin
-            ibuf_r.op_args.tcu.step_m = 4'(wg_m_index);
-            ibuf_r.op_args.tcu.step_n = 4'(wg_n_index);
-            ibuf_r.op_args.tcu.step_k = 4'(wg_k_index);
+            ibuf_r.op_args.tcu.step_m = 3'(wg_m_index);
+            ibuf_r.op_args.tcu.step_n = 7'(wg_n_index);
+            ibuf_r.op_args.tcu.step_k = 3'(wg_k_index);
             ibuf_r.wb  = 1;
             ibuf_r.rd  = make_reg_num(REG_TYPE_F, TCU_WG_RC + wg_rs3_off);
             ibuf_r.rs3 = make_reg_num(REG_TYPE_F, TCU_WG_RC + wg_rs3_off);
@@ -283,6 +289,25 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
             // B source: always smem descriptor (x11)
             ibuf_r.rs2 = make_reg_num(REG_TYPE_I, 5'd11);
             ibuf_r.used_rs[1] = is_first_uop;
+        end else
+    `endif
+    `ifdef TCU_TMEM_ENABLE
+        if (is_umma) begin
+            ibuf_r.op_args.tcu.step_m = 3'(wg_m_index);
+            ibuf_r.op_args.tcu.step_n = 7'(wg_n_index);
+            ibuf_r.op_args.tcu.step_k = 3'(wg_k_index);
+            // No register writeback
+            ibuf_r.wb  = 0;
+            ibuf_r.rd  = '0;
+            // A source: smem descriptor (x10), read on first uop only
+            ibuf_r.rs1 = make_reg_num(REG_TYPE_I, 5'd10);
+            ibuf_r.used_rs[0] = is_first_uop;
+            // B source: smem descriptor (x11), read on first uop only
+            ibuf_r.rs2 = make_reg_num(REG_TYPE_I, 5'd11);
+            ibuf_r.used_rs[1] = is_first_uop;
+            // warp_rank: x12
+            ibuf_r.rs3 = make_reg_num(REG_TYPE_I, 5'd12);
+            ibuf_r.used_rs[2] = '1;
         end else
     `endif
         begin
@@ -300,9 +325,9 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
         ibuf_r.op_type = meta_uop ? INST_TCU_META_STORE : ibuf_in.op_type;
         ibuf_r.op_args.tcu.fmt_d = meta_uop ? 5'(ctr) : ibuf_in.op_args.tcu.fmt_d;
 
-        ibuf_r.op_args.tcu.step_m = meta_uop ? '0 : (SYM_SPARSE && is_sparse ? 4'(m_sp_s) : 4'(m_index));
-        ibuf_r.op_args.tcu.step_n = meta_uop ? '0 : (SYM_SPARSE && is_sparse ? 4'(n_sp_s) : 4'(n_index));
-        ibuf_r.op_args.tcu.step_k = meta_uop ? '0 : (SYM_SPARSE && is_sparse ? 4'(0)      : 4'(k_index));
+        ibuf_r.op_args.tcu.step_m = meta_uop ? '0 : (SYM_SPARSE && is_sparse ? 3'(m_sp_s) : 3'(m_index));
+        ibuf_r.op_args.tcu.step_n = meta_uop ? '0 : (SYM_SPARSE && is_sparse ? 7'(n_sp_s) : 7'(n_index));
+        ibuf_r.op_args.tcu.step_k = meta_uop ? '0 : (SYM_SPARSE && is_sparse ? 3'(0)      : 3'(k_index));
 
         ibuf_r.wb  = meta_uop ? 1'b0 : 1'b1;
         ibuf_r.rd  = meta_uop ? '0 : make_reg_num(REG_TYPE_F, rs3);
@@ -315,9 +340,9 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
         ibuf_r.rs2 = meta_uop ? ibuf_in.rs2 : make_reg_num(REG_TYPE_F, rs2);
         ibuf_r.rs3 = meta_uop ? '0 : make_reg_num(REG_TYPE_F, rs3);
     `else
-        ibuf_r.op_args.tcu.step_m = 4'(m_index);
-        ibuf_r.op_args.tcu.step_n = 4'(n_index);
-        ibuf_r.op_args.tcu.step_k = 4'(k_index);
+        ibuf_r.op_args.tcu.step_m = 3'(m_index);
+        ibuf_r.op_args.tcu.step_n = 7'(n_index);
+        ibuf_r.op_args.tcu.step_k = 3'(k_index);
         ibuf_r.wb  = 1;
         ibuf_r.rd  = make_reg_num(REG_TYPE_F, rs3);
         ibuf_r.rs1 = make_reg_num(REG_TYPE_F, rs1);

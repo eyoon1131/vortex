@@ -29,8 +29,8 @@ module VX_tcu_meta import VX_gpu_pkg::*, VX_tcu_pkg::*;
 
     // Read port (from FEDP path)
     input wire [`LOG2UP(`NUM_WARPS)-1:0] rd_wid,
-    input wire [3:0]    step_m,
-    input wire [3:0]    step_k,
+    input wire [2:0]    step_m,
+    input wire [2:0]    step_k,
     output wire [TCU_MAX_META_BLOCK_WIDTH-1:0] vld_block
 );
     `UNUSED_SPARAM (INSTANCE_ID)

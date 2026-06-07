@@ -731,9 +731,9 @@ struct IntrTcuArgs {
   uint32_t cd_nregs  : 2; // 0=8, 1=16, 2=32 C/D registers
   uint32_t fmt_s     : 5;
   uint32_t fmt_d     : 5;
-  uint32_t step_m    : 4;
+  uint32_t step_m    : 3;
   uint32_t step_n    : 7; // max 128
-  uint32_t step_k    : 4;
+  uint32_t step_k    : 3;
   uint32_t meta_kind : 1; // 0=sparse, 1=mx
 };
 

@@ -486,7 +486,14 @@ package VX_gpu_pkg;
 `ifdef TCU_WGMMA_ENABLE
     localparam INST_TCU_WGMMA      = 4'h1;
 `endif
-    localparam INST_TCU_META_STORE = 4'h2;
+`ifdef TCU_TMEM_ENABLE
+    localparam INST_TCU_TMEM_ALLOC      = 4'h2;
+    localparam INST_TCU_TMEM_DEALLOC    = 4'h3;
+    localparam INST_TCU_TMEM_ST         = 4'h4;
+    localparam INST_TCU_TMEM_LD         = 4'h5;
+    localparam INST_TCU_UMMA            = 4'h6;
+`endif
+    localparam INST_TCU_META_STORE = 4'h6;
     localparam INST_TCU_BITS = 4;
 `endif
 
@@ -629,15 +636,14 @@ package VX_gpu_pkg;
 
 `ifdef EXT_TCU_ENABLE
     typedef struct packed {
-        logic __padding;
         logic a_from_smem;    // 0=register, 1=shared memory (B is always smem)
         logic [1:0] cd_nregs; // 0=8, 1=16, 2=32 C/D registers
         logic is_sparse;
         logic [4:0] fmt_d;
         logic [4:0] fmt_s;
-        logic [3:0] step_k;
-        logic [3:0] step_n;
-        logic [3:0] step_m;
+        logic [2:0] step_k;
+        logic [6:0] step_n;
+        logic [2:0] step_m;
     } tcu_args_t;
     `PACKAGE_ASSERT($bits(tcu_args_t) == INST_ARGS_BITS)
 `endif

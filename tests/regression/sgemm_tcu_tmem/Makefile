@@ -9,7 +9,7 @@ SRCS := $(SRC_DIR)/main.cpp $(SW_COMMON_DIR)/rvfloats.cpp $(SW_COMMON_DIR)/softf
 
 VX_SRCS := $(SRC_DIR)/kernel.cpp
 
-CONFIGS += -DTCU_WGMMA_ENABLE -DTCU_TMEM_ENABLE
+CONFIGS += -DTCU_TMEM_ENABLE
 
 CXXFLAGS += -I$(THIRD_PARTY_DIR)/softfloat/source/include
 

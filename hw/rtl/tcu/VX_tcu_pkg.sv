@@ -42,6 +42,38 @@ package VX_tcu_pkg;
 
     localparam TCU_FMT_WIDTH= 5;
 
+    // Set fedp latencies
+/* verilator lint_off VARHIDDEN */
+`ifdef TCU_TYPE_DSP
+    localparam FCVT_LATENCY = 1;
+    localparam FMUL_LATENCY = 8;
+    localparam FADD_LATENCY = 11;
+    localparam FACC_LATENCY = $clog2(2 * TCU_TC_K + 1) * FADD_LATENCY;
+    localparam FEDP_LATENCY = FCVT_LATENCY + FMUL_LATENCY + FACC_LATENCY;
+`elsif TCU_TYPE_BHF
+    localparam FMUL_LATENCY = 2;
+    localparam FADD_LATENCY = 2;
+    localparam FRND_LATENCY = 1;
+    localparam FACC_LATENCY  = $clog2(2 * TCU_TC_K + 1) * (FADD_LATENCY + FRND_LATENCY);
+    localparam FEDP_LATENCY = (FMUL_LATENCY + FRND_LATENCY) + 1 + FACC_LATENCY;
+`elsif TCU_TYPE_FPNEW
+    localparam FMUL_LATENCY = 2;
+    localparam FADD_LATENCY = 2;
+    localparam FACC_LATENCY  = $clog2(2 * TCU_TC_K) * FADD_LATENCY;
+    localparam FEDP_LATENCY = FMUL_LATENCY + 1 + FACC_LATENCY + FADD_LATENCY;
+`elsif TCU_TYPE_DPI
+    localparam FMUL_LATENCY = 2;
+    localparam FACC_LATENCY = 2;
+    localparam FEDP_LATENCY = FMUL_LATENCY + FACC_LATENCY;
+`else // TCU_TYPE_TFR
+    localparam FMUL_LATENCY = 1;
+    localparam FALN_LATENCY = 1;
+    localparam FACC_LATENCY = 1;
+    localparam FRND_LATENCY = 1;
+    localparam FEDP_LATENCY = FMUL_LATENCY + FALN_LATENCY + FACC_LATENCY + FRND_LATENCY;
+`endif
+/* verilator lint_on VARHIDDEN */
+
     // Set configuration parameters
     localparam TCU_NT = `NUM_THREADS;
 
@@ -51,6 +83,12 @@ package VX_tcu_pkg;
     localparam TCU_NR = 8;
     localparam TCU_DK = 0;
     localparam TCU_DP = 0;
+
+    // TMEM parameters
+    localparam TCU_TMEM_LANES = `NUM_WARPS * `NUM_THREADS;
+    localparam TCU_TMEM_COLS  = 256;
+    localparam TCU_TMEM_LANE_BITS = $clog2(TCU_TMEM_LANES);
+    localparam TCU_TMEM_COL_BITS  = $clog2(TCU_TMEM_COLS);
 
     // Tile dimensions
     localparam TCU_TILE_CAP = TCU_NT * TCU_NR;
@@ -340,6 +378,19 @@ package VX_tcu_pkg;
                     (op_args.tcu.cd_nregs == 2'd0) ? 8 : (op_args.tcu.cd_nregs == 2'd1) ? 16 : 32,
                     op_args.tcu.a_from_smem ? "S" : "R",
                     op_args.tcu.step_m, op_args.tcu.step_n));
+            end
+        `endif
+        `ifdef TCU_TMEM_ENABLE
+            INST_TCU_TMEM_ALLOC:    `TRACE(level, ("TMEM_ALLOC"))
+            INST_TCU_TMEM_DEALLOC:  `TRACE(level, ("TMEM_DEALLOC"))
+            INST_TCU_TMEM_ST:       `TRACE(level, ("TMEM_ST"))
+            INST_TCU_TMEM_LD:       `TRACE(level, ("TMEM_LD"))
+            INST_TCU_UMMA: begin
+                `TRACE(level, ("UMMA."));
+                trace_fmt(level, op_args.tcu.fmt_s);
+                `TRACE(level, ("."));
+                trace_fmt(level, op_args.tcu.fmt_d);
+                `TRACE(level, (".%0d.%0d.%0d", op_args.tcu.step_m, op_args.tcu.step_n, op_args.tcu.step_k));
             end
         `endif
         `ifdef TCU_SPARSE_ENABLE

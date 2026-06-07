@@ -556,29 +556,71 @@ module VX_decode import VX_gpu_pkg::*; #(
                 `ifdef EXT_TCU_ENABLE
                     7'h02: begin
                         ex_type = EX_TCU;
-                    `ifdef TCU_WGMMA_ENABLE
-                        op_type = funct3[0] ? INST_OP_BITS'(INST_TCU_WGMMA)
+                    `ifdef TCU_TMEM_ENABLE
+                        if (funct3 >= 3'h2) begin
+                            // TMEM instructions: funct3=2..6
+                            op_args.tcu.is_sparse   = 1'b0;
+                            op_args.tcu.cd_nregs    = 2'b0;
+                            op_args.tcu.a_from_smem = 1'b1;
+                            op_args.tcu.fmt_s       = rs1[4:0];
+                            op_args.tcu.fmt_d       = rd[4:0];
+                            op_args.tcu.step_m      = '0;
+                            op_args.tcu.step_n      = '0;
+                            op_args.tcu.step_k      = '0;
+                            case (funct3)
+                                3'h2: begin // TMEM_ALLOC
+                                    op_type = INST_OP_BITS'(INST_TCU_TMEM_ALLOC);
+                                    `USED_IREG (rs1);  // ncols
+                                end
+                                3'h3: begin // TMEM_DEALLOC
+                                    op_type = INST_OP_BITS'(INST_TCU_TMEM_DEALLOC);
+                                end
+                                3'h4: begin // TMEM_ST
+                                    op_type = INST_OP_BITS'(INST_TCU_TMEM_ST);
+                                    `USED_IREG (rs1);  // tmem_addr
+                                    `USED_FREG (rs2);  // value
+                                end
+                                3'h5: begin // TMEM_LD
+                                    op_type = INST_OP_BITS'(INST_TCU_TMEM_LD);
+                                    `USED_IREG (rs1);  // tmem_addr
+                                    `USED_FREG (rd);
+                                end
+                                3'h6: begin // UMMA
+                                    op_type = INST_OP_BITS'(INST_TCU_UMMA);
+                                    `USED_IREG (rs1);  // desc_a (a0)
+                                    `USED_IREG (rs2);  // desc_b (a1)
+                                    `USED_IREG (rs3);  // warp_rank (a2)
+                                end
+                                default:;
+                            endcase
+                        end else begin  // funct3 < 2: WMMA/WGMMA
+                    `endif
+                        `ifdef TCU_WGMMA_ENABLE
+                            op_type = funct3[0] ? INST_OP_BITS'(INST_TCU_WGMMA)
                                             : INST_OP_BITS'(INST_TCU_WMMA);
-                    `else
-                        op_type = INST_OP_BITS'(INST_TCU_WMMA);
+                        `else
+                            op_type = INST_OP_BITS'(INST_TCU_WMMA);
+                        `endif
+                        `ifdef TCU_SPARSE_ENABLE
+                            op_args.tcu.is_sparse = rs2[0];
+                        `else
+                            op_args.tcu.is_sparse = 1'b0;
+                        `endif
+                            op_args.tcu.cd_nregs    = rs2[2:1];
+                            op_args.tcu.a_from_smem = rs2[3];
+                            op_args.tcu.fmt_s  = rs1[4:0];
+                            op_args.tcu.fmt_d  = rd[4:0];
+                            op_args.tcu.step_m = '0;
+                            op_args.tcu.step_n = '0;
+                            op_args.tcu.step_k = '0;
+                            `USED_FREG (rd);
+                            `USED_FREG (rs1);
+                            `USED_FREG (rs2);
+                            `USED_FREG (rs3);
+                    `ifdef TCU_TMEM_ENABLE    
+                        end // end else
                     `endif
-                    `ifdef TCU_SPARSE_ENABLE
-                        op_args.tcu.is_sparse = rs2[0];
-                    `else
-                        op_args.tcu.is_sparse = 1'b0;
-                    `endif
-                        op_args.tcu.cd_nregs    = rs2[2:1];
-                        op_args.tcu.a_from_smem = rs2[3];
-                        op_args.tcu.fmt_s  = rs1[4:0];
-                        op_args.tcu.fmt_d  = rd[4:0];
-                        op_args.tcu.step_m = '0;
-                        op_args.tcu.step_n = '0;
-                        op_args.tcu.step_k = '0;
-                        `USED_FREG (rd);
-                        `USED_FREG (rs1);
-                        `USED_FREG (rs2);
-                        `USED_FREG (rs3);
-                    end
+                    end // end 7'h02
                 `endif
                 `ifdef EXT_DXA_ENABLE
                     7'h03: begin // DXA issue (dimension-specific)
