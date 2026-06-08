@@ -622,7 +622,7 @@ int main(int argc, char *argv[]) {
 
   std::cout << "input data type: " << vt::ITYPE::name << " (id=" << vt::ITYPE::id << ")" << std::endl;
   std::cout << "output data type: " << vt::OTYPE::name << " (id=" << vt::OTYPE::id << ")" << std::endl;
-  std::cout << "WMMA Core Dimension: M=" << wg_cfg::tcM << ", N=" << wg_cfg::tcN << ", K=" << wg_cfg::tcK << std::endl;
+  std::cout << "WMMA Core Dimension: M=" << wg_cfg::tcM << ", N=" << wg_cfg::tcN << ", K=" << wg_cfg::tcK * wg_cfg::i_ratio << std::endl;
   std::cout << "UMMA Per-Warp Tile: M=" << per_warp_M << ", N=" << per_warp_N << ", K=" << wg_cfg::tileK << std::endl;
   std::cout << "UMMA CTA Tile: M=" << cta_M << ", N=" << per_warp_N << ", K=" << wg_cfg::tileK << std::endl;
   std::cout << "Grid dimension: " << grid_dim[0] << "x" << grid_dim[1] << std::endl;
