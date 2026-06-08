@@ -107,21 +107,20 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         assign per_blk_rd_addr[block_idx] = blk_lmem_if.req_addr;
 
     `ifdef TCU_TMEM_ENABLE
-        wire is_wgmma_or_umma_b = (per_block_execute_if[block_idx].data.op_type == INST_TCU_WGMMA)
-                               || (per_block_execute_if[block_idx].data.op_type == INST_TCU_UMMA);
-        wire req_valid_b = per_block_execute_if[block_idx].valid && is_wgmma_or_umma_b;
-        wire req_fire_b  = per_block_execute_if[block_idx].valid
-                        && per_block_execute_if[block_idx].ready
-                        && is_wgmma_or_umma_b;
+        wire is_umma_b          = (core_execute_if[block_idx].data.op_type == INST_TCU_UMMA);
+        wire is_wgmma_or_umma_b = (core_execute_if[block_idx].data.op_type == INST_TCU_WGMMA)
+                               || is_umma_b;
+        wire req_valid_b        = core_execute_if[block_idx].valid && is_wgmma_or_umma_b;
+        wire req_fire_b         = core_execute_if[block_idx].valid
+                               && core_execute_if[block_idx].ready
+                               && is_wgmma_or_umma_b;
     `else
-        wire is_wgmma_b = (per_block_execute_if[block_idx].data.op_type == INST_TCU_WGMMA);
-        wire req_valid_b = per_block_execute_if[block_idx].valid && is_wgmma_b;
-        // req_fire: the execute unit actually consumed this µop this cycle.
-        // Used by tile_buf to clear warp_alloc_pending at the right time,
-        // preventing spurious re-fetch when execute is stalled (e.g. mdata_queue full).
-        wire req_fire_b  = per_block_execute_if[block_idx].valid
-                        && per_block_execute_if[block_idx].ready
-                        && is_wgmma_b;
+        wire is_umma_b      = 1'b0;
+        wire is_wgmma_b     = (per_block_execute_if[block_idx].data.op_type == INST_TCU_WGMMA);
+        wire req_valid_b    = per_block_execute_if[block_idx].valid && is_wgmma_b;
+        wire req_fire_b     = per_block_execute_if[block_idx].valid
+                           && per_block_execute_if[block_idx].ready
+                           && is_wgmma_b;
     `endif
 
         VX_tcu_tbuf #(
@@ -140,10 +139,12 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             .req_fire         (req_fire_b),
             .req_wid          (per_block_execute_if[block_idx].data.header.wid),
             .req_is_sparse    (per_block_execute_if[block_idx].data.op_args.tcu.is_sparse),
+            .req_is_umma      (is_umma_b),
             .req_step_m       (per_block_execute_if[block_idx].data.op_args.tcu.step_m),
             .req_step_n       (per_block_execute_if[block_idx].data.op_args.tcu.step_n),
             .req_step_k       (per_block_execute_if[block_idx].data.op_args.tcu.step_k),
             .req_fmt_s        (per_block_execute_if[block_idx].data.op_args.tcu.fmt_s),
+            .req_a_from_smem  (per_block_execute_if[block_idx].data.op_args.tcu.a_from_smem),
             .req_cd_nregs     (per_block_execute_if[block_idx].data.op_args.tcu.cd_nregs),
             .req_desc_a       (per_block_execute_if[block_idx].data.rs1_data[0]),
             .req_desc_b       (per_block_execute_if[block_idx].data.rs2_data[0]),
@@ -382,28 +383,6 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                                                      ? tmem_result_if[block_idx].ready
                                                      : core_execute_if[block_idx].ready;
     end
-
-    // -----------------------------------------------------------------------
-    // TMEM write pending register stalls UMMA until previous write completes
-    // -----------------------------------------------------------------------
-
-    localparam TMEM_PIPE_LATENCY = FEDP_LATENCY + 1;
-    
-    reg [TMEM_PIPE_LATENCY-1:0] tmem_wr_pending [BLOCK_SIZE];
-    wire tmem_wr_busy [BLOCK_SIZE];
-    
-    for (genvar block_idx = 0; block_idx < BLOCK_SIZE; ++block_idx) begin : g_tmem_hazard
-        wire umma_fire = core_execute_if[block_idx].valid 
-                      && core_execute_if[block_idx].ready
-                      && (core_execute_if[block_idx].data.op_type == INST_TCU_UMMA);
-        always_ff @(posedge clk) begin
-            if (reset)
-                tmem_wr_pending[block_idx] <= '0;
-            else
-                tmem_wr_pending[block_idx] <= {tmem_wr_pending[block_idx][TMEM_PIPE_LATENCY-2:0], umma_fire};
-        end
-        assign tmem_wr_busy[block_idx] = |tmem_wr_pending[block_idx];
-    end
 `endif // TCU_TMEM_ENABLE
 
     // -----------------------------------------------------------------------
@@ -428,7 +407,6 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         `ifdef TCU_TMEM_ENABLE
             .tmem_data          (tmem_data),
             .tmem_warp_rank     (tmem_warp_rank[block_idx]),
-            .tmem_wr_busy       (tmem_wr_busy[block_idx]),
             .tmem_wr_en         (tmem_wr_en[block_idx]),
             .tmem_wr_lane_base  (tmem_wr_lane_base[block_idx]),
             .tmem_wr_col_base   (tmem_wr_col_base[block_idx]),

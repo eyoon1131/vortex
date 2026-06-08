@@ -39,7 +39,13 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
 `endif
 
 `ifdef TCU_WGMMA_ENABLE
+`ifdef TCU_TMEM_ENABLE
+    localparam MAX_UMMA_UOPS = 128 * TCU_WG_K_STEPS;
+    localparam CTR_MAX = MAX_UOPS > TCU_WG_UOPS ? MAX_UOPS : TCU_WG_UOPS;
+    localparam CTR_W = $clog2(CTR_MAX > MAX_UMMA_UOPS ? CTR_MAX : MAX_UMMA_UOPS);
+`else
     localparam CTR_W = $clog2(MAX_UOPS > TCU_WG_UOPS ? MAX_UOPS : TCU_WG_UOPS);
+`endif
 `else
     localparam CTR_W = $clog2(MAX_UOPS);
 `endif
@@ -70,6 +76,9 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
     localparam LG_M_WG = $clog2(TCU_WG_M_STEPS);  // 1
     localparam LG_K_WG = $clog2(TCU_WG_K_STEPS);   // 1
     localparam LG_N_WG_MAX = $clog2(TCU_WG_N_STEPS); // 4 (for NRC=32)
+`ifdef TCU_TMEM_ENABLE
+    localparam LG_N_UMMA_MAX = $clog2(TCU_UMMA_N_STEPS); // 6 (for NRC=128)
+`endif
     localparam WG_MK_BITS = LG_M_WG + LG_K_WG;      // 2
 
     // Pre-computed uop counts for each cd_nregs value (dense)
@@ -87,11 +96,70 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
         endcase
     end
 
-    // Dense:  ctr = n * (m_steps * k_steps) + k * m_steps + m
-    // Sparse: ctr = n * m_steps + m  (k always 0, k_count halved)
+`ifdef TCU_TMEM_ENABLE
+    // Repurpose {a_from_smem, cd_nregs} as 3-bit NRC encoding for UMMA
+    // 0->8, 1->16, 2->32, 3->64, 4->128
+    wire [2:0] umma_nrc_enc = {ibuf_in.op_args.tcu.a_from_smem, ibuf_in.op_args.tcu.cd_nregs};
+
+    localparam WG_UOPS_NR64  = 64  * TCU_WG_K_STEPS;
+    localparam WG_UOPS_NR128 = 128 * TCU_WG_K_STEPS;
+
+    // Override wg_uop_cnt for UMMA using 3-bit encoding
+    logic [UOP_CTR_W-1:0] umma_uop_cnt;
+    always_comb begin
+        case (umma_nrc_enc)
+            3'd0: umma_uop_cnt = UOP_CTR_W'(WG_UOPS_NR8);
+            3'd1: umma_uop_cnt = UOP_CTR_W'(WG_UOPS_NR16);
+            3'd2: umma_uop_cnt = UOP_CTR_W'(WG_UOPS_NR32);
+            3'd3: umma_uop_cnt = UOP_CTR_W'(WG_UOPS_NR64);
+            default: umma_uop_cnt = UOP_CTR_W'(WG_UOPS_NR128);
+        endcase
+    end
+`endif
+
+    // WGMMA Dense: ctr = n * (m_steps * k_steps) + k * m_steps + m  - m inner, k middle, n outer
+    // WGMMA Sparse: ctr = n * m_steps + m  (k always 0, k_count halved)
+    // UMMA Dense:  ctr = k * (n_steps * m_steps) + n * m_steps + m  -  m inner, n middle, k outer
+    // UMMA k-outer loop ordering requires n_steps*m_steps >= PIPE_LATENCY (FEDP_LATENCY + 1)
+    // to avoid RAW hazards on TMEM accumulator without stall logic
+`ifdef TCU_TMEM_ENABLE
+    `STATIC_ASSERT(TCU_UMMA_N_STEPS * TCU_WG_M_STEPS >= FEDP_LATENCY + 1, 
+        ("UMMA k-outer ordering insufficient: increase NRC or add stall logic"))
+`endif
+    
     wire [`UP(LG_M_WG)-1:0] wg_m_index = ctr[0 +: `UP(LG_M_WG)];
     wire [`UP(LG_K_WG)-1:0] wg_k_index;
     wire [`UP(LG_N_WG_MAX)-1:0] wg_n_index;
+
+`ifdef TCU_TMEM_ENABLE
+    // k-outer index mux for UMMA
+    logic [`UP(LG_K_WG)-1:0]     umma_k_index;
+    logic [`UP(LG_N_UMMA_MAX)-1:0] umma_n_index;
+    always_comb begin
+        case (umma_nrc_enc)
+            3'd0: begin // NRC=8
+                umma_k_index = ctr[LG_M_WG + 2 +: LG_K_WG];
+                umma_n_index = `UP(LG_N_UMMA_MAX)'(ctr[LG_M_WG +: 2]);
+            end
+            3'd1: begin // NRC=16
+                umma_k_index = ctr[LG_M_WG + 3 +: LG_K_WG];
+                umma_n_index = `UP(LG_N_UMMA_MAX)'(ctr[LG_M_WG +: 3]);
+            end
+            3'd2: begin // NRC=32
+                umma_k_index = ctr[LG_M_WG + 4 +: LG_K_WG];
+                umma_n_index = `UP(LG_N_UMMA_MAX)'(ctr[LG_M_WG +: 4]);
+            end
+            3'd3: begin // NRC=64
+                umma_k_index = ctr[LG_M_WG + 5 +: LG_K_WG];
+                umma_n_index = `UP(LG_N_UMMA_MAX)'(ctr[LG_M_WG +: 5]);
+            end
+            default: begin // NRC=128
+                umma_k_index = ctr[LG_M_WG + 6 +: LG_K_WG];
+                umma_n_index = `UP(LG_N_UMMA_MAX)'(ctr[LG_M_WG +: 6]);
+            end
+        endcase
+    end
+`endif
 `ifdef TCU_SPARSE_ENABLE
     wire wg_is_sparse = ibuf_in.op_args.tcu.is_sparse;
     if (LG_K_WG != 0) begin : g_wg_k_idx
@@ -145,7 +213,7 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
 
     assign uop_count =
 `ifdef TCU_TMEM_ENABLE
-        is_umma ? wg_uop_cnt :
+        is_umma ? umma_uop_cnt :
 `endif
 `ifdef TCU_WGMMA_ENABLE
         is_wgmma ? (
@@ -294,8 +362,8 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
     `ifdef TCU_TMEM_ENABLE
         if (is_umma) begin
             ibuf_r.op_args.tcu.step_m = 3'(wg_m_index);
-            ibuf_r.op_args.tcu.step_n = 7'(wg_n_index);
-            ibuf_r.op_args.tcu.step_k = 3'(wg_k_index);
+            ibuf_r.op_args.tcu.step_n = 7'(umma_n_index);
+            ibuf_r.op_args.tcu.step_k = 3'(umma_k_index);
             // No register writeback
             ibuf_r.wb  = 0;
             ibuf_r.rd  = '0;

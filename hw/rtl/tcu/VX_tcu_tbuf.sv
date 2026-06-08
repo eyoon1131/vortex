@@ -57,10 +57,12 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     input  wire                     req_fire,   // execute consumed current µop
     input  wire [NW_WIDTH-1:0]      req_wid,
     input  wire                     req_is_sparse,
+    input  wire                     req_is_umma,
     input  wire [2:0]               req_step_m,
     input  wire [6:0]               req_step_n,
     input  wire [2:0]               req_step_k,
     input  wire [4:0]               req_fmt_s,
+    input  wire                     req_a_from_smem,
     input  wire [1:0]               req_cd_nregs,
     input  wire [`XLEN-1:0]         req_desc_a,
     input  wire [`XLEN-1:0]         req_desc_b,
@@ -83,11 +85,19 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
     localparam TILE_M = TCU_WG_TILE_M;
     localparam TILE_K = TCU_WG_TILE_K;
+`ifdef TCU_TMEM_ENABLE
+    localparam UMMA_TILE_N = TCU_UMMA_TILE_N;
+`else
     localparam TILE_N = TCU_WG_TILE_N;
+`endif
 
     // Buffer sizes in 32-bit words (format-agnostic; sub-word packing done in gather).
     localparam A_TOTAL = TILE_M * TILE_K;
+`ifdef TCU_TMEM_ENABLE
+    localparam B_TOTAL = TILE_K * UMMA_TILE_N;
+`else
     localparam B_TOTAL = TILE_K * TILE_N;
+`endif
 
 `ifdef TCU_SPARSE_ENABLE
     // Metadata buffer: worst-case format is int8 (I_RATIO=4).
@@ -163,20 +173,22 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
        ,.META_TOTAL_MAX (META_TOTAL_MAX)
     `endif
     ) tbuf_gather (
-        .req_step_m     (req_step_m),
-        .req_step_n     (req_step_n),
-        .req_step_k     (req_step_k),
-        .req_fmt_s      (req_fmt_s),
-        .req_cd_nregs   (req_cd_nregs),
-        .a_buf          (hit_a_buf),
-        .b_buf          (hit_b_buf),
+        .req_is_umma        (req_is_umma),
+        .req_step_m         (req_step_m),
+        .req_step_n         (req_step_n),
+        .req_step_k         (req_step_k),
+        .req_fmt_s          (req_fmt_s),
+        .req_a_from_smem    (req_a_from_smem),
+        .req_cd_nregs       (req_cd_nregs),
+        .a_buf              (hit_a_buf),
+        .b_buf              (hit_b_buf),
     `ifdef TCU_SPARSE_ENABLE
-        .is_sparse      (hit_is_sparse),
-        .meta_buf       (hit_meta_buf),
-        .meta_stride    (hit_meta_stride),
+        .is_sparse          (hit_is_sparse),
+        .meta_buf           (hit_meta_buf),
+        .meta_stride        (hit_meta_stride),
     `endif
-        .tbuf_rs1_data  (tbuf_rs1_data),
-        .tbuf_rs2_data  (tbuf_rs2_data)
+        .tbuf_rs1_data      (tbuf_rs1_data),
+        .tbuf_rs2_data      (tbuf_rs2_data)
     `ifdef TCU_SPARSE_ENABLE
        ,.tbuf_sp_meta   (tbuf_sp_meta)
     `endif

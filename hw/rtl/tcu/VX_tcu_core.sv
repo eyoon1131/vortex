@@ -34,7 +34,6 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // TMEM read/write ports
     input wire [31:0]                               tmem_data[TCU_TMEM_LANES][TCU_TMEM_COLS],
     input wire [TCU_TMEM_LANE_BITS-1:0]             tmem_warp_rank,
-    input wire                                      tmem_wr_busy,
     output wire                                     tmem_wr_en,
     output wire [TCU_TMEM_LANE_BITS-1:0]            tmem_wr_lane_base,
     output wire [TCU_TMEM_COL_BITS-1:0]             tmem_wr_col_base,
@@ -159,8 +158,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 `ifdef TCU_WGMMA_ENABLE
 `ifdef TCU_TMEM_ENABLE
     assign execute_if.ready = ~mdata_queue_full && fedp_enable 
-                           && (~(is_wgmma || is_umma) || tbuf_ready)
-                           && ~(is_umma && tmem_wr_busy);;
+                           && (~(is_wgmma || is_umma) || tbuf_ready);
 `else
     assign execute_if.ready = ~mdata_queue_full && fedp_enable && (~is_wgmma || tbuf_ready);
 `endif

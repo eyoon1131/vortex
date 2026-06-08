@@ -130,6 +130,13 @@ package VX_tcu_pkg;
     localparam TCU_WG_TILE_K = 2 * TCU_TC_K;
     localparam TCU_WG_TILE_N = (TCU_WG_NR * TCU_NT) / TCU_WG_TILE_M;
 
+    // UMMA geometry
+`ifdef TCU_TMEM_ENABLE
+    localparam TCU_UMMA_NR      = 128;
+    localparam TCU_UMMA_TILE_N  = (TCU_UMMA_NR * TCU_NT) / TCU_WG_TILE_M;
+    localparam TCU_UMMA_N_STEPS = TCU_UMMA_TILE_N / TCU_TC_N;
+`endif
+
     // WG step counts: block geometry (TC_M/TC_N/TC_K) unchanged, tile is larger
     localparam TCU_WG_M_STEPS = TCU_WG_TILE_M / TCU_TC_M;
     localparam TCU_WG_N_STEPS = TCU_WG_TILE_N / TCU_TC_N;

@@ -48,11 +48,13 @@ module VX_tcu_tbuf_gather import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 `endif
 ) (
     // Step and format inputs
+    input  wire                     req_is_umma,
     input  wire [2:0]               req_step_m,
     input  wire [6:0]               req_step_n,
     input  wire [2:0]               req_step_k,
     input  wire [4:0]               req_fmt_s,
     input  wire [1:0]               req_cd_nregs,
+    input  wire                     req_a_from_smem,
 
     // Hit-slot buffers (from VX_tcu_tbuf_fetch)
     input  wire [A_TOTAL-1:0][31:0] a_buf,
@@ -86,18 +88,39 @@ module VX_tcu_tbuf_gather import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     `UNUSED_PARAM (TILE_M)
     `UNUSED_PARAM (TILE_N)
 
-    // Actual per-warp N dimension from cd_nregs: 0→8, 1→16, 2→32
-    // per_warp_N = NRC * NT / TILE_M (in output-type columns)
-    localparam NT_DIV_TM = TCU_NT / TILE_M;
-    reg [5:0] wg_nrc;
+    // Decode encoded NRC 
+`ifdef TCU_TMEM_ENABLE
+    wire [2:0] umma_nrc_enc = {req_a_from_smem, req_cd_nregs};
+    reg [7:0] umma_nrc;
     always_comb begin
-        case (req_cd_nregs)
-            2'd0: wg_nrc = 6'd8;
-            2'd1: wg_nrc = 6'd16;
-            default: wg_nrc = 6'd32;
+        case (umma_nrc_enc)
+            3'd0: umma_nrc = 8'd8;
+            3'd1: umma_nrc = 8'd16;
+            3'd2: umma_nrc = 8'd32;
+            3'd3: umma_nrc = 8'd64;
+            default: umma_nrc = 8'd128;
         endcase
     end
-    wire [6:0] actual_N = 7'(wg_nrc) * NT_DIV_TM[2:0];
+`endif
+
+    // WGMMA: Actual per-warp N dimension from cd_nregs: 0→8, 1→16, 2→32
+    // UMMA: from {a_from_smem, cd_nregs}: NRC=8 to 128
+    // per_warp_N = NRC * NT / TILE_M (in output-type columns)
+    localparam NT_DIV_TM = TCU_NT / TILE_M;
+    reg [7:0] wg_nrc;
+    always_comb begin
+    `ifdef TCU_TMEM_ENABLE
+        if (req_is_umma) begin
+            wg_nrc = umma_nrc;
+        end else
+    `endif
+        case (req_cd_nregs)
+            2'd0: wg_nrc = 8'd8;
+            2'd1: wg_nrc = 8'd16;
+            default: wg_nrc = 8'd32;
+        endcase
+    end
+    wire [7:0] actual_N = 8'(wg_nrc) * NT_DIV_TM[2:0];
 
     localparam LG_A_BS  = $clog2(TCU_A_BLOCK_SIZE);
     localparam LG_B_BS  = $clog2(TCU_B_BLOCK_SIZE);

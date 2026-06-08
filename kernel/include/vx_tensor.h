@@ -1121,6 +1121,21 @@ struct umma_context {
 private:
   using cfg = wgmma_config_t<NT, It, Ot, NRC_>;
 
+  // UMMA flags encoding (rs2 field):
+  //   bit 0     : is_sparse = 0 (always)
+  //   bits [2:1]: cd_nregs — repurposed lower 2 bits of NRC encoding
+  //   bit 3     : a_from_smem — repurposed as upper bit of NRC encoding
+  //   Full 3-bit NRC encoding = {a_from_smem, cd_nregs} = bits [3:1]
+  static constexpr int umma_nrc_code =
+      (NRC_ == 128) ? 4 :
+      (NRC_ == 64)  ? 3 :
+      (NRC_ == 32)  ? 2 :
+      (NRC_ == 16)  ? 1 : 0;
+
+  static constexpr int umma_flags() {
+      return (umma_nrc_code << 1);  // bits [3:1] = NRC encoding, bit 0 = 0 (not sparse)
+  }
+
 public:
   using input_t  = typename It::dtype;
   using output_t = typename Ot::dtype;
@@ -1149,18 +1164,24 @@ public:
   static __attribute__((always_inline)) void umma_sync(smem_matrix_desc desc_a,
                                                        smem_matrix_desc desc_b,
                                                        uint32_t warp_rank) {
+    static_assert(NRC_ == 8 || NRC_ == 16 || NRC_ == 32 || NRC_ == 64 || NRC_ == 128,
+                  "umma_sync supports NRC = 8, 16, 32, 64, 128");
+    
+    constexpr int flags = umma_flags();
+
     register uint32_t ra __asm__("a0") = desc_a.value;
     register uint32_t rb __asm__("a1") = desc_b.value;
     register uint32_t rw __asm__("a2") = warp_rank;
 
     __asm__ volatile (
-      ".insn r %[insn], %[f3], %[f7], x%[fmd], x%[fms], x0\n\t"
+      ".insn r %[insn], %[f3], %[f7], x%[fmd], x%[fms], x%[flags]\n\t"
       :
       : [insn]"i"(RISCV_CUSTOM0),
         [f3]"i"(VX_UMMA),
         [f7]"i"(VX_TMEM_FUNCT7),
         [fmd]"i"(Ot::id),
         [fms]"i"(It::id),
+        [flags]"i"(flags),
         "r"(ra), "r"(rb), "r"(rw)
       : "memory"
     );
