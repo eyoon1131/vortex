@@ -739,9 +739,14 @@ struct IntrTcuArgs {
 
 inline std::ostream &operator<<(std::ostream &os, const TcuType& type) {
   switch (type) {
-  case TcuType::WMMA:       os << "WMMA"; break;
-  case TcuType::WGMMA:      os << "WGMMA"; break;
-  case TcuType::META_STORE: os << "META_STORE"; break;
+  case TcuType::WMMA:         os << "WMMA"; break;
+  case TcuType::WGMMA:        os << "WGMMA"; break;
+  case TcuType::TMEM_ALLOC:   os << "TMEM_ALLOC"; break;
+  case TcuType::TMEM_DEALLOC: os << "TMEM_DEALLOC"; break;
+  case TcuType::TMEM_LD:      os << "TMEM_ALLOC"; break;
+  case TcuType::TMEM_ST:      os << "TMEM_ALLOC"; break;
+  case TcuType::UMMA:         os << "UMMA"; break;
+  case TcuType::META_STORE:   os << "META_STORE"; break;
   default:
     assert(false);
   }

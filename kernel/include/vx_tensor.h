@@ -1146,10 +1146,15 @@ public:
   static constexpr uint32_t tileK  = cfg::tileK;
   static constexpr uint32_t NRC    = NRC_;
 
+  // Each warp's A slice starts at wid * per_warp_M * tileK
+  static __attribute__((always_inline)) const input_t* warp_A_ptr(const input_t* A_global) {
+    return A_global + vx_warp_id() * xtileM * tileK;
+  }
+
   // Initialize the accumulator tile in TMEM to a given value.
   // Must be called by every warp before the K-loop.
-  static __attribute__((always_inline)) void fill_tmem(output_t value, uint32_t warp_rank) {
-    uint32_t lane_base = warp_rank * xtileM;
+  static __attribute__((always_inline)) void fill_tmem(output_t value) {
+    uint32_t lane_base = vx_warp_id() * xtileM;
     for (uint32_t col = 0; col < xtileN; ++col) {
         vx_tmem_st(vx_make_tmem_addr(lane_base, col), static_cast<float>(value));
     }
@@ -1162,8 +1167,7 @@ public:
   // accumulator to its lane range in TMEM (lane_base = warp_rank * xtileM),
   // since the hardware warp ID (wid) may not match warp_rank
   static __attribute__((always_inline)) void umma_sync(smem_matrix_desc desc_a,
-                                                       smem_matrix_desc desc_b,
-                                                       uint32_t warp_rank) {
+                                                       smem_matrix_desc desc_b) {
     static_assert(NRC_ == 8 || NRC_ == 16 || NRC_ == 32 || NRC_ == 64 || NRC_ == 128,
                   "umma_sync supports NRC = 8, 16, 32, 64, 128");
     
@@ -1171,7 +1175,6 @@ public:
 
     register uint32_t ra __asm__("a0") = desc_a.value;
     register uint32_t rb __asm__("a1") = desc_b.value;
-    register uint32_t rw __asm__("a2") = warp_rank;
 
     __asm__ volatile (
       ".insn r %[insn], %[f3], %[f7], x%[fmd], x%[fms], x%[flags]\n\t"
@@ -1182,17 +1185,40 @@ public:
         [fmd]"i"(Ot::id),
         [fms]"i"(It::id),
         [flags]"i"(flags),
-        "r"(ra), "r"(rb), "r"(rw)
+        "r"(ra), "r"(rb)
       : "memory"
     );
   }
 
-  // ── Post-processing: TMEM → registers → global memory ────────────────────
-  // Loads one column of the accumulator tile from TMEM into a register per
-  // thread. Thread t reads from lane (lane_base + t), where lane_base =
-  // warp_rank * xtileM + r * NUM_THREADS for m-step r.
-  static __attribute__((always_inline)) float accum_ld(uint32_t lane_base, uint32_t col) {
-    return vx_tmem_ld(vx_make_tmem_addr(lane_base, col));
+  // Store accumulated TMEM results to global output matrix C.
+  // C_global: pointer to full output matrix, row-major
+  // tile_row:  starting row of this CTA's tile in C
+  // tile_col:  starting col of this CTA's tile in C  
+  // N:         number of columns in C (full matrix width)
+  // Each warp reads its accumulator tile from TMEM and stores it to global
+  // memory. The accumulator for warp_rank W occupies lanes
+  // [W*xtileM, W*xtileM + xtileM) in TMEM, with each lane corresponding to
+  // one output row. Since xtileM may exceed NUM_THREADS, each thread is
+  // responsible for (xtileM / NUM_THREADS) rows, iterated via r. For each
+  // row, thread tid_in_warp reads from lane (lane_base + tid_in_warp) across
+  // all xtileN columns and writes to the corresponding row of the output matrix.
+  static __attribute__((always_inline)) void store_output(output_t* C_global,
+                                                          uint32_t  tile_row,
+                                                          uint32_t  tile_col,
+                                                          uint32_t  N) {
+    uint32_t tid          = vx_thread_id();
+    uint32_t wid          = vx_warp_id();
+    uint32_t tid_in_warp  = tid % NUM_THREADS;
+    constexpr uint32_t rows_per_thread = xtileM / NUM_THREADS;
+
+    for (uint32_t r = 0; r < rows_per_thread; ++r) {
+      uint32_t lane_base = wid * xtileM + r * NUM_THREADS;
+      uint32_t out_row   = tile_row + lane_base + tid_in_warp;
+      output_t* row_ptr  = C_global + out_row * N + tile_col;
+      for (uint32_t col = 0; col < xtileN; ++col) {
+        row_ptr[col] = static_cast<output_t>(vx_tmem_ld(vx_make_tmem_addr(lane_base, col)));
+      }
+    }
   }
 };
 

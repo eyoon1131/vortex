@@ -33,7 +33,6 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 `ifdef TCU_TMEM_ENABLE
     // TMEM read/write ports
     input wire [31:0]                               tmem_data[TCU_TMEM_LANES][TCU_TMEM_COLS],
-    input wire [TCU_TMEM_LANE_BITS-1:0]             tmem_warp_rank,
     output wire                                     tmem_wr_en,
     output wire [TCU_TMEM_LANE_BITS-1:0]            tmem_wr_lane_base,
     output wire [TCU_TMEM_COL_BITS-1:0]             tmem_wr_col_base,
@@ -91,6 +90,8 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     assign rs2_data = execute_if.data.rs2_data;
 `endif
 
+    wire [`LOG2UP(`NUM_WARPS)-1:0] wid = execute_if.data.header.wid;
+
     wire [2:0] step_m = execute_if.data.op_args.tcu.step_m;
     wire [6:0] step_n = execute_if.data.op_args.tcu.step_n;
     wire [2:0] step_k = execute_if.data.op_args.tcu.step_k;
@@ -105,7 +106,6 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // -----------------------------------------------------------------------
 
 `ifdef TCU_SPARSE_ENABLE
-    wire [`LOG2UP(`NUM_WARPS)-1:0] wid = execute_if.data.header.wid;
     wire meta_wr_en = execute_fire && is_meta_store;
 
     // meta_store: force rd=0 in mdata_queue header
@@ -269,7 +269,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             end
 
         `ifdef TCU_TMEM_ENABLE
-            wire [TCU_TMEM_LANE_BITS-1:0] tmem_lane = TCU_TMEM_LANE_BITS'(tmem_warp_rank) * TCU_TMEM_LANE_BITS'(TCU_WG_TILE_M)
+            wire [TCU_TMEM_LANE_BITS-1:0] tmem_lane = TCU_TMEM_LANE_BITS'(wid) * TCU_TMEM_LANE_BITS'(TCU_WG_TILE_M)
                                                     + TCU_TMEM_LANE_BITS'(step_m) * TCU_TMEM_LANE_BITS'(TCU_TC_M)
                                                     + TCU_TMEM_LANE_BITS'(i);
             wire [TCU_TMEM_COL_BITS-1:0]  tmem_col  = TCU_TMEM_COL_BITS'(step_n) * TCU_TMEM_COL_BITS'(TCU_TC_N)
@@ -419,7 +419,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // -----------------------------------------------------------------------
     typedef struct packed {
         logic                           valid;
-        logic [TCU_TMEM_LANE_BITS-1:0]  lane_base;  // warp_rank * xtileM + step_m * tcM
+        logic [TCU_TMEM_LANE_BITS-1:0]  lane_base;  // wid * xtileM + step_m * tcM
         logic [TCU_TMEM_COL_BITS-1:0]   col_base;   // step_n * tcN
     } tmem_addr_t;
 
@@ -433,7 +433,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             for (int p = 0; p < PIPE_LATENCY-1; ++p)
                 tmem_addr_pipe[p] <= tmem_addr_pipe[p+1];
             tmem_addr_pipe[PIPE_LATENCY-1].valid        <= execute_fire && is_umma;
-            tmem_addr_pipe[PIPE_LATENCY-1].lane_base    <= TCU_TMEM_LANE_BITS'(TCU_TMEM_LANE_BITS'(tmem_warp_rank) 
+            tmem_addr_pipe[PIPE_LATENCY-1].lane_base    <= TCU_TMEM_LANE_BITS'(TCU_TMEM_LANE_BITS'(wid) 
                                                          * TCU_TMEM_LANE_BITS'(TCU_WG_TILE_M)
                                                          + TCU_TMEM_LANE_BITS'(step_m) 
                                                          * TCU_TMEM_LANE_BITS'(TCU_TC_M));

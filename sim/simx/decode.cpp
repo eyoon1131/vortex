@@ -1367,7 +1367,7 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
         constexpr uint32_t k_steps = umma_cfg::k_steps;   // always 2
         uint32_t fmt_d = rd;
         uint32_t fmt_s = rs1;
-        constexpr uint32_t a0 = 10, a1 = 11, a2 = 12;
+        constexpr uint32_t a0 = 10, a1 = 11;
         constexpr uint32_t n_steps = umma_cfg::NRC / m_steps;
         constexpr uint32_t total_uops = k_steps * umma_cfg::NRC;
         uint32_t steps_shift = (total_uops > 1) ? (32 - log2ceil(total_uops)) : 0;
@@ -1387,7 +1387,6 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
                 uop->setSrcReg(0, a0, RegType::Integer);
                 uop->setSrcReg(1, a1, RegType::Integer);
               }
-              uop->setSrcReg(2, a2, RegType::Integer);  // a2 = warp_rank
               uop->setParentUUID(uuid);
               ibuffer.push_back(uop);
             }

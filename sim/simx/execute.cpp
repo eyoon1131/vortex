@@ -1709,8 +1709,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         assert(exec_tmask.count() == num_threads);
         uint32_t a_desc = rs1_data.empty() ? 0 : rs1_data.at(0).u32;
         uint32_t b_desc = rs2_data.empty() ? 0 : rs2_data.at(0).u32;
-        uint32_t warp_rank = rs3_data.at(0).u32;
-        core_->tensor_unit()->umma(wid, warp_rank, tpuArgs.fmt_s, tpuArgs.fmt_d,
+        core_->tensor_unit()->umma(wid, tpuArgs.fmt_s, tpuArgs.fmt_d,
                                     tpuArgs.step_m, tpuArgs.step_n, tpuArgs.step_k,
                                     a_desc, b_desc, trace_data.get());
       } break;

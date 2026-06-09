@@ -272,11 +272,6 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     wire [TCU_TMEM_LANE_BITS-1:0]           tmem_wr_lane_base [BLOCK_SIZE];
     wire [TCU_TMEM_COL_BITS-1:0]            tmem_wr_col_base  [BLOCK_SIZE];
     wire [TCU_TC_M-1:0][TCU_TC_N-1:0][31:0] tmem_wr_data      [BLOCK_SIZE];
-    wire [TCU_TMEM_LANE_BITS-1:0]           tmem_warp_rank    [BLOCK_SIZE];  
-
-    for (genvar block_idx = 0; block_idx < BLOCK_SIZE; ++block_idx) begin : g_tmem_warp_rank
-        assign tmem_warp_rank[block_idx] = TCU_TMEM_LANE_BITS'(per_block_execute_if[block_idx].data.rs3_data[0]);
-    end
 
     for (genvar block_idx = 0; block_idx < BLOCK_SIZE; ++block_idx) begin : g_tmem_mgmt
         always_ff @(posedge clk) begin
@@ -406,7 +401,6 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         `endif
         `ifdef TCU_TMEM_ENABLE
             .tmem_data          (tmem_data),
-            .tmem_warp_rank     (tmem_warp_rank[block_idx]),
             .tmem_wr_en         (tmem_wr_en[block_idx]),
             .tmem_wr_lane_base  (tmem_wr_lane_base[block_idx]),
             .tmem_wr_col_base   (tmem_wr_col_base[block_idx]),

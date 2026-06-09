@@ -106,7 +106,6 @@ public:
 				 ExeTraceData* trace_data);
 
 	void umma(uint32_t wid,
-			  uint32_t warp_rank,
 			  uint32_t fmt_s,
 			  uint32_t fmt_d,
 			  uint32_t step_m,

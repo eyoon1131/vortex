@@ -373,9 +373,6 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
             // B source: smem descriptor (x11), read on first uop only
             ibuf_r.rs2 = make_reg_num(REG_TYPE_I, 5'd11);
             ibuf_r.used_rs[1] = is_first_uop;
-            // warp_rank: x12
-            ibuf_r.rs3 = make_reg_num(REG_TYPE_I, 5'd12);
-            ibuf_r.used_rs[2] = '1;
         end else
     `endif
         begin

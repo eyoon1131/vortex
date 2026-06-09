@@ -1010,7 +1010,6 @@ public:
   }
 
 	void umma(uint32_t wid,
-            uint32_t warp_rank,
             uint32_t fmt_s,
             uint32_t fmt_d,
             uint32_t step_m,
@@ -1056,8 +1055,7 @@ public:
           // Load B
           b_col[z].u32 = load_lmem_word(sd_b, k_elem, b_col_idx, fmt_s, true);
         }
-        uint32_t lane = warp_rank * umma_cfg::xtileM + step_m * cfg::tcM + i; // Calculated with warp_rank, not wid
-                                                                              // warp_rank = tid / NUM_THREADS not guaranteed to match wid
+        uint32_t lane = wid * umma_cfg::xtileM + step_m * cfg::tcM + i;
         uint32_t col  = step_n * cfg::tcN + j;
         uint32_t c_val = tmem_.data[lane][col];
         uint32_t d_val = fedp(a_row, b_col, c_val);
@@ -1308,7 +1306,6 @@ void TensorUnit::tmem_ld(uint32_t tmem_addr,
 }
 
 void TensorUnit::umma(uint32_t wid,
-                      uint32_t warp_rank,
                       uint32_t fmt_s,
                       uint32_t fmt_d,
                       uint32_t step_m,
@@ -1317,7 +1314,7 @@ void TensorUnit::umma(uint32_t wid,
                       uint32_t a_desc,
                       uint32_t b_desc,
                       ExeTraceData* trace_data) {
-  impl_->umma(wid, warp_rank, fmt_s, fmt_d, step_m, step_n, step_k,
+  impl_->umma(wid, fmt_s, fmt_d, step_m, step_n, step_k,
                 a_desc, b_desc, trace_data);
 }
 

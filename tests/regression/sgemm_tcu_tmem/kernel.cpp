@@ -18,7 +18,7 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
 
   uint32_t tid = threadIdx.x;
   uint32_t num_threads = blockDim.x;  // warps * NUM_THREADS
-  uint32_t warp_rank = tid / NUM_THREADS; // CRUCIAL: warp_rank is not guaranteed to equal wid set by device
+  uint32_t warp_rank = tid / NUM_THREADS; // warp_rank is not guaranteed to equal wid set by device (vx_warp_id())
   uint32_t num_warps = num_threads / NUM_THREADS;
 
   // CTA tile dimensions
@@ -32,7 +32,7 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
   auto B_smem = smem + cta_M * ctx::tileK;
 
   // ── TMEM allocation ───────────────────────────────────────────────────────
-  // One elected warp allocates TMEM for the CTA
+  // One elected thread allocates TMEM for the CTA
   if (warp_rank == 0 && tid == 0) {
     vt::vx_tmem_alloc(ctx::xtileN);
   }
@@ -40,7 +40,7 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
 
   // Initialize accumulator in TMEM to zero
   // Executed cooperatively by warps
-  ctx::fill_tmem(0, warp_rank);
+  ctx::fill_tmem(0);
   __syncthreads();
 
   for (uint32_t k = 0; k < K; k += ctx::tileK) {
@@ -62,34 +62,18 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
 
     __syncthreads();
 
-    // Each warp's A slice starts at warp_rank * per_warp_M * tileK
-    auto A_warp = A_smem + warp_rank * ctx::xtileM * ctx::tileK;
+    // Get each warp's A slice
+    auto A_warp = ctx::warp_A_ptr(A_smem);
     auto desc_a = vt::vx_make_smem_desc(A_warp, ctx::tileK * sizeof(ctx::input_t));
     auto desc_b = vt::vx_make_smem_desc(B_smem, ctx::xtileN * sizeof(ctx::input_t));
 
-    ctx::umma_sync(desc_a, desc_b, warp_rank);
+    ctx::umma_sync(desc_a, desc_b);
 
     __syncthreads();
   }
 
   // ── Epilogue: TMEM → global memory ───────────────────────────────────────
-  // Each warp reads its accumulator tile from TMEM and stores it to global
-  // memory. The accumulator for warp_rank W occupies lanes
-  // [W*xtileM, W*xtileM + xtileM) in TMEM, with each lane corresponding to
-  // one output row. Since xtileM may exceed NUM_THREADS, each thread is
-  // responsible for (xtileM / NUM_THREADS) rows, iterated via r. For each
-  // row, thread tid_in_warp reads from lane (lane_base + tid_in_warp) across
-  // all xtileN columns and writes to the corresponding row of the output matrix.
-  uint32_t tid_in_warp = tid % NUM_THREADS;
-  uint32_t rows_per_thread = ctx::xtileM / NUM_THREADS;
-  for (uint32_t r = 0; r < rows_per_thread; ++r) {
-      uint32_t lane_base = warp_rank * ctx::xtileM + r * NUM_THREADS;
-      uint32_t out_row = tile_row + lane_base + tid_in_warp;
-      for (uint32_t col = 0; col < ctx::xtileN; ++col) {
-          float val = ctx::accum_ld(lane_base, col);
-          pC[out_row * N + tile_col + col] = static_cast<ctx::output_t>(val);
-      }
-  }
+  ctx::store_output(pC, tile_row, tile_col, N);
   __syncthreads();
 
   // ── TMEM deallocation ─────────────────────────────────────────────────────

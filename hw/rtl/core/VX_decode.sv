@@ -592,7 +592,6 @@ module VX_decode import VX_gpu_pkg::*; #(
                                     op_args.tcu.a_from_smem = rs2[3];
                                     `USED_IREG (rs1);  // desc_a (a0)
                                     `USED_IREG (rs2);  // desc_b (a1)
-                                    `USED_IREG (rs3);  // warp_rank (a2)
                                 end
                                 default:;
                             endcase
