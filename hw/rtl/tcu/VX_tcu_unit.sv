@@ -238,7 +238,34 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     end
     assign tcu_perf.wgmma_instrs = wgmma_instrs_ctr_r;
     assign tcu_perf.wgmma_stalls = wgmma_stalls_ctr_r;
-`endif
+
+`ifdef TCU_TMEM_ENABLE
+    // umma_instrs / umma_stalls
+    logic umma_fire_b  [BLOCK_SIZE];
+    logic umma_stall_b [BLOCK_SIZE];
+    for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_umma_perf
+        wire is_umma_p = (per_block_execute_if[bi].data.op_type == INST_TCU_UMMA);
+        assign umma_fire_b [bi] = per_block_execute_if[bi].valid && per_block_execute_if[bi].ready && is_umma_p;
+        assign umma_stall_b[bi] = per_block_execute_if[bi].valid && !per_block_execute_if[bi].ready && is_umma_p;
+    end
+
+    logic [PERF_CTR_BITS-1:0] umma_instrs_ctr_r;
+    logic [PERF_CTR_BITS-1:0] umma_stalls_ctr_r;
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            umma_instrs_ctr_r <= '0;
+            umma_stalls_ctr_r <= '0;
+        end else begin
+            for (int bi = 0; bi < BLOCK_SIZE; bi++) begin
+                if (umma_fire_b[bi])  umma_instrs_ctr_r <= umma_instrs_ctr_r + PERF_CTR_BITS'(1);
+                if (umma_stall_b[bi]) umma_stalls_ctr_r <= umma_stalls_ctr_r + PERF_CTR_BITS'(1);
+            end
+        end
+    end
+    assign tcu_perf.umma_instrs = umma_instrs_ctr_r;
+    assign tcu_perf.umma_stalls = umma_stalls_ctr_r;
+`endif // TCU_TMEM_ENABLE
+`endif // PERF_ENABLE
 
 `else // !TCU_WGMMA_ENABLE
 
@@ -247,6 +274,8 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     assign tcu_perf.lmem_reads        = '0;
     assign tcu_perf.wgmma_instrs      = '0;
     assign tcu_perf.wgmma_stalls      = '0;
+    assign tcu_perf.umma_instrs       = '0;
+    assign tcu_perf.umma_stalls       = '0;
 `endif
 
 `endif // TCU_WGMMA_ENABLE
