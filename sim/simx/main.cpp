@@ -26,6 +26,8 @@
 #include "core.h"
 #include "VX_types.h"
 #include "emulator.h"
+#include "scheduler_impl.h"
+#include "scheduler_ml.h"
 #include "dtm/debug_module.h"
 #include "dtm/jtag_dtm.h"
 #include "dtm/remote_bitbang.h"
@@ -33,7 +35,8 @@
 using namespace vortex;
 
 static void show_usage() {
-   std::cout << "Usage: [-c <cores>] [-w <warps>] [-t <threads>] [-v: vector-test] [-s: stats] [-d: debug-mode] [-p <port>: RBB port] [-V: verbose debug logging] [-h: help] <program>" << std::endl;
+   std::cout << "Usage: [-c <cores>] [-w <warps>] [-t <threads>] [-v: vector-test] [-s: stats] [-d: debug-mode] [-p <port>: RBB port] [-V: verbose debug logging] [--scheduler=<sched>] [-h: help] <program>" << std::endl;
+   std::cout << "  Schedulers: rr (true round-robin, default), linear/ls (first-ready scan), gto, ml" << std::endl;
 }
 
 uint32_t num_threads = NUM_THREADS;
@@ -44,11 +47,33 @@ bool vector_test = false;
 bool debug_mode = false;
 bool debug_verbose = false;  // Verbose debug module logging
 uint16_t rbb_port = 9823;  // Default OpenOCD remote bitbang port
+std::string scheduler = "rr";  // Default scheduler
 const char* program = nullptr;
 
 static void parse_args(int argc, char **argv) {
+	// Check for VORTEX_SCHEDULER environment variable first (lowest priority)
+	const char* env_scheduler = std::getenv("VORTEX_SCHEDULER");
+	if (env_scheduler) {
+	scheduler = std::string(env_scheduler);
+	}
+
+	// Pre-process argv to extract --scheduler option before getopt
+	// This removes it from argv so getopt doesn't see it
+	int new_argc = 1;
+	char* new_argv[100];
+	new_argv[0] = argv[0];
+
+	for (int i = 1; i < argc; ++i) {
+	std::string arg(argv[i]);
+	if (arg.find("--scheduler=") == 0) {
+	scheduler = arg.substr(12);  // Extract scheduler name after "--scheduler=" (higher priority)
+	} else {
+	new_argv[new_argc++] = argv[i];
+	}
+	}
+
   	int c;
-  	while ((c = getopt(argc, argv, "t:w:c:vshdp:V")) != -1) {
+	while ((c = getopt(new_argc, new_argv, "t:w:c:vshdp:V")) != -1) {
     	switch (c) {
       case 't':
         num_threads = atoi(optarg);
@@ -84,10 +109,10 @@ static void parse_args(int argc, char **argv) {
     	}
 	}
 
-	if (optind < argc) {
-		program = argv[optind];
+	if (optind < new_argc) {
+		program = new_argv[optind];
     if (!debug_mode) {
-      std::cout << "Running " << program << "..." << std::endl;
+      std::cout << "Running " << program << " with scheduler: " << scheduler << "..." << std::endl;
     }
 	} else if (!debug_mode) {
 		show_usage();
@@ -200,13 +225,55 @@ int main(int argc, char **argv) {
         rbb.tick();
       }
     } else {
+      // Setup scheduler before running simulation
+      Emulator* emulator = processor.get_first_emulator();
+      if (emulator != nullptr) {
+        std::unique_ptr<WarpScheduler> sched;
+        if (scheduler == "gto") {
+          sched = std::make_unique<GTOScheduler>(num_warps);
+          std::cerr << "[INFO] Using GTO Scheduler" << std::endl;
+        } else if (scheduler == "ml") {
+          sched = std::make_unique<MLScheduler>(num_warps);
+          std::cerr << "[INFO] Using ML Scheduler" << std::endl;
+        } else if (scheduler == "linear" || scheduler == "ls") {
+          sched = std::make_unique<LinearScanScheduler>();
+          std::cerr << "[INFO] Using LinearScan Scheduler" << std::endl;
+        } else {
+          // Default to round-robin
+          sched = std::make_unique<RoundRobinScheduler>();
+          std::cerr << "[INFO] Using RoundRobin Scheduler" << std::endl;
+        }
+        emulator->setScheduler(std::move(sched));
+      }
+
       // run simulation
     #ifdef EXT_V_ENABLE
       // vector test exitcode is a special case
       if (vector_test) return (processor.run() != 1);
     #endif
       // else continue as normal
+      std::cerr << "[INFO] Starting simulation..." << std::endl;
+      std::cerr.flush();
       processor.run();
+      std::cerr << "[INFO] Simulation complete" << std::endl;
+      std::cerr.flush();
+
+      // Print performance metrics
+      if (emulator != nullptr) {
+        uint64_t cycles = emulator->getCycleCount();
+        uint64_t instrs = emulator->getInstructionCount();
+        double ipc = emulator->getIPC();
+
+        std::cout << "\n=== Performance Metrics ===" << std::endl;
+        std::cout << "Scheduler: " << emulator->getSchedulerName() << std::endl;
+        std::cout << "Total Cycles: " << cycles << std::endl;
+        std::cout << "Total Instructions: " << instrs << std::endl;
+        std::cout << "IPC (Instructions Per Cycle): " << std::fixed << std::setprecision(4) << ipc << std::endl;
+        std::cout.flush();
+      } else {
+        std::cerr << "[ERROR] Emulator pointer is null!" << std::endl;
+      }
+
 
       // read exitcode from @MPM.1
       ram.read(&exitcode, (IO_MPM_ADDR + 8), 4);

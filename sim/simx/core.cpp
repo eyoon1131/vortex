@@ -276,6 +276,7 @@ void Core::decode() {
       DT(4, "*** ibuffer-stall: " << *trace);
     }
     ++perf_stats_.ibuf_stalls;
+    emulator_.notifyWarpStall(trace->wid);
     return;
   } else {
     trace->log_once(false);

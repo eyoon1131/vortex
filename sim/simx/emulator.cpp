@@ -19,6 +19,7 @@
 #include <util.h>
 
 #include "emulator.h"
+#include "scheduler_impl.h"
 #include "instr_trace.h"
 #include "instr.h"
 #include "dcrs.h"
@@ -81,6 +82,10 @@ Emulator::Emulator(const Arch &arch, const DCRS &dcrs, Core* core)
     , warps_(arch.num_warps(), arch.num_threads())
     , barriers_(arch.num_barriers(), 0)
     , ipdom_size_(arch.num_threads()-1)
+    , scheduler_(std::make_unique<RoundRobinScheduler>())
+    , cycle_count_(0)
+    , instruction_count_(0)
+    , warp_stall_count_(arch.num_warps(), 0)
   #ifdef EXT_TCU_ENABLE
     , tensor_unit_(core->tensor_unit())
   #endif
@@ -131,6 +136,21 @@ void Emulator::reset() {
   
   last_inactive_warp_pc_ = 0;
   last_inactive_warp_pc_valid_ = false;
+
+  // Reset scheduler and metrics
+  if (scheduler_) {
+    scheduler_->reset();
+  }
+  cycle_count_ = 0;
+  instruction_count_ = 0;
+  std::fill(warp_stall_count_.begin(), warp_stall_count_.end(), 0);
+}
+
+void Emulator::setScheduler(std::unique_ptr<WarpScheduler> scheduler) {
+  scheduler_ = std::move(scheduler);
+  if (scheduler_) {
+    scheduler_->reset();
+  }
 }
 
 void Emulator::attach_ram(RAM* ram) {
@@ -175,13 +195,18 @@ instr_trace_t* Emulator::step() {
     stalled_warps_.reset(0);
   }
 
-  // find next ready warp
-  for (size_t wid = 0, nw = arch_.num_warps(); wid < nw; ++wid) {
-    bool warp_active = active_warps_.test(wid);
-    bool warp_stalled = stalled_warps_.test(wid);
-    if (warp_active && !warp_stalled) {
-      scheduled_warp = wid;
-      break;
+  // find next ready warp using scheduler
+  if (scheduler_) {
+    scheduled_warp = scheduler_->selectWarp(active_warps_, stalled_warps_, warps_, cycle_count_);
+  } else {
+    // Fallback to simple scan if no scheduler (shouldn't happen)
+    for (size_t wid = 0, nw = arch_.num_warps(); wid < nw; ++wid) {
+      bool warp_active = active_warps_.test(wid);
+      bool warp_stalled = stalled_warps_.test(wid);
+      if (warp_active && !warp_stalled) {
+        scheduled_warp = wid;
+        break;
+      }
     }
   }
 
@@ -242,6 +267,13 @@ instr_trace_t* Emulator::step() {
 
   // Execute
   auto trace = this->execute(*instr, scheduled_warp);
+
+  // Update metrics
+  cycle_count_++;
+  instruction_count_++;
+  if (scheduler_) {
+    scheduler_->notifyExecution(scheduled_warp, cycle_count_);
+  }
 
   // Check for single-step mode - halt after executing one instruction
   if (debug_module_ != nullptr && debug_module_->is_single_step_active()) {
@@ -667,6 +699,25 @@ void Emulator::update_fcrs(uint32_t fflags, uint32_t wid, uint32_t tid) {
     this->set_csr(VX_CSR_FCSR, this->get_csr(VX_CSR_FCSR, wid, tid) | fflags, wid, tid);
     this->set_csr(VX_CSR_FFLAGS, this->get_csr(VX_CSR_FFLAGS, wid, tid) | fflags, wid, tid);
   }
+}
+
+// ML Scheduler support: notify when a warp stalls
+void Emulator::notifyWarpStall(uint32_t wid) {
+  if (wid < warp_stall_count_.size()) {
+    warp_stall_count_[wid]++;
+
+    if (scheduler_) {
+      scheduler_->notifyStall(wid, cycle_count_);
+    }
+  }
+}
+
+// Get stall count for a specific warp (for debugging/analysis)
+uint64_t Emulator::getWarpStallCount(uint32_t wid) const {
+  if (wid < warp_stall_count_.size()) {
+    return warp_stall_count_[wid];
+  }
+  return 0;
 }
 
 // For riscv-vector test functionality, ecall and ebreak must trap

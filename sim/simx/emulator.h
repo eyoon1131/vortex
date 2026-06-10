@@ -17,9 +17,11 @@
 #include <vector>
 #include <sstream>
 #include <stack>
+#include <memory>
 #include <mem.h>
 #include "types.h"
 #include "instr.h"
+#include "scheduler.h"
 #ifdef EXT_TCU_ENABLE
 #include "tcu/tensor_unit.h"
 #endif
@@ -110,6 +112,30 @@ public:
 
   void dcache_write(const void* data, uint64_t addr, uint32_t size);
 
+  // Scheduler control
+  void setScheduler(std::unique_ptr<WarpScheduler> scheduler);
+
+  WarpScheduler* getScheduler() const { return scheduler_.get(); }
+
+  std::string getSchedulerName() const {
+    return scheduler_ ? scheduler_->name() : "None";
+  }
+
+  // Metrics accessors
+  uint64_t getCycleCount() const { return cycle_count_; }
+
+  uint64_t getInstructionCount() const { return instruction_count_; }
+
+  double getIPC() const {
+    return cycle_count_ > 0 ? (double)instruction_count_ / cycle_count_ : 0.0;
+  }
+
+  // ML Scheduler support: notify stall event
+  void notifyWarpStall(uint32_t wid);
+
+  // ML Scheduler support: get warp stall statistics
+  uint64_t getWarpStallCount(uint32_t wid) const;
+
   // Get warp by index (for debug module access)
   warp_t& get_warp(uint32_t wid) {
     return warps_.at(wid);
@@ -166,6 +192,16 @@ private:
   uint32_t    ipdom_size_;
   Word        csr_mscratch_;
   wspawn_t    wspawn_;
+
+  // Warp scheduler
+  std::unique_ptr<WarpScheduler> scheduler_;
+
+  // Performance metrics
+  uint64_t cycle_count_;
+  uint64_t instruction_count_;
+
+  // Per-warp stall tracking (for ML scheduler)
+  std::vector<uint64_t> warp_stall_count_;
 
   // PC of the last warp to become inactive, used by the debug module to
   // report the final PC when the program completes.

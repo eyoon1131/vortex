@@ -18,6 +18,7 @@
 #include <mem.h>
 #include <processor.h>
 #include <util.h>
+#include "emulator.h"
 
 #include <assert.h>
 #include <chrono>
@@ -26,6 +27,12 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string>
+#include <memory>
+
+#include "scheduler.h"
+#include "scheduler_impl.h"
+#include "scheduler_ml.h"
 
 #include <VX_config.h>
 #ifdef VM_ENABLE
@@ -339,6 +346,30 @@ public:
     this->dcr_write(VX_DCR_BASE_STARTUP_ADDR1, krnl_addr >> 32);
     this->dcr_write(VX_DCR_BASE_STARTUP_ARG0, args_addr & 0xffffffff);
     this->dcr_write(VX_DCR_BASE_STARTUP_ARG1, args_addr >> 32);
+
+    // Setup scheduler based on VORTEX_SCHEDULER environment variable
+    const char* env_scheduler = std::getenv("VORTEX_SCHEDULER");
+    std::string scheduler_name = env_scheduler ? std::string(env_scheduler) : "rr";
+
+    Emulator* emulator = processor_.get_first_emulator();
+    if (emulator != nullptr) {
+      std::unique_ptr<WarpScheduler> sched;
+      if (scheduler_name == "gto") {
+        sched = std::make_unique<GTOScheduler>(NUM_WARPS);
+        std::cerr << "[simx] Using GTO Scheduler" << std::endl;
+      } else if (scheduler_name == "ml") {
+        sched = std::make_unique<MLScheduler>(NUM_WARPS);
+        std::cerr << "[simx] Using ML Scheduler" << std::endl;
+      } else if (scheduler_name == "linear" || scheduler_name == "ls") {
+        sched = std::make_unique<LinearScanScheduler>();
+        std::cerr << "[simx] Using LinearScan Scheduler" << std::endl;
+      } else {
+        // Default to round-robin
+        sched = std::make_unique<RoundRobinScheduler>();
+        std::cerr << "[simx] Using RoundRobin Scheduler" << std::endl;
+      }
+      emulator->setScheduler(std::move(sched));
+    }
 
     // start new run
     future_ = std::async(std::launch::async, [&] { processor_.run(); });

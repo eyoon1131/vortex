@@ -28,6 +28,7 @@ show_help()
     echo "  where"
     echo "--driver: gpu, simx, rtlsim, oape, xrt"
     echo "--app: any subfolder test under regression or opencl"
+    echo "--scheduler: rr (true round-robin, default), linear/ls (first-ready scan), gto, ml"
     echo "--class: 0=disable, 1=pipeline, 2=memsys"
     echo "--nohup: build and run in temp directory"
 }
@@ -49,6 +50,8 @@ DEFAULTS() {
     HAS_ARGS=0
     HAS_NP=0
     PERF_CLASS=0
+    # Check environment variable first, then default to rr
+    SCHEDULER=${VORTEX_SCHEDULER:-rr}
     CONFIGS="$CONFIGS"
     TEMPBUILD=0
     LOGFILE=run.log
@@ -60,6 +63,7 @@ parse_args() {
         case $i in
             --driver=*) DRIVER=${i#*=} ;;
             --app=*)    APP=${i#*=} ;;
+            --scheduler=*) SCHEDULER=${i#*=} ;;
             --clusters=*) CONFIGS=$(add_option "$CONFIGS" "-DNUM_CLUSTERS=${i#*=}") ;;
             --cores=*)  CONFIGS=$(add_option "$CONFIGS" "-DNUM_CORES=${i#*=}") ;;
             --warps=*)  CONFIGS=$(add_option "$CONFIGS" "-DNUM_WARPS=${i#*=}") ;;
@@ -126,6 +130,7 @@ run_app() {
     [ $TEMPBUILD -eq 1 ] && cmd_opts=$(add_option "$cmd_opts" "VORTEX_RT_PATH=\"$TEMPDIR\"")
     [ $HAS_ARGS -eq 1 ] && cmd_opts=$(add_option "$cmd_opts" "OPTS=\"$ARGS\"")
     [ $HAS_NP -eq 1 ] && cmd_opts=$(add_option "$cmd_opts" "NP=$NP")
+    [ -n "$SCHEDULER" ] && cmd_opts=$(add_option "$cmd_opts" "VORTEX_SCHEDULER=\"$SCHEDULER\"")
     cmd_opts=$(add_option "$cmd_opts" "make -C \"$APP_PATH\" run-$DRIVER")
     [ $DEBUG -ne 0 ] && cmd_opts=$(add_option "$cmd_opts" "> $LOGFILE 2>&1")
     echo "Running: $cmd_opts"
