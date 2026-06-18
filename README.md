@@ -1,3 +1,18 @@
+# Tensor Memory
+
+To test the Tensor Memory extension to the TCU, enable the EXT_TCU_ENABLE and TCU_TMEM_ENABLE flags. 
+```sh
+    CONFIGS="-DEXT_TCU_ENABLE -DTCU_TMEM_ENABLE" ./ci/blackbox.sh --app=sgemm_tcu_tmem
+```
+`NUM_THREADS` and `UMMA_NRC` are configured to default to 4 and 8, respectively, in `common.h` under `tests/regression/sgemm_tcu_tmem`. `UMMA_NRC` supports values of 8, 16, 32, 64, and 128. `DNUM_WARPS` defaults to 4, and must match the `w` argument to `sgemm_tcu_tmem`. The matrix sizes used in the test can be configured via the `m`, `n`, and `k` arguments. For example, to run `sgemm_tcu_tmem` with matrix dimensions 128 x 128 x 64, with 8 threads, 8 warps, and `UMMA_NRC` = 32, 
+```sh
+    CONFIGS="-DEXT_TCU_ENABLE -DTCU_TMEM_ENABLE -DNUM_THREADS=8 -DNUM_WARPS=8 -DUMMA_NRC=32" ./ci/blackbox.sh --app=sgemm_tcu_tmem --args="-n128 -m128 -k64 -w8"
+```
+The default driver is simx. For cycle-accurate results, 
+```sh
+    CONFIGS="-DEXT_TCU_ENABLE -DTCU_TMEM_ENABLE" ./ci/blackbox.sh --driver=rtlsim --app=sgemm_tcu_tmem
+```
+
 # Vortex GPGPU
 
 Vortex is a full-stack open-source RISC-V GPGPU. Vortex supports multiple **backend drivers**, including our C++ simulator (simx), an RTL simulator, and physical Xilinx and Altera FPGAs-- all controlled by a single driver script. The chosen driver determines the corresponding code invoked to run Vortex. Generally, developers will prototype their intended design in simx, before completing going forward with an RTL implementation. Alternatively, you can get up and running by selecting a driver of your choice and running a demo program.

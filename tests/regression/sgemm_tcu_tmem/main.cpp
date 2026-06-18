@@ -588,8 +588,8 @@ int main(int argc, char *argv[]) {
 
   uint64_t num_warps;
   RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_WARPS, &num_warps));
-  if (warps > num_warps) {
-    std::cout << "Error: requested warps (" << warps << ") exceeds device's capacity (" << num_warps << ")" << std::endl;
+  if (warps != num_warps) {
+    std::cout << "Error: requested warps (" << warps << ") does not match device's capacity (" << num_warps << ")" << std::endl;
     return -1;
   }
 
