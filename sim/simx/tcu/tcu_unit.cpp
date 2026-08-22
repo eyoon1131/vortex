@@ -56,10 +56,10 @@ static constexpr uint32_t kFedpLatency = 1 + 1 + 1 + 1;
 // End-to-end MMA uop cost: dispatch plus the dot-product pipeline.
 static constexpr uint32_t kMmaLatency = 1 + kFedpLatency;
 
-#ifdef TCU_TMEM_ENABLE
 // UMMA's 3-bit umma_nrc field selects the per-warp N-tile width (NRC).
+// Not gated behind TCU_TMEM_ENABLE: plan_wgmma_lines() references it via
+// its is_umma branch whenever WGMMA is enabled, independent of TMEM.
 static constexpr uint32_t kNrcTable[5] = {8, 16, 32, 64, 128};
-#endif
 
 inline uint64_t nan_box(uint32_t value) {
   return value | 0xffffffff00000000;
