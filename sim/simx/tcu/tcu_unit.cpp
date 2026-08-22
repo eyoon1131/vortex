@@ -26,6 +26,7 @@
 #include <cmath>
 #include <limits>
 #include <type_traits>
+#include <unordered_set>
 
 using namespace vortex;
 
@@ -54,6 +55,11 @@ static constexpr uint32_t kFedpLatency = 1 + 1 + 1 + 1;
 #endif
 // End-to-end MMA uop cost: dispatch plus the dot-product pipeline.
 static constexpr uint32_t kMmaLatency = 1 + kFedpLatency;
+
+#ifdef TCU_TMEM_ENABLE
+// UMMA's 3-bit umma_nrc field selects the per-warp N-tile width (NRC).
+static constexpr uint32_t kNrcTable[5] = {8, 16, 32, 64, 128};
+#endif
 
 inline uint64_t nan_box(uint32_t value) {
   return value | 0xffffffff00000000;
@@ -393,6 +399,14 @@ public:
     agu_.fill(agu_state_t{});
     agu_issue_rr_ = 0;
   #endif
+  #ifdef TCU_TMEM_ENABLE
+    for (auto& row : tmem_data_) row.fill(0);
+    tmem_free_.assign(1, {0, kTmemCols});
+    tmem_allocs_.clear();
+    cta_tmem_handle_.clear();
+    cta_tmem_dealloc_warps_.clear();
+    umma_handle_.clear();
+  #endif
   }
 
 #ifdef TCU_META_ENABLE
@@ -544,7 +558,7 @@ public:
       auto& input = simobject_->Inputs.at(b);
       if (input.empty()) continue;
       auto trace = input.peek();
-      if (!tcu_is_wgmma(std::get<TcuType>(trace->op_type))) continue;
+      if (!tcu_uses_shared_tbuf(std::get<TcuType>(trace->op_type))) continue;
 
       uint32_t wid = trace->wid;
       uint64_t wid_bit = (uint64_t(1) << wid);
@@ -606,7 +620,8 @@ public:
         tbuf->invalidate_a(b);
       }
       this->plan_wgmma_lines(b, wid, a_desc, b_desc, tpuArgs,
-                             std::get<TcuType>(trace->op_type) == TcuType::WGMMA_SP);
+                             std::get<TcuType>(trace->op_type) == TcuType::WGMMA_SP,
+                             std::get<TcuType>(trace->op_type) == TcuType::UMMA);
       if (tbuf->ready_a(b) && tbuf->ready_b()) {
         ++perf_stats_.tbuf_cache_hits;
       }
@@ -646,10 +661,10 @@ public:
 
       #ifdef VX_CFG_TCU_WGMMA_ENABLE
       // CTA-overlap fence deferred this block — skip until pass 1 plans it.
-      if (tcu_is_wgmma(tcu_type) && !tpuArgs.is_setup_uop &&
+      if (tcu_uses_shared_tbuf(tcu_type) && !tpuArgs.is_setup_uop &&
           !(wgmma_planned_warps_.at(b) & (uint64_t(1) << trace->wid)))
         continue;
-      if (tcu_is_wgmma(tcu_type) && !tpuArgs.is_setup_uop) {
+      if (tcu_uses_shared_tbuf(tcu_type) && !tpuArgs.is_setup_uop) {
         int32_t this_cta = (int32_t)core_->scheduler().warp(trace->wid).cta_csrs.cta_id;
         bool block_other_cta_inflight = false;
         for (uint32_t k = 0; k < VX_CFG_NUM_TCU_BLOCKS; ++k) {
@@ -721,6 +736,54 @@ public:
           this->agu_start(b, wid, tpuArgs.fmt_d, base_addr, trace);
         } break;
       #endif
+      #ifdef TCU_TMEM_ENABLE
+        case TcuType::UMMA: {
+          uint32_t a_desc = rs1_data.empty() ? 0 : rs1_data.at(0).u32;
+          uint32_t b_desc = rs2_data.empty() ? 0 : rs2_data.at(0).u32;
+          uint32_t handle = rs3_data.empty() ? 0 : rs3_data.at(0).u32;
+          cur_block_ = b;
+          // Same lockstep invariant as WGMMA — UMMA shares the same bbuf.
+          if (!tpuArgs.is_setup_uop) {
+            int32_t this_cta = (int32_t)core_->scheduler().warp(wid).cta_csrs.cta_id;
+            for (uint32_t k = 0; k < VX_CFG_NUM_TCU_BLOCKS; ++k) {
+              if (k == b) continue;
+              if (in_wgmma_.at(k) && cta_owner_a_.at(k) != this_cta) {
+                std::cerr << "*** TCU CTA lockstep violation: block " << b
+                          << " executing UMMA cta_id=" << this_cta
+                          << " while block " << k << " holds cta_id="
+                          << cta_owner_a_.at(k) << std::endl;
+                std::abort();
+              }
+            }
+          }
+          this->umma(wid, tpuArgs.fmt_s, tpuArgs.fmt_d,
+                     tpuArgs.step_m, tpuArgs.step_n, tpuArgs.step_k,
+                     tpuArgs.umma_nrc, a_desc, b_desc, handle,
+                     rs1_data, rs2_data);
+        } break;
+        case TcuType::TMEM_ALLOC: {
+          // Every warp of the CTA can call this independently — tmem_alloc()
+          // caches by cta_uid so they all get the same handle back with no
+          // elected-thread/smem-broadcast needed in the kernel.
+          uint32_t ncols = rs1_data.empty() ? 0 : rs1_data.at(0).u32;
+          int32_t cta_uid = this->cta_uid(wid);
+          uint32_t handle = this->tmem_alloc(ncols, cta_uid);
+          for (auto& r : rd_data) r.u32 = handle;
+        } break;
+        case TcuType::TMEM_DEALLOC: {
+          uint32_t handle = rs1_data.empty() ? 0 : rs1_data.at(0).u32;
+          int32_t cta_uid = this->cta_uid(wid);
+          this->tmem_dealloc(handle, cta_uid, wid);
+        } break;
+        case TcuType::TMEM_ST: {
+          uint32_t tmem_addr = rs1_data.empty() ? 0 : rs1_data.at(0).u32;
+          this->tmem_st(tmem_addr, rs2_data);
+        } break;
+        case TcuType::TMEM_LD: {
+          uint32_t tmem_addr = rs1_data.empty() ? 0 : rs1_data.at(0).u32;
+          this->tmem_ld(tmem_addr, rd_data);
+        } break;
+      #endif
         default:
           std::abort();
         }
@@ -742,6 +805,19 @@ public:
         delay = 3;
         break;
     #endif
+    #ifdef TCU_TMEM_ENABLE
+      case TcuType::UMMA:
+        delay = kMmaLatency;
+        break;
+      case TcuType::TMEM_ST:
+      case TcuType::TMEM_LD:
+        delay = 1;
+        break;
+      case TcuType::TMEM_ALLOC:
+      case TcuType::TMEM_DEALLOC:
+        delay = 0;
+        break;
+    #endif
       default:
         std::abort();
       }
@@ -759,9 +835,9 @@ public:
       if (simobject_->Outputs.at(b).try_send(trace, delay)) {
         exec_done_.at(b) = false;
       #ifdef VX_CFG_TCU_WGMMA_ENABLE
-        // Clear this warp's plan bit on its last uop so the next WGMMA
+        // Clear this warp's plan bit on its last uop so the next WGMMA/UMMA
         // re-decodes descriptors. Block stays in_wgmma_ until all warps drain.
-        if (tcu_is_wgmma(tcu_type) && trace->instr_ptr->get_fu_unlock()) {
+        if (tcu_uses_shared_tbuf(tcu_type) && trace->instr_ptr->get_fu_unlock()) {
           uint64_t wid_bit = (uint64_t(1) << trace->wid);
           wgmma_planned_warps_.at(b) &= ~wid_bit;
           if (wgmma_planned_warps_.at(b) == 0) {
@@ -787,12 +863,14 @@ public:
   // Lines already resident or in-flight are skipped (additive plan).
   void plan_wgmma_lines(uint32_t b, uint32_t wid,
                         uint32_t a_desc, uint32_t b_desc,
-                        const IntrTcuArgs& args, bool is_sparse) {
+                        const IntrTcuArgs& args, bool is_sparse, bool is_umma) {
     uint32_t fmt_s = args.fmt_s;
     bool is_a_smem = args.is_a_smem;
     uint32_t e_bits = elem_bits(fmt_s);
-    // NRC: cd_nregs 0/1/2 → 8/16/32; xtileN = NRC * NT / xtileM.
-    uint32_t nrc      = (args.cd_nregs == 0) ? 8 : (args.cd_nregs == 1) ? 16 : 32;
+    // WGMMA: cd_nregs 0/1/2 → 8/16/32. UMMA: umma_nrc 0..4 → 8/16/32/64/128
+    // (its own field — cd_nregs is left at 0 for UMMA instructions)
+    uint32_t nrc      = is_umma ? kNrcTable[args.umma_nrc]
+                                 : ((args.cd_nregs == 0) ? 8 : (args.cd_nregs == 1) ? 16 : 32);
     uint32_t xtile_n  = (nrc * VX_CFG_NUM_THREADS) / wg_cfg::xtileM;
 
     lmem_desc_t sd_a{}, sd_b{};
@@ -1085,6 +1163,231 @@ public:
     __unused(b_desc);
   }
 
+#ifdef TCU_TMEM_ENABLE
+  // Unique per-launched-CTA identifier, linearized from block_idx against
+  // grid_dim. NOT the same thing as cta_csrs.cta_id: that field is
+  // the LMEM co-residency slot index, a value that gets 
+  // reused across different CTAs as slots free up and refill.
+  // This is wrong for tmem_alloc which needs to tell CTA N's allocation
+  // lifetime apart from CTA N+k's.
+  int32_t cta_uid(uint32_t wid) {
+    auto& csrs = core_->scheduler().warp(wid).cta_csrs;
+    return (int32_t)(csrs.block_idx[2] * csrs.grid_dim[1] * csrs.grid_dim[0]
+                    + csrs.block_idx[1] * csrs.grid_dim[0]
+                    + csrs.block_idx[0]);
+  }
+
+  // ── TMEM allocator ─────────────────────────────────────────────────────
+  // First-fit free-list column allocator. Multiple warpgroups (different
+  // CTAs) can hold disjoint, concurrently-live allocations.
+  //
+  // CTA-scoped idempotency: every warp of a CTA can call tmem_alloc()
+  // independently and get the same handle back, with no elected-thread +
+  // shared-memory broadcast needed in the kernel. The first call for a
+  // given cta_id allocates and later calls from other warps of the
+  // same CTA just return the cached handle.
+  uint32_t tmem_alloc(uint32_t ncols, int32_t cta_id) {
+    auto cta_it = cta_tmem_handle_.find(cta_id);
+    if (cta_it != cta_tmem_handle_.end()) {
+      uint32_t handle = cta_it->second;
+      if (tmem_allocs_.at(handle) != ncols) {
+        std::cout << "Error: TMEM_ALLOC ncols mismatch for cta_id=" << cta_id
+                  << " (existing=" << tmem_allocs_.at(handle) << ", requested=" << ncols
+                  << ") — one CTA can only hold one live allocation in this PoC" << std::endl;
+        std::abort();
+      }
+      return handle;
+    }
+
+    for (auto it = tmem_free_.begin(); it != tmem_free_.end(); ++it) {
+      if (it->second < ncols) continue;
+      uint32_t handle = it->first;
+      if (it->second == ncols) {
+        tmem_free_.erase(it);
+      } else {
+        it->first  += ncols;
+        it->second -= ncols;
+      }
+      tmem_allocs_[handle] = ncols;
+      for (uint32_t c = handle; c < handle + ncols; ++c)
+        for (auto& row : tmem_data_)
+          row[c] = 0;
+      cta_tmem_handle_[cta_id] = handle;
+      return handle;
+    }
+    std::cout << "Error: TMEM allocation failed (ncols=" << ncols
+              << ", no free range large enough)" << std::endl;
+    std::abort();
+  }
+
+  // Mirrors tmem_alloc(). The range is only actually freed once every warp
+  // of the CTA has called dealloc.
+  void tmem_dealloc(uint32_t handle, int32_t cta_id, uint32_t wid) {
+    auto it = tmem_allocs_.find(handle);
+    if (it == tmem_allocs_.end()) {
+      std::cout << "Error: TMEM_DEALLOC unknown handle " << handle << std::endl;
+      std::abort();
+    }
+    auto& dealloc_warps = cta_tmem_dealloc_warps_[cta_id];
+    dealloc_warps.insert(wid);
+    uint32_t expected = core_->scheduler().warp(wid).cta_csrs.cta_size;
+    if (dealloc_warps.size() < expected) {
+      return; // other warps of this CTA still hold the allocation open
+    }
+
+    tmem_free_.push_back({handle, it->second});
+    tmem_allocs_.erase(it);
+    cta_tmem_handle_.erase(cta_id);
+    cta_tmem_dealloc_warps_.erase(cta_id);
+    // Coalesce adjacent free ranges to keep the allocator from fragmenting.
+    std::sort(tmem_free_.begin(), tmem_free_.end());
+    for (size_t i = 0; i + 1 < tmem_free_.size();) {
+      if (tmem_free_[i].first + tmem_free_[i].second == tmem_free_[i + 1].first) {
+        tmem_free_[i].second += tmem_free_[i + 1].second;
+        tmem_free_.erase(tmem_free_.begin() + i + 1);
+      } else {
+        ++i;
+      }
+    }
+  }
+
+  // Per-thread lane/col bound check for tmem_st/tmem_ld: lane must be within
+  // physical capacity, col must fall inside an active allocation
+  void validate_tmem_lane_col(uint32_t lane, uint32_t col) {
+    if (lane >= kTmemLanes) {
+      std::cout << "Error: TMEM lane " << lane << " exceeds kTmemLanes=" << kTmemLanes << std::endl;
+      std::abort();
+    }
+    for (auto& kv : tmem_allocs_) {
+      if (col >= kv.first && col < kv.first + kv.second) return;
+    }
+    std::cout << "Error: TMEM column " << col << " not within any active allocation" << std::endl;
+    std::abort();
+  }
+
+  void tmem_st(uint32_t tmem_addr, const std::vector<reg_data_t>& value_data) {
+    uint32_t lane_base = (tmem_addr >> 16) & 0xFFFF;
+    uint32_t col       = tmem_addr & 0xFFFF;
+    for (uint32_t t = 0; t < value_data.size(); ++t) {
+      validate_tmem_lane_col(lane_base + t, col);
+      tmem_data_.at(lane_base + t).at(col) = value_data.at(t).u32;
+    }
+    perf_stats_.tmem_writes += value_data.size();
+  }
+
+  void tmem_ld(uint32_t tmem_addr, std::vector<reg_data_t>& rd_data) {
+    uint32_t lane_base = (tmem_addr >> 16) & 0xFFFF;
+    uint32_t col       = tmem_addr & 0xFFFF;
+    for (uint32_t t = 0; t < rd_data.size(); ++t) {
+      validate_tmem_lane_col(lane_base + t, col);
+      rd_data.at(t).u64 = nan_box(tmem_data_.at(lane_base + t).at(col));
+    }
+    perf_stats_.tmem_reads += rd_data.size();
+  }
+
+  // UMMA: A/B fetched via the shared tile buffer exactly like WGMMA's
+  // smem path; C/D read/written directly against tmem_data_ at
+  // [handle + local_col], derived from the handle cached on the first uop.
+  void umma(uint32_t wid,
+            uint32_t fmt_s,
+            uint32_t fmt_d,
+            uint32_t step_m,
+            uint32_t step_n,
+            uint32_t step_k,
+            uint32_t umma_nrc,
+            uint32_t a_desc,
+            uint32_t b_desc,
+            uint32_t handle,
+            const std::vector<reg_data_t>& rs1_data,
+            const std::vector<reg_data_t>& rs2_data) {
+    __unused(rs1_data);
+    __unused(rs2_data);
+
+    uint32_t nrc = kNrcTable[umma_nrc];
+
+    uint32_t ratio   = elem_ratio(fmt_s);
+    uint32_t k_words = kFedpWords;
+    uint32_t e_bits  = elem_bits(fmt_s);
+
+    bool first_uop = (step_m == 0 && step_n == 0 && step_k == 0);
+    if (first_uop) {
+      lmem_desc_[wid][0] = {uint64_t(VX_MEM_LMEM_BASE_ADDR) + (a_desc & 0xFFFF), (a_desc >> 16) * 8 / e_bits, false};
+      lmem_desc_[wid][1] = {uint64_t(VX_MEM_LMEM_BASE_ADDR) + (b_desc & 0xFFFF), (b_desc >> 16) * 8 / e_bits, false};
+      umma_handle_[wid] = handle;
+    }
+    lmem_desc_t sd_a = lmem_desc_[wid][0];
+    lmem_desc_t sd_b = lmem_desc_[wid][1];
+    cur_a_desc_base_ = sd_a.base;
+    cur_is_sparse_ = false;
+
+    uint32_t xtileM = wg_cfg::xtileM;
+    uint32_t xtileN = (nrc * VX_CFG_NUM_THREADS) / xtileM;
+    cur_xtile_n_ = xtileN;
+    uint32_t use_handle = umma_handle_[wid];
+
+    // Bounds check once per uop rather than per element.
+    auto alloc_it = tmem_allocs_.find(use_handle);
+    if (alloc_it == tmem_allocs_.end()) {
+      std::cout << "Error: UMMA invalid TMEM handle " << use_handle << std::endl;
+      std::abort();
+    }
+    uint32_t max_lane = wid * xtileM + step_m * cfg::tcM + cfg::tcM;
+    if (max_lane > kTmemLanes) {
+      std::cout << "Error: UMMA lane range exceeds kTmemLanes=" << kTmemLanes << std::endl;
+      std::abort();
+    }
+    uint32_t max_col_local = step_n * cfg::tcN + cfg::tcN;
+    if (max_col_local > alloc_it->second) {
+      std::cout << "Error: UMMA column range exceeds TMEM allocation (handle=" << use_handle
+                << ", ncols=" << alloc_it->second << ")" << std::endl;
+      std::abort();
+    }
+
+    reg_data_t a_tile[cfg::tcM * kFedpWords] = {};
+    for (uint32_t i = 0; i < cfg::tcM; ++i) {
+      uint32_t a_row_idx = step_m * cfg::tcM + i;
+      for (uint32_t z = 0; z < k_words; ++z) {
+        uint32_t k_elem = (step_k * k_words + z) * ratio;
+        a_tile[i * k_words + z].u32 = load_lmem_word(sd_a, a_row_idx, k_elem, fmt_s, false, false);
+      }
+    }
+
+    reg_data_t b_tile[cfg::tcM * cfg::tcN * kFedpWords] = {};
+    for (uint32_t i = 0; i < cfg::tcM; ++i) {
+      for (uint32_t j = 0; j < cfg::tcN; ++j) {
+        uint32_t b_col_idx = step_n * cfg::tcN + j;
+        for (uint32_t z = 0; z < k_words; ++z) {
+          uint32_t k_elem = (step_k * k_words + z) * ratio;
+          b_tile[(i * cfg::tcN + j) * k_words + z].u32 =
+              load_lmem_word(sd_b, k_elem, b_col_idx, fmt_s, true, false);
+        }
+      }
+    }
+
+    PFN_FEDP_N fedp = select_FEDP_N(fmt_s, fmt_d);
+    for (uint32_t i = 0; i < cfg::tcM; ++i) {
+      for (uint32_t j = 0; j < cfg::tcN; ++j) {
+        uint32_t lane = wid * xtileM + step_m * cfg::tcM + i;
+        uint32_t col  = use_handle + step_n * cfg::tcN + j;
+        auto a_row = &a_tile[i * k_words];
+        auto b_col = &b_tile[(i * cfg::tcN + j) * k_words];
+        uint32_t c_val = tmem_data_.at(lane).at(col);
+        uint32_t d_val = fedp(a_row, b_col, c_val, k_words);
+        tmem_data_.at(lane).at(col) = d_val;
+        DTH(3, simobject_->name() << " UMMA FEDP"
+            << ": wid=" << wid << ", i=" << i << ", j=" << j
+            << ", m=" << step_m << ", n=" << step_n << ", k=" << step_k << std::hex
+            << ", tmem[" << lane << "][" << col << "]: 0x" << c_val << " -> 0x" << d_val
+            << std::dec << std::endl);
+      }
+    }
+
+    ++perf_stats_.umma_instrs;
+    perf_stats_.tmem_reads  += cfg::tcM * cfg::tcN;
+    perf_stats_.tmem_writes += cfg::tcM * cfg::tcN;
+  }
+#endif // TCU_TMEM_ENABLE
+
   const PerfStats& perf_stats() const {
     // lmem_reads: total MemReq traffic from TcuTbuf (abuf + bbuf).
     perf_stats_.lmem_reads = simobject_->tbuf()->reads();
@@ -1371,6 +1674,32 @@ private:
   // CTA owner per block's A buffer and the shared B buffer (-1 = unowned).
   std::array<int32_t, VX_CFG_NUM_TCU_BLOCKS> cta_owner_a_{};
   int32_t cta_owner_b_ = -1;
+
+#ifdef TCU_TMEM_ENABLE
+  // TMEM is architecturally per-SM on Blackwell GPUs, not per-tensor-core. 
+  // Living inside TcuUnit::Impl here is correct because Vortex currently
+  // instantiates exactly one TcuUnit per Core. If Vortex ever allows
+  // multiple TCU-equivalent units per core, this storage and the
+  // allocator need to move up to Core so it becomes correctly
+  // SM-scoped instead of per-TC (which would also break the
+  // CTA-scoped handle cache in tmem_alloc()/tmem_dealloc()).
+  static constexpr uint32_t kTmemCols  = 256;
+  static constexpr uint32_t kTmemLanes = VX_CFG_NUM_THREADS * VX_CFG_NUM_WARPS;
+  static_assert(kTmemLanes <= 128, "TMEM lanes exceed cap");
+
+  std::array<std::array<uint32_t, kTmemCols>, kTmemLanes> tmem_data_{};
+  // Free-list allocator state: {start_col, ncols} ranges, and handle->ncols
+  // for active allocations.
+  std::vector<std::pair<uint32_t, uint32_t>> tmem_free_{{0, kTmemCols}};
+  std::unordered_map<uint32_t, uint32_t> tmem_allocs_;
+  // CTA-scoped idempotent-alloc bookkeeping
+  std::unordered_map<int32_t, uint32_t> cta_tmem_handle_;
+  // Distinct wids that have called tmem_dealloc for this CTA — a set, not a
+  // counter, so a warp calling dealloc twice can't free the range early
+  std::unordered_map<int32_t, std::unordered_set<uint32_t>> cta_tmem_dealloc_warps_;
+  // Per-wid cached TMEM handle, latched on UMMA's first uop
+  std::unordered_map<uint32_t, uint32_t> umma_handle_;
+#endif
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1394,6 +1723,18 @@ op_string_t TcuUnit::op_string(TcuType tcu_type, IntrTcuArgs args) {
   case TcuType::TCU_LD:
     return {"TCU_LD." + std::string((args.fmt_d & 0x10) ? "MX." : "SP.")
              + std::string(vt::fmt_string(args.fmt_s)) + ".slot" + std::to_string(args.fmt_d & 0xf), ""};
+#ifdef TCU_TMEM_ENABLE
+  case TcuType::UMMA: {
+    return {"UMMA." + std::string(vt::fmt_string(args.fmt_s)) + "." + std::string(vt::fmt_string(args.fmt_d))
+             + "." + std::to_string(kNrcTable[args.umma_nrc])
+             + "." + std::to_string(args.step_m) + "." + std::to_string(args.step_n)
+             + "." + std::to_string(args.step_k), ""};
+  }
+  case TcuType::TMEM_ALLOC:   return {"TMEM_ALLOC", ""};
+  case TcuType::TMEM_DEALLOC: return {"TMEM_DEALLOC", ""};
+  case TcuType::TMEM_ST:      return {"TMEM_ST", ""};
+  case TcuType::TMEM_LD:      return {"TMEM_LD", ""};
+#endif
   default:
     std::abort();
   }
@@ -1430,6 +1771,12 @@ uint32_t TcuUopGen::uop_count(const Instr& instr) {
     uint32_t mma_uops = k_count * nrc;
     return mma_uops + needs_setup;
   }
+#ifdef TCU_TMEM_ENABLE
+  if (tcu_type == TcuType::UMMA) {
+    uint32_t nrc = kNrcTable[args.umma_nrc];
+    return wg_cfg::k_steps * nrc;
+  }
+#endif
 #endif
 
   return 1;
@@ -1486,7 +1833,7 @@ Instr::Ptr TcuUopGen::get(const Instr& macro_instr, uint32_t uop_index) {
         uint32_t actual_n = lg_k ? (n_sp >> lg_k) : n_sp;
         uint32_t reg_rs3 = rc_base + (mma_idx >> 1);
         uop_instr->set_op_type(TcuType::WMMA_SP);
-        uop_instr->set_args(IntrTcuArgs{0, 0, fmt_s, fmt_d, m_sp, actual_n, 0, 0, 0, 0});
+        uop_instr->set_args(IntrTcuArgs{0, 0, fmt_s, fmt_d, m_sp, actual_n, 0, 0, 0, 0, 0});
         uop_instr->set_dest_reg(reg_rs3, RegType::Float);
         uop_instr->set_src_reg(0, ra_base + m_sp, RegType::Float);
         uop_instr->set_src_reg(1, rb_base + n_sp, RegType::Float);
@@ -1542,7 +1889,7 @@ Instr::Ptr TcuUopGen::get(const Instr& macro_instr, uint32_t uop_index) {
           reg_rs3 = rc_base + c_off;
         }
         uop_instr->set_op_type(is_sparse ? TcuType::WMMA_SP : TcuType::WMMA);
-        uop_instr->set_args(IntrTcuArgs{0, 0, fmt_s, fmt_d, m, n, k, 0, 0, 0});
+        uop_instr->set_args(IntrTcuArgs{0, 0, fmt_s, fmt_d, m, n, k, 0, 0, 0, 0});
         uop_instr->set_dest_reg(reg_rs3, RegType::Float);
         uop_instr->set_src_reg(0, reg_rs1, RegType::Float);
         uop_instr->set_src_reg(1, reg_rs2, RegType::Float);
@@ -1569,7 +1916,7 @@ Instr::Ptr TcuUopGen::get(const Instr& macro_instr, uint32_t uop_index) {
 
       if (needs_setup && uop_index == 0) {
         uop_instr->set_args(IntrTcuArgs{is_a_smem ? 1u : 0u, cd_nregs,
-                                       fmt_s, fmt_d, 0, 0, 0, 1, 0, 1});
+                                       fmt_s, fmt_d, 0, 0, 0, 1, 0, 1, 0});
         uop_instr->set_src_reg(0, a0, RegType::Integer);
         uop_instr->set_src_reg(1, a1, RegType::Integer);
         uop_instr->set_fu_lock(true);
@@ -1596,7 +1943,7 @@ Instr::Ptr TcuUopGen::get(const Instr& macro_instr, uint32_t uop_index) {
       bool first = (mma_idx == 0);
       bool last  = (uop_index == (total - 1));
       uop_instr->set_args(IntrTcuArgs{is_a_smem ? 1u : 0u, cd_nregs,
-                                     fmt_s, fmt_d, m, n, k, first ? 1u : 0u, last ? 1u : 0u, 0});
+                                     fmt_s, fmt_d, m, n, k, first ? 1u : 0u, last ? 1u : 0u, 0, 0});
       uop_instr->set_dest_reg(r, RegType::Float);
       if (!is_a_smem) {
         uint32_t rs1_off = is_sparse ? m : (m * a_reg_k_steps + k);
@@ -1614,6 +1961,41 @@ Instr::Ptr TcuUopGen::get(const Instr& macro_instr, uint32_t uop_index) {
     uop_instr->set_fu_lock(uop_index == 0);
     uop_instr->set_fu_unlock(uop_index == (total - 1));
   }
+#ifdef TCU_TMEM_ENABLE
+  else if (tcu_type == TcuType::UMMA) {
+    constexpr uint32_t m_steps = wg_cfg::m_steps;
+    constexpr uint32_t a0 = 10, a1 = 11, a2 = 12; // desc_a, desc_b, tmem handle
+
+    uop_instr->set_op_type(TcuType::UMMA);
+
+    // Loop order: m inner, n middle, k outer. RTL note: k-outer only avoids
+    // a RAW hazard on the TMEM accumulator (repeat visits to the same (m,n)
+    // location are n_steps*m_steps uops apart) if that gap is >= the FEDP
+    // pipeline's latency. SimX has no pipeline depth, so the hazard
+    // doesn't exist here.
+    uint32_t mn = total / wg_cfg::k_steps;
+    uint32_t k = uop_index / mn;
+    uint32_t rem = uop_index % mn;
+    uint32_t n = rem / m_steps;
+    uint32_t m = rem % m_steps;
+
+    bool first = (uop_index == 0);
+    bool last  = (uop_index == (total - 1));
+    uop_instr->set_args(IntrTcuArgs{1, 0, args.fmt_s, args.fmt_d, m, n, k,
+                                   first ? 1u : 0u, last ? 1u : 0u, 0, args.umma_nrc});
+    // desc_a/desc_b/handle only need fetching once; Impl caches them per-wid
+    // (lmem_desc_, umma_handle_) and reuses on subsequent uops.
+    if (first) {
+      uop_instr->set_src_reg(0, a0, RegType::Integer);
+      uop_instr->set_src_reg(1, a1, RegType::Integer);
+      uop_instr->set_src_reg(2, a2, RegType::Integer);
+    }
+    // No dest_reg: UMMA's C/D lives in TMEM, not the register file.
+
+    uop_instr->set_fu_lock(uop_index == 0);
+    uop_instr->set_fu_unlock(uop_index == (total - 1));
+  }
+#endif
 #endif
 
   return uop_instr;
@@ -1691,3 +2073,37 @@ void TcuUnit::wgmma(uint32_t wid,
                rs1_data, rs2_data, rs3_data, rd_data,
                is_sparse, cd_nregs, is_a_smem, is_setup_uop);
 }
+
+#ifdef TCU_TMEM_ENABLE
+uint32_t TcuUnit::tmem_alloc(uint32_t ncols, int32_t cta_id) {
+  return impl_->tmem_alloc(ncols, cta_id);
+}
+
+void TcuUnit::tmem_dealloc(uint32_t handle, int32_t cta_id, uint32_t wid) {
+  impl_->tmem_dealloc(handle, cta_id, wid);
+}
+
+void TcuUnit::tmem_st(uint32_t tmem_addr, const std::vector<reg_data_t>& value_data) {
+  impl_->tmem_st(tmem_addr, value_data);
+}
+
+void TcuUnit::tmem_ld(uint32_t tmem_addr, std::vector<reg_data_t>& rd_data) {
+  impl_->tmem_ld(tmem_addr, rd_data);
+}
+
+void TcuUnit::umma(uint32_t wid,
+                    uint32_t fmt_s,
+                    uint32_t fmt_d,
+                    uint32_t step_m,
+                    uint32_t step_n,
+                    uint32_t step_k,
+                    uint32_t umma_nrc,
+                    uint32_t a_desc,
+                    uint32_t b_desc,
+                    uint32_t handle,
+                    const std::vector<reg_data_t>& rs1_data,
+                    const std::vector<reg_data_t>& rs2_data) {
+  impl_->umma(wid, fmt_s, fmt_d, step_m, step_n, step_k,
+              umma_nrc, a_desc, b_desc, handle, rs1_data, rs2_data);
+}
+#endif

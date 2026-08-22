@@ -1171,5 +1171,202 @@ public:
   }
 };
 
+#ifdef TCU_TMEM_ENABLE
+
+// =============================================================================
+// UMMA / TMEM: A/B from SMEM via descriptors (same as WGMMA's SS mode), C/D
+// accumulator in TMEM. TMEM is allocated dynamically via vx_tmem_alloc(),
+// which returns a handle (base column). This lets multiple warpgroups
+// (different CTAs) hold disjoint, concurrently-live allocations.
+//
+// Every warp of a CTA can call vx_tmem_alloc()/vx_tmem_dealloc() directly.
+// The allocator is CTA-scoped: the first warp to call tmem_alloc for a
+// given CTA actually allocates: every other warp of that CTA calling it
+// gets the same handle back automatically, and the range is only freed
+// once every warp that called alloc has also called dealloc.
+// =============================================================================
+
+#define VX_TCU_FUNCT7   2
+#define VX_TMEM_ALLOC   3
+#define VX_TMEM_DEALLOC 4
+#define VX_TMEM_ST      5
+#define VX_TMEM_LD      6
+#define VX_UMMA         7
+
+// TMEM address format: bits[31:16] = lane base, bits[15:0] = column (the
+// column should already include the allocation's handle offset).
+static __attribute__((always_inline)) uint32_t vx_make_tmem_addr(uint32_t lane_base, uint32_t col) {
+  return ((lane_base & 0xFFFF) << 16) | (col & 0xFFFF);
+}
+
+// Allocate ncols columns of TMEM; returns a handle (base column) to add to
+// every subsequent local column index against this allocation.
+static __attribute__((always_inline)) uint32_t vx_tmem_alloc(uint32_t ncols) {
+  register uint32_t r_ncols  __asm__("a0") = ncols;
+  register uint32_t r_handle __asm__("a0");
+  __asm__ volatile (
+    ".insn r %[insn], %[f3], %[f7], %[handle], %[ncols], x0\n\t"
+    : [handle]"=r"(r_handle)
+    : [insn]"i"(RISCV_CUSTOM0),
+      [f3]"i"(VX_TMEM_ALLOC),
+      [f7]"i"(VX_TCU_FUNCT7),
+      [ncols]"r"(r_ncols)
+    : "memory"
+  );
+  return r_handle;
+}
+
+// Free a TMEM allocation identified by its handle.
+static __attribute__((always_inline)) void vx_tmem_dealloc(uint32_t handle) {
+  register uint32_t r_handle __asm__("a0") = handle;
+  __asm__ volatile (
+    ".insn r %[insn], %[f3], %[f7], x0, %[handle], x0\n\t"
+    :
+    : [insn]"i"(RISCV_CUSTOM0),
+      [f3]"i"(VX_TMEM_DEALLOC),
+      [f7]"i"(VX_TCU_FUNCT7),
+      [handle]"r"(r_handle)
+    : "memory"
+  );
+}
+
+// Store a float value from this thread's register into TMEM at [lane][col].
+static __attribute__((always_inline)) void vx_tmem_st(uint32_t tmem_addr, float value) {
+  register uint32_t r_addr  __asm__("a0") = tmem_addr;
+  register float    r_value __asm__("f0") = value;
+  __asm__ volatile (
+    ".insn r %[insn], %[f3], %[f7], x0, %[addr], %[val]\n\t"
+    :
+    : [insn]"i"(RISCV_CUSTOM0),
+      [f3]"i"(VX_TMEM_ST),
+      [f7]"i"(VX_TCU_FUNCT7),
+      [addr]"r"(r_addr),
+      [val]"f"(r_value)
+    : "memory"
+  );
+}
+
+// Load a float value from TMEM at [lane][col] into this thread's register.
+static __attribute__((always_inline)) float vx_tmem_ld(uint32_t tmem_addr) {
+  register uint32_t r_addr   __asm__("a0") = tmem_addr;
+  register float    r_result __asm__("f0");
+  __asm__ volatile (
+    ".insn r %[insn], %[f3], %[f7], %[result], %[addr], x0\n\t"
+    : [result]"=f"(r_result)
+    : [insn]"i"(RISCV_CUSTOM0),
+      [f3]"i"(VX_TMEM_LD),
+      [f7]"i"(VX_TCU_FUNCT7),
+      [addr]"r"(r_addr)
+    : "memory"
+  );
+  return r_result;
+}
+
+template <uint32_t NT,
+          typename It,
+          typename Ot,
+          uint32_t NRC_ = 8>
+struct umma_context {
+private:
+  // Reuse WGMMA's geometry derivation
+  using ctx = wgmma_context<NT, It, Ot, false, NRC_>;
+
+  // UMMA flags encoding (rs2 field, same shape as WGMMA's):
+  //   bit 0     : is_sparse = 0 (always, for now)
+  //   bits [3:1]: NRC encoding — 0=8, 1=16, 2=32, 3=64, 4=128
+  static constexpr int umma_nrc_code =
+      (NRC_ == 128) ? 4 : (NRC_ == 64) ? 3 : (NRC_ == 32) ? 2 : (NRC_ == 16) ? 1 : 0;
+
+public:
+  using input_t  = typename ctx::input_t;
+  using output_t = typename ctx::output_t;
+
+  static constexpr uint32_t xtileM = ctx::xtileM;
+  static constexpr uint32_t xtileN = ctx::xtileN;
+  static constexpr uint32_t tileK  = ctx::tileK;
+  static constexpr uint32_t tcM    = ctx::tcM;
+  static constexpr uint32_t tcN    = ctx::tcN;
+  static constexpr uint32_t NRC    = NRC_;
+
+  // A/B SMEM layout is identical to WGMMA
+  static constexpr uint32_t a_warp_elems = ctx::a_warp_elems;
+
+  static __attribute__((always_inline)) uint32_t a_blockmajor_idx(uint32_t r, uint32_t c) {
+    return ctx::a_blockmajor_idx(r, c);
+  }
+
+  // B must be block-major
+  static __attribute__((always_inline)) uint32_t b_blockmajor_idx(uint32_t r, uint32_t c) {
+    return ctx::b_blockmajor_idx(r, c);
+  }
+
+  // Initialize this warp's accumulator tile in TMEM to `value`.
+  static __attribute__((always_inline)) void fill_tmem(uint32_t handle, output_t value) {
+    uint32_t wid = vx_warp_id();
+    constexpr uint32_t rows_per_thread = xtileM / NT;
+    for (uint32_t r = 0; r < rows_per_thread; ++r) {
+      uint32_t lane_base = wid * xtileM + r * NT;
+      for (uint32_t col = 0; col < xtileN; ++col) {
+        vx_tmem_st(vx_make_tmem_addr(lane_base, handle + col), static_cast<float>(value));
+      }
+    }
+  }
+
+  // Issue a UMMA op: A/B sourced from SMEM via descriptors, C/D implicit in
+  // TMEM at `handle`.
+  static __attribute__((always_inline)) void umma_sync(smem_matrix_desc desc_a,
+                                                       smem_matrix_desc desc_b,
+                                                       uint32_t handle) {
+    static_assert(NRC_ == 8 || NRC_ == 16 || NRC_ == 32 || NRC_ == 64 || NRC_ == 128,
+                  "umma_sync supports NRC = 8, 16, 32, 64, 128");
+
+    int flags = umma_nrc_code << 1;
+
+    register uint32_t ra __asm__("a0") = desc_a.value;
+    register uint32_t rb __asm__("a1") = desc_b.value;
+    register uint32_t rh __asm__("a2") = handle;
+
+    __asm__ volatile (
+      ".insn r %[insn], %[f3], %[f7], x%[fmd], x%[fms], x%[flags]\n\t"
+      :
+      : [insn]"i"(RISCV_CUSTOM0),
+        [f3]"i"(VX_UMMA),
+        [f7]"i"(VX_TCU_FUNCT7),
+        [fmd]"i"(Ot::id),
+        [fms]"i"(It::id),
+        [flags]"i"(flags),
+        "r"(ra), "r"(rb), "r"(rh)
+      : "memory"
+    );
+  }
+
+  // Store this warp's accumulator tile from TMEM to global memory.
+  // `rank` is this warp's CTA-relative index (e.g. tid/NT), distinct from
+  // vx_warp_id(), which is the global hardware wid TMEM addressing uses.
+  static __attribute__((always_inline)) void store_output(uint32_t handle,
+                                                          output_t* C_global,
+                                                          uint32_t  tile_row,
+                                                          uint32_t  tile_col,
+                                                          uint32_t  N,
+                                                          uint32_t  rank) {
+    uint32_t tid = vx_thread_id();
+    uint32_t wid = vx_warp_id();
+    uint32_t tid_in_warp = tid % NT;
+    constexpr uint32_t rows_per_thread = xtileM / NT;
+
+    for (uint32_t r = 0; r < rows_per_thread; ++r) {
+      uint32_t lane_base  = wid * xtileM + r * NT;   // TMEM address: global wid
+      uint32_t local_base = rank * xtileM + r * NT;  // output row: CTA-relative
+      uint32_t out_row   = tile_row + local_base + tid_in_warp;
+      output_t* row_ptr  = C_global + out_row * N + tile_col;
+      for (uint32_t col = 0; col < xtileN; ++col) {
+        row_ptr[col] = static_cast<output_t>(vx_tmem_ld(vx_make_tmem_addr(lane_base, handle + col)));
+      }
+    }
+  }
+};
+
+#endif // TCU_TMEM_ENABLE
+
 } // namespace tensor
 } // namespace vortex

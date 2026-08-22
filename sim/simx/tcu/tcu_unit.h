@@ -63,12 +63,22 @@ public:
 		uint64_t tbuf_stalls = 0;      // cycles stalled on TcuTbufA/TcuSharedB readiness
 		uint64_t tbuf_cache_hits = 0;  // WGMMA entries with all lines already resident (cross-WGMMA reuse)
 		uint64_t lmem_reads = 0;       // sum of TcuTbufA + TcuSharedB LmemReqs issued
+#ifdef TCU_TMEM_ENABLE
+		uint64_t umma_instrs = 0;      // UMMA micro-ops executed
+		uint64_t tmem_reads = 0;       // TMEM elements read (UMMA C + tmem_ld)
+		uint64_t tmem_writes = 0;      // TMEM elements written (UMMA D + tmem_st)
+#endif
 
 		PerfStats& operator+=(const PerfStats& rhs) {
 			this->latency          += rhs.latency;
 			this->tbuf_stalls      += rhs.tbuf_stalls;
 			this->tbuf_cache_hits  += rhs.tbuf_cache_hits;
 			this->lmem_reads       += rhs.lmem_reads;
+#ifdef TCU_TMEM_ENABLE
+			this->umma_instrs      += rhs.umma_instrs;
+			this->tmem_reads       += rhs.tmem_reads;
+			this->tmem_writes      += rhs.tmem_writes;
+#endif
 			return *this;
 		}
 	};
@@ -112,6 +122,37 @@ public:
 	           uint32_t cd_nregs,
 	           uint32_t is_a_smem,
 	           uint32_t is_setup_uop);
+
+#ifdef TCU_TMEM_ENABLE
+	// Allocate ncols columns of TMEM; returns a handle (base column).
+	uint32_t tmem_alloc(uint32_t ncols, int32_t cta_id);
+
+	// Free a TMEM allocation identified by its handle.
+	void tmem_dealloc(uint32_t handle, int32_t cta_id, uint32_t wid);
+
+	// Store one element per thread into TMEM. tmem_addr is software-computed
+	// (vx_make_tmem_addr(lane_base, handle + local_col)) so the handle's base
+	// column is already folded in.
+	void tmem_st(uint32_t tmem_addr, const std::vector<reg_data_t>& value_data);
+
+	// Load one element per thread from TMEM.
+	void tmem_ld(uint32_t tmem_addr, std::vector<reg_data_t>& rd_data);
+
+	// UMMA: A/B from SMEM via descriptors, C/D accumulator in TMEM addressed 
+	// via `handle`.
+	void umma(uint32_t wid,
+	          uint32_t fmt_s,
+	          uint32_t fmt_d,
+	          uint32_t step_m,
+	          uint32_t step_n,
+	          uint32_t step_k,
+	          uint32_t umma_nrc,
+	          uint32_t a_desc,
+	          uint32_t b_desc,
+	          uint32_t handle,
+	          const std::vector<reg_data_t>& rs1_data,
+	          const std::vector<reg_data_t>& rs2_data);
+#endif
 
 	// Tile-buffer subsystem (owns abuf×Q + bbuf + LMEM arb).
 	// Exposed so that `Core` can bind its single LMEM port pair.

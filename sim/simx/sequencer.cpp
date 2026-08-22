@@ -113,7 +113,12 @@ bool Sequencer::advance() {
   state_.current_uop = nullptr;
   if (state_.active) {
     ++state_.uop_index;
-    if (state_.uop_index >= state_.uop_count || state_.uop_index >= 255) {
+    // Runaway guard against a corrupted uop_count, not a real ceiling.
+    // UMMA can need k_steps * NRC uops, up to a few hundred for
+    // NRC=128 (WGMMA/LSU/RTU stay far below this). A tighter cap here
+    // silently drops the final uop, which carries fu_unlock for TCU,
+    // permanently deadlocking that FU lane.
+    if (state_.uop_index >= state_.uop_count || state_.uop_index >= 4096) {
       state_.active = false;
     }
   }

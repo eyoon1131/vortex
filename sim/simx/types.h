@@ -744,9 +744,14 @@ inline std::ostream &operator<<(std::ostream &os, const CsrType& type) {
 enum class TcuType {
   WMMA,
   WGMMA,
-  WMMA_SP,    // Sparse variants live in distinct op_types so IntrTcuArgs
-  WGMMA_SP,   // doesn't carry a per-uop is_sparse bit.
-  TCU_LD,     // Warp-level metadata load. rd[4] selects sparse/MX namespace.
+  WMMA_SP,      // Sparse variants live in distinct op_types so IntrTcuArgs
+  WGMMA_SP,     // doesn't carry a per-uop is_sparse bit.
+  TCU_LD,       // Warp-level metadata load. rd[4] selects sparse/MX namespace.
+  UMMA,         // A/B from SMEM via descriptors, C/D accumulator in TMEM.
+  TMEM_ALLOC,   // Allocate ncols columns of TMEM; returns a handle (base column).
+  TMEM_DEALLOC, // Free a TMEM allocation identified by its handle.
+  TMEM_ST,      // Store one element per thread into TMEM at [lane][col].
+  TMEM_LD,      // Load one element per thread from TMEM at [lane][col].
 };
 
 struct IntrTcuArgs {
@@ -755,11 +760,15 @@ struct IntrTcuArgs {
   uint32_t fmt_s        : 5;
   uint32_t fmt_d        : 5;
   uint32_t step_m       : 4;
-  uint32_t step_n       : 4;
+  // WGMMA's NRC ceiling (32) keeps its n_steps <= 16, fitting 4 bits.
+  // UMMA allows NRC up to 128, so n_steps can reach 64 — widened to 8
+  uint32_t step_n       : 8;
   uint32_t step_k       : 4;
   uint32_t is_first_uop : 1; // set per-uop by tcu_uops expansion (C4)
   uint32_t is_last_uop  : 1;
   uint32_t is_setup_uop : 1; // WGMMA descriptor setup uop, no FEDP compute
+  // UMMA-only: NRC encoding (0=8, 1=16, 2=32, 3=64, 4=128)
+  uint32_t umma_nrc     : 3;
 };
 
 // Helper: is_sparse derived from op_type (no per-uop bit).
@@ -777,13 +786,30 @@ inline bool tcu_is_wmma(TcuType t) {
   return t == TcuType::WMMA || t == TcuType::WMMA_SP;
 }
 
+// Helper: types that fetch operands through the shared tile buffer (abuf/bbuf)
+// and are therefore subject to the CTA lockstep fence
+inline bool tcu_uses_shared_tbuf(TcuType t) {
+  return tcu_is_wgmma(t) || t == TcuType::UMMA;
+}
+
+// Helper: TMEM management ops
+inline bool tcu_is_tmem_mgmt(TcuType t) {
+  return t == TcuType::TMEM_ALLOC || t == TcuType::TMEM_DEALLOC
+      || t == TcuType::TMEM_ST || t == TcuType::TMEM_LD;
+}
+
 inline std::ostream &operator<<(std::ostream &os, const TcuType& type) {
   switch (type) {
-  case TcuType::WMMA:       os << "WMMA"; break;
-  case TcuType::WGMMA:      os << "WGMMA"; break;
-  case TcuType::WMMA_SP:    os << "WMMA.SP"; break;
-  case TcuType::WGMMA_SP:   os << "WGMMA.SP"; break;
-  case TcuType::TCU_LD:     os << "TCU_LD"; break;
+  case TcuType::WMMA:         os << "WMMA"; break;
+  case TcuType::WGMMA:        os << "WGMMA"; break;
+  case TcuType::WMMA_SP:      os << "WMMA.SP"; break;
+  case TcuType::WGMMA_SP:     os << "WGMMA.SP"; break;
+  case TcuType::TCU_LD:       os << "TCU_LD"; break;
+  case TcuType::UMMA:         os << "UMMA"; break;
+  case TcuType::TMEM_ALLOC:   os << "TMEM_ALLOC"; break;
+  case TcuType::TMEM_DEALLOC: os << "TMEM_DEALLOC"; break;
+  case TcuType::TMEM_ST:      os << "TMEM_ST"; break;
+  case TcuType::TMEM_LD:      os << "TMEM_LD"; break;
   default:
     assert(false);
   }

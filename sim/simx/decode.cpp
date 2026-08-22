@@ -899,7 +899,7 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
         uint32_t fmt_d = rd, fmt_s = rs1;
         bool is_sparse = (rs2 & 1) != 0;
         instr->set_op_type(is_sparse ? TcuType::WMMA_SP : TcuType::WMMA);
-        instr->set_args(IntrTcuArgs{0, 0, fmt_s, fmt_d, 0, 0, 0, 0, 0, 0});
+        instr->set_args(IntrTcuArgs{0, 0, fmt_s, fmt_d, 0, 0, 0, 0, 0, 0, 0});
         instr->set_macro_op();
         instr->set_wstall(true);
       } break;
@@ -910,7 +910,7 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
         uint32_t cd_nregs = (rs2 >> 1) & 0x3;
         bool is_a_smem = (rs2 >> 3) & 1;
         instr->set_op_type(is_sparse ? TcuType::WGMMA_SP : TcuType::WGMMA);
-        instr->set_args(IntrTcuArgs{is_a_smem ? 1u : 0u, cd_nregs, fmt_s, fmt_d, 0, 0, 0, 0, 0, 0});
+        instr->set_args(IntrTcuArgs{is_a_smem ? 1u : 0u, cd_nregs, fmt_s, fmt_d, 0, 0, 0, 0, 0, 0, 0});
         instr->set_macro_op();
         instr->set_wstall(true);
       } break;
@@ -920,11 +920,46 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
         uint32_t fmt_s = rs2;
         uint32_t slot  = rd;
         instr->set_op_type(TcuType::TCU_LD);
-        instr->set_args(IntrTcuArgs{0, 0, fmt_s, slot, 0, 0, 0, 0, 0, 0});
+        instr->set_args(IntrTcuArgs{0, 0, fmt_s, slot, 0, 0, 0, 0, 0, 0, 0});
         // rs1 holds the warp-broadcast base address (real I-reg read).
         instr->set_src_reg(0, rs1, RegType::Integer);
       } break;
     #endif // TCU_META_ENABLE
+    #ifdef TCU_TMEM_ENABLE
+      case 3: { // TMEM_ALLOC — rd receives the handle, rs1 carries ncols
+        instr->set_op_type(TcuType::TMEM_ALLOC);
+        instr->set_args(IntrTcuArgs{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+        instr->set_dest_reg(rd, RegType::Integer);
+        instr->set_src_reg(0, rs1, RegType::Integer);
+      } break;
+      case 4: { // TMEM_DEALLOC — rs1 carries the handle to free
+        instr->set_op_type(TcuType::TMEM_DEALLOC);
+        instr->set_args(IntrTcuArgs{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+        instr->set_src_reg(0, rs1, RegType::Integer);
+      } break;
+      case 5: { // TMEM_ST — rs1=tmem_addr (handle+col folded in by software), rs2=value
+        instr->set_op_type(TcuType::TMEM_ST);
+        instr->set_args(IntrTcuArgs{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+        instr->set_src_reg(0, rs1, RegType::Integer);
+        instr->set_src_reg(1, rs2, RegType::Float);
+      } break;
+      case 6: { // TMEM_LD — rd=result, rs1=tmem_addr
+        instr->set_op_type(TcuType::TMEM_LD);
+        instr->set_args(IntrTcuArgs{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+        instr->set_dest_reg(rd, RegType::Float);
+        instr->set_src_reg(0, rs1, RegType::Integer);
+      } break;
+      case 7: { // UMMA_SYNC — macro Instr, sequencer expands to micro-ops.
+                // A/B descriptors arrive via fixed regs a0/a1 and the TMEM
+                // handle via a2, all picked up in TcuUopGen.
+        uint32_t fmt_d = rd, fmt_s = rs1;
+        uint32_t umma_nrc = (rs2 >> 1) & 0x7; // bits[3:1] of flags = NRC encoding (0..4)
+        instr->set_op_type(TcuType::UMMA);
+        instr->set_args(IntrTcuArgs{1, 0, fmt_s, fmt_d, 0, 0, 0, 0, 0, 0, umma_nrc});
+        instr->set_macro_op();
+        instr->set_wstall(true);
+      } break;
+    #endif // TCU_TMEM_ENABLE
       default:
         std::abort();
       }
