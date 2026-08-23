@@ -27,10 +27,13 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     input wire          tbuf_ready,
 `endif
 
-    // TMEM read/write ports
+    // TMEM read/write ports. Read is request/response, tile-origin in,
+    // whole TC_M x TC_N tile back
 `ifdef TCU_TMEM_ENABLE
     input wire [NW_WIDTH-1:0]                       cta_rank,
-    input wire [31:0]                               tmem_data[TCU_TMEM_LANES][TCU_TMEM_COLS],
+    output wire [TCU_TMEM_LANE_BITS-1:0]            tmem_rd_lane_base,
+    output wire [TCU_TMEM_COL_BITS-1:0]             tmem_rd_col_base,
+    input wire [TCU_TC_M-1:0][TCU_TC_N-1:0][31:0]   tmem_rd_data,
     output wire                                     tmem_wr_en,
     output wire [TCU_TMEM_LANE_BITS-1:0]            tmem_wr_lane_base,
     output wire [TCU_TMEM_COL_BITS-1:0]             tmem_wr_col_base,
@@ -291,6 +294,11 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                                                   + TCU_TMEM_LANE_BITS'(step_m) * TCU_TMEM_LANE_BITS'(TCU_TC_M);
     wire [TCU_TMEM_COL_BITS-1:0]  umma_col_base  = TCU_TMEM_COL_BITS'(umma_handle)
                                                   + TCU_TMEM_COL_BITS'(step_n) * TCU_TMEM_COL_BITS'(TCU_TC_N);
+
+    // Read request to VX_tcu_tmem: this op's tile origin, valid whenever a
+    // new UMMA op is admitted
+    assign tmem_rd_lane_base = umma_lane_base;
+    assign tmem_rd_col_base  = umma_col_base;
 
     // RAW-hazard interlock. k-outer UMMA loop order only avoids revisiting
     // the same TMEM tile before its prior write retires when
@@ -619,19 +627,9 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         `endif
 
         `ifdef TCU_TMEM_ENABLE
-            // TMEM tile-origin address for this grid cell: lane depends on
-            // i (M direction), col depends on j (N direction) plus the
-            // handle base. Uses cta_rank (this warp's 0-indexed rank within
-            // its own CTA) because lanes are sized to one warpgroup's width
-            // (TCU_TMEM_LANES = NUM_TCU_BLOCKS * NUM_THREADS) and
-            // shared/reused across concurrent warpgroups.
-            wire [TCU_TMEM_LANE_BITS-1:0] tmem_lane = TCU_TMEM_LANE_BITS'(cta_rank) * TCU_TMEM_LANE_BITS'(TCU_WG_TILE_M)
-                                                     + TCU_TMEM_LANE_BITS'(step_m) * TCU_TMEM_LANE_BITS'(TCU_TC_M)
-                                                     + TCU_TMEM_LANE_BITS'(i);
-            wire [TCU_TMEM_COL_BITS-1:0]  tmem_col  = TCU_TMEM_COL_BITS'(umma_handle)
-                                                     + TCU_TMEM_COL_BITS'(step_n) * TCU_TMEM_COL_BITS'(TCU_TC_N)
-                                                     + TCU_TMEM_COL_BITS'(j);
-            wire [31:0] c_val = is_umma ? tmem_data[tmem_lane][tmem_col]
+            // tmem_rd_data[i][j] is VX_tcu_tmem's response tile for this
+            // op's (tmem_rd_lane_base, tmem_rd_col_base) request
+            wire [31:0] c_val = is_umma ? tmem_rd_data[i][j]
                                         : 32'(execute_if.data.rs3_data[i * TCU_TC_N + j]);
         `else
             wire [31:0] c_val = 32'(execute_if.data.rs3_data[i * TCU_TC_N + j]);

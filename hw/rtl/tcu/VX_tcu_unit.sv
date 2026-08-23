@@ -280,34 +280,9 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
 `ifdef TCU_TMEM_ENABLE
     // -----------------------------------------------------------------------
-    // TMEM storage and management.
-    //
-    // PLACEHOLDER: this is tensor_mem's original single-tenant allocator
-    // (one global allocation, no per-CTA handle) ported onto the current
-    // TCU structure. NOT the real multi-tenant allocator (CTA-scoped
-    // free-list + CAM, matching the SimX side). Deliberately simple to
-    // verify the UMMA FEDP compute path + RAW-hazard interlock.
-    // Redo before any multi-CTA-concurrent UMMA testing:
-    //   - ALLOC/DEALLOC/ST all share one always_ff below with NO real
-    //     arbitration across blocks — if more than one block requests one
-    //     of these in the same cycle, whichever has the highest block_idx
-    //     wins (last write in the loop), the rest are silently dropped
-    //     rather than retried.
-    //   - handle is always implicitly 0 (tmem_ncols tracks one allocation,
-    //     no per-CTA base column)
+    // TMEM storage/management (VX_tcu_tmem) + its wiring to the per-block
+    // tcu_core instances
     // -----------------------------------------------------------------------
-
-    logic [31:0] tmem_data [TCU_TMEM_LANES][TCU_TMEM_COLS];
-    logic        tmem_allocated;
-    logic [7:0]  tmem_ncols;
-    `UNUSED_VAR (tmem_allocated)
-    `UNUSED_VAR (tmem_ncols)
-
-    // Per-block outputs from tcu_core (UMMA compute writeback)
-    wire                                    tmem_wr_en        [BLOCK_SIZE];
-    wire [TCU_TMEM_LANE_BITS-1:0]           tmem_wr_lane_base [BLOCK_SIZE];
-    wire [TCU_TMEM_COL_BITS-1:0]            tmem_wr_col_base  [BLOCK_SIZE];
-    wire [TCU_TC_M-1:0][TCU_TC_N-1:0][31:0] tmem_wr_data      [BLOCK_SIZE];
 
     wire        [BLOCK_SIZE-1:0] tmem_mgmt_valid;
     tcu_execute_t                tmem_mgmt_data [BLOCK_SIZE];
@@ -316,101 +291,50 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         assign tmem_mgmt_data[bi]  = tmem_execute_if[bi].data;
     end
 
-    // TMEM_LD is combinational, never conflicts across blocks
-    wire [31:0] tmem_ld_rd_data [BLOCK_SIZE][`VX_CFG_NUM_THREADS];
-    for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_tmem_ld
-        wire is_tmem_ld = tmem_execute_if[bi].valid
-                        && (tmem_execute_if[bi].data.op_type == INST_TCU_TMEM_LD);
-        wire [TCU_TMEM_LANE_BITS-1:0] ld_lane_base =
-            TCU_TMEM_LANE_BITS'(tmem_execute_if[bi].data.rs1_data[0][31:16]);
-        wire [TCU_TMEM_COL_BITS-1:0] ld_col =
-            TCU_TMEM_COL_BITS'(tmem_execute_if[bi].data.rs1_data[0][15:0]);
-        for (genvar t = 0; t < `VX_CFG_NUM_THREADS; ++t) begin : g_tmem_ld_t
-            assign tmem_ld_rd_data[bi][t] = is_tmem_ld
-                ? tmem_data[TCU_TMEM_LANE_BITS'(ld_lane_base) + TCU_TMEM_LANE_BITS'(t)][ld_col]
-                : '0;
-        end
+    wire        [BLOCK_SIZE-1:0] tmem_mgmt_ready;
+    wire        [BLOCK_SIZE-1:0] tmem_result_valid_w;
+    tcu_result_t                 tmem_result_data_w [BLOCK_SIZE];
+    wire        [BLOCK_SIZE-1:0] tmem_result_ready_w;
+    for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_tmem_bridge
+        assign tmem_execute_if[bi].ready = tmem_mgmt_ready[bi];
+        assign tmem_result_if[bi].valid  = tmem_result_valid_w[bi];
+        assign tmem_result_if[bi].data   = tmem_result_data_w[bi];
+        assign tmem_result_ready_w[bi]   = tmem_result_if[bi].ready;
     end
 
-    // ALLOC/DEALLOC/ST + UMMA writeback: combined into one process so
-    // there's a single driver for tmem_data/tmem_allocated/tmem_ncols
-    always_ff @(posedge clk) begin
-        if (reset) begin
-            tmem_allocated <= 1'b0;
-            tmem_ncols     <= '0;
-        end else begin
-            // UMMA compute writeback — never collides across blocks in
-            // practice (lane ranges are cta_rank-derived and disjoint
-            // within an active warpgroup)
-            for (int b = 0; b < BLOCK_SIZE; ++b) begin
-                if (tmem_wr_en[b]) begin
-                    for (int i = 0; i < TCU_TC_M; ++i) begin
-                        for (int j = 0; j < TCU_TC_N; ++j) begin
-                            tmem_data[TCU_TMEM_LANE_BITS'(tmem_wr_lane_base[b]) + TCU_TMEM_LANE_BITS'(i)]
-                                     [TCU_TMEM_COL_BITS'(tmem_wr_col_base[b])  + TCU_TMEM_COL_BITS'(j)]
-                                <= tmem_wr_data[b][i][j];
-                        end
-                    end
-                end
-            end
+    // UMMA compute read (operand C) / writeback ports to/from tcu_core.
+    wire [TCU_TMEM_LANE_BITS-1:0]           tmem_rd_lane_base [BLOCK_SIZE];
+    wire [TCU_TMEM_COL_BITS-1:0]            tmem_rd_col_base  [BLOCK_SIZE];
+    wire [TCU_TC_M-1:0][TCU_TC_N-1:0][31:0] tmem_rd_data      [BLOCK_SIZE];
 
-            // ALLOC/DEALLOC/ST: single global allocation, no arbitration
-            for (int b = 0; b < BLOCK_SIZE; ++b) begin
-                if (tmem_mgmt_valid[b]) begin
-                    case (tmem_mgmt_data[b].op_type)
-                        INST_TCU_TMEM_ALLOC: begin
-                            tmem_allocated <= 1'b1;
-                            tmem_ncols     <= tmem_mgmt_data[b].rs1_data[0][7:0];
-                            for (int l = 0; l < TCU_TMEM_LANES; ++l)
-                                for (int c = 0; c < TCU_TMEM_COLS; ++c)
-                                    tmem_data[l][c] <= '0;
-                        end
-                        INST_TCU_TMEM_DEALLOC: begin
-                            tmem_allocated <= 1'b0;
-                            tmem_ncols     <= '0;
-                        end
-                        INST_TCU_TMEM_ST: begin
-                            for (int t = 0; t < `VX_CFG_NUM_THREADS; ++t) begin
-                                if (tmem_mgmt_data[b].header.tmask[t]) begin
-                                    automatic logic [TCU_TMEM_LANE_BITS-1:0] st_lane_base =
-                                        TCU_TMEM_LANE_BITS'(tmem_mgmt_data[b].rs1_data[0][31:16]);
-                                    automatic logic [TCU_TMEM_COL_BITS-1:0] st_col =
-                                        TCU_TMEM_COL_BITS'(tmem_mgmt_data[b].rs1_data[0][15:0]);
-                                    tmem_data[TCU_TMEM_LANE_BITS'(st_lane_base) + TCU_TMEM_LANE_BITS'(t)][st_col]
-                                        <= tmem_mgmt_data[b].rs2_data[t][31:0];
-                                end
-                            end
-                        end
-                        default: ;
-                    endcase
-                end
-            end
-        end
-    end
+    wire                                    tmem_wr_en        [BLOCK_SIZE];
+    wire [TCU_TMEM_LANE_BITS-1:0]           tmem_wr_lane_base [BLOCK_SIZE];
+    wire [TCU_TMEM_COL_BITS-1:0]            tmem_wr_col_base  [BLOCK_SIZE];
+    wire [TCU_TC_M-1:0][TCU_TC_N-1:0][31:0] tmem_wr_data      [BLOCK_SIZE];
 
-    // Bypass execute<->result handshake: same-cycle response, no queueing
-    for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_tmem_result
-        assign tmem_execute_if[bi].ready = tmem_result_if[bi].ready;
-        assign tmem_result_if[bi].valid  = tmem_execute_if[bi].valid;
-        assign tmem_result_if[bi].data.header = tmem_execute_if[bi].data.header;
-        wire is_tmem_ld_r = tmem_execute_if[bi].data.op_type == INST_TCU_TMEM_LD;
-        for (genvar t = 0; t < `VX_CFG_NUM_THREADS; ++t) begin : g_tmem_result_t
-            if (`VX_CFG_XLEN > 32) begin : g_nanbox
-                assign tmem_result_if[bi].data.data[t] = is_tmem_ld_r
-                    ? {32'hffffffff, tmem_ld_rd_data[bi][t]} : '0;
-            end else begin : g_pass
-                assign tmem_result_if[bi].data.data[t] = is_tmem_ld_r
-                    ? `VX_CFG_XLEN'(tmem_ld_rd_data[bi][t]) : '0;
-            end
-        end
-    end
-
-`ifdef PERF_ENABLE
-    // Stub for now
-    assign tcu_perf.umma_instrs = '0;
-    assign tcu_perf.tmem_reads  = '0;
-    assign tcu_perf.tmem_writes = '0;
-`endif
+    VX_tcu_tmem #(
+        .INSTANCE_ID (`SFORMATF(("%s-tmem", INSTANCE_ID))),
+        .BLOCK_SIZE  (BLOCK_SIZE)
+    ) tmem (
+        .clk           (clk),
+        .reset         (reset),
+    `ifdef PERF_ENABLE
+        .tcu_perf      (tcu_perf),
+    `endif
+        .mgmt_valid    (tmem_mgmt_valid),
+        .mgmt_data     (tmem_mgmt_data),
+        .mgmt_ready    (tmem_mgmt_ready),
+        .result_valid  (tmem_result_valid_w),
+        .result_data   (tmem_result_data_w),
+        .result_ready  (tmem_result_ready_w),
+        .rd_lane_base  (tmem_rd_lane_base),
+        .rd_col_base   (tmem_rd_col_base),
+        .rd_data       (tmem_rd_data),
+        .wr_en         (tmem_wr_en),
+        .wr_lane_base  (tmem_wr_lane_base),
+        .wr_col_base   (tmem_wr_col_base),
+        .wr_data       (tmem_wr_data)
+    );
 `endif // TCU_TMEM_ENABLE
 
     // -----------------------------------------------------------------------
@@ -436,7 +360,9 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         `endif
         `ifdef TCU_TMEM_ENABLE
             .cta_rank         (block_cta_rank),
-            .tmem_data        (tmem_data),
+            .tmem_rd_lane_base(tmem_rd_lane_base[block_idx]),
+            .tmem_rd_col_base (tmem_rd_col_base[block_idx]),
+            .tmem_rd_data     (tmem_rd_data[block_idx]),
             .tmem_wr_en       (tmem_wr_en[block_idx]),
             .tmem_wr_lane_base(tmem_wr_lane_base[block_idx]),
             .tmem_wr_col_base (tmem_wr_col_base[block_idx]),
