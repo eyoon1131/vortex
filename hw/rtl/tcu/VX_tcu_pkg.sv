@@ -46,14 +46,6 @@ package VX_tcu_pkg;
     // Set configuration parameters
     localparam TCU_NT = `VX_CFG_NUM_THREADS;
 
-`ifdef TCU_TMEM_ENABLE
-    // TMEM parameters
-    localparam TCU_TMEM_LANES = `VX_CFG_NUM_TCU_BLOCKS * `VX_CFG_NUM_THREADS;
-    localparam TCU_TMEM_COLS  = 256;
-    localparam TCU_TMEM_LANE_BITS = $clog2(TCU_TMEM_LANES);
-    localparam TCU_TMEM_COL_BITS  = $clog2(TCU_TMEM_COLS);
-`endif
-
     localparam TCU_WG_NRA = 4;  // A registers per warp (fixed)
     localparam TCU_WG_NR = 32;  // max NRC (C/D registers, variable via cd_nregs)
 
@@ -99,6 +91,22 @@ package VX_tcu_pkg;
     // Dense FEDP width doubles under VX_CFG_TCU_FEDP2K
     localparam TCU_WG_TILE_M = 2 * TCU_TC_M;
     localparam TCU_WG_TILE_K = 2 * TCU_TC_K;
+
+`ifdef TCU_TMEM_ENABLE
+    // TMEM parameters
+    //
+    // TCU_TMEM_LANES is sized to ONE warpgroup's width, shared/reused
+    // across concurrent warpgroups. This bakes in CTA size == warpgroup
+    // size (NUM_TCU_BLOCKS) — a real Blackwell property (tcgen05 warpgroups
+    // are fixed at 4 warps) - but it's an assumption, not something
+    // this RTL enforces on its own: nothing here stops software from
+    // launching a CTA with more warps than NUM_TCU_BLOCKS.
+    localparam TCU_TMEM_LANES = `VX_CFG_NUM_TCU_BLOCKS * TCU_WG_TILE_M;
+    localparam TCU_TMEM_COLS  = 256;
+    localparam TCU_TMEM_LANE_BITS = $clog2(TCU_TMEM_LANES);
+    localparam TCU_TMEM_COL_BITS  = $clog2(TCU_TMEM_COLS);
+`endif
+
 `ifdef VX_CFG_TCU_FEDP2K
     localparam TCU_WG_FEDP_K = 2 * TCU_TC_K;
 `else

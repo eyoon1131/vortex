@@ -17,19 +17,11 @@
 
 // TMEM (Tensor Memory) storage and management
 //
-// PLACEHOLDER: this is tensor_mem's original single-tenant allocator (one
-// global allocation, no per-CTA handle), ported onto the current TCU
-// structure — NOT the real multi-tenant allocator (CTA-scoped free-list +
-// CAM, matching the SimX side). Deliberately simple, to verify the UMMA
-// FEDP compute path + RAW-hazard interlock first. Redo before any
-// multi-CTA-concurrent UMMA testing:
-//   - ALLOC/DEALLOC/ST all share one always_ff below with NO real
-//     arbitration across blocks — if more than one block requests one of
-//     these in the same cycle, whichever has the highest block index
-//     wins (last write in the loop), the rest are silently dropped rather
-//     than retried.
-//   - handle is always implicitly 0 (tmem_ncols tracks one allocation, no
-//     per-CTA base column). DEALLOC clears bookkeeping only, not storage.
+// TMEM_ALLOC/TMEM_DEALLOC are per-CTA allocation, delegated to
+// VX_tcu_tmem_alloc: one block's ALLOC-or-DEALLOC request is arbitrated to
+// a single winner per cycle. alloc() only ever reserves a column range —
+// it does not initialize TMEM contents, so the allocator has no dependency
+// on tmem_data
 
 module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     parameter `STRING INSTANCE_ID = "",
@@ -68,10 +60,6 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     `UNUSED_SPARAM (INSTANCE_ID)
 
     logic [31:0] tmem_data [TCU_TMEM_LANES][TCU_TMEM_COLS];
-    logic        tmem_allocated;
-    logic [7:0]  tmem_ncols;
-    `UNUSED_VAR (tmem_allocated)
-    `UNUSED_VAR (tmem_ncols)
 
     // -----------------------------------------------------------------------
     // UMMA compute read: decode once per (block, tile row), reuse across
@@ -103,73 +91,111 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         end
     end
 
-    // ALLOC/DEALLOC/ST + UMMA writeback: combined into one process so
-    // there's a single driver for tmem_data/tmem_allocated/tmem_ncols
+    // UMMA compute writeback + TMEM_ST: both write their own tmem_data
+    // cells independently, never touching shared allocator state, so
+    // neither needs arbitration across blocks
     always_ff @(posedge clk) begin
-        if (reset) begin
-            tmem_allocated <= 1'b0;
-            tmem_ncols     <= '0;
-        end else begin
-            // UMMA compute writeback
-            for (int b = 0; b < BLOCK_SIZE; ++b) begin
-                if (wr_en[b]) begin
-                    for (int i = 0; i < TCU_TC_M; ++i) begin
-                        for (int j = 0; j < TCU_TC_N; ++j) begin
-                            tmem_data[TCU_TMEM_LANE_BITS'(wr_lane_base[b]) + TCU_TMEM_LANE_BITS'(i)]
-                                     [TCU_TMEM_COL_BITS'(wr_col_base[b])  + TCU_TMEM_COL_BITS'(j)]
-                                <= wr_data[b][i][j];
-                        end
+        // UMMA compute writeback
+        for (int b = 0; b < BLOCK_SIZE; ++b) begin
+            if (wr_en[b]) begin
+                for (int i = 0; i < TCU_TC_M; ++i) begin
+                    for (int j = 0; j < TCU_TC_N; ++j) begin
+                        tmem_data[TCU_TMEM_LANE_BITS'(wr_lane_base[b]) + TCU_TMEM_LANE_BITS'(i)]
+                                 [TCU_TMEM_COL_BITS'(wr_col_base[b])  + TCU_TMEM_COL_BITS'(j)]
+                            <= wr_data[b][i][j];
                     end
                 end
             end
+        end
 
-            // ALLOC/DEALLOC/ST
-            for (int b = 0; b < BLOCK_SIZE; ++b) begin
-                if (mgmt_valid[b]) begin
-                    case (mgmt_data[b].op_type)
-                        INST_TCU_TMEM_ALLOC: begin
-                            tmem_allocated <= 1'b1;
-                            tmem_ncols     <= mgmt_data[b].rs1_data[0][7:0];
-                            for (int l = 0; l < TCU_TMEM_LANES; ++l)
-                                for (int c = 0; c < TCU_TMEM_COLS; ++c)
-                                    tmem_data[l][c] <= '0;
-                        end
-                        INST_TCU_TMEM_DEALLOC: begin
-                            tmem_allocated <= 1'b0;
-                            tmem_ncols     <= '0;
-                        end
-                        INST_TCU_TMEM_ST: begin
-                            for (int t = 0; t < `VX_CFG_NUM_THREADS; ++t) begin
-                                if (mgmt_data[b].header.tmask[t]) begin
-                                    automatic logic [TCU_TMEM_LANE_BITS-1:0] st_lane_base =
-                                        TCU_TMEM_LANE_BITS'(mgmt_data[b].rs1_data[0][31:16]);
-                                    automatic logic [TCU_TMEM_COL_BITS-1:0] st_col =
-                                        TCU_TMEM_COL_BITS'(mgmt_data[b].rs1_data[0][15:0]);
-                                    tmem_data[TCU_TMEM_LANE_BITS'(st_lane_base) + TCU_TMEM_LANE_BITS'(t)][st_col]
-                                        <= mgmt_data[b].rs2_data[t][31:0];
-                                end
-                            end
-                        end
-                        default: ;
-                    endcase
+        // TMEM_ST
+        for (int b = 0; b < BLOCK_SIZE; ++b) begin
+            if (mgmt_valid[b] && (mgmt_data[b].op_type == INST_TCU_TMEM_ST)) begin
+                for (int t = 0; t < `VX_CFG_NUM_THREADS; ++t) begin
+                    if (mgmt_data[b].header.tmask[t]) begin
+                        automatic logic [TCU_TMEM_LANE_BITS-1:0] st_lane_base =
+                            TCU_TMEM_LANE_BITS'(mgmt_data[b].rs1_data[0][31:16]);
+                        automatic logic [TCU_TMEM_COL_BITS-1:0] st_col =
+                            TCU_TMEM_COL_BITS'(mgmt_data[b].rs1_data[0][15:0]);
+                        tmem_data[TCU_TMEM_LANE_BITS'(st_lane_base) + TCU_TMEM_LANE_BITS'(t)][st_col]
+                            <= mgmt_data[b].rs2_data[t][31:0];
+                    end
                 end
             end
         end
     end
 
-    // Bypass execute<->result handshake: same-cycle response, no queueing
+    // -----------------------------------------------------------------------
+    // ALLOC/DEALLOC arbitration: one block's request is granted per cycle
+    // -----------------------------------------------------------------------
+    wire [BLOCK_SIZE-1:0] is_alloc_req;
+    wire [BLOCK_SIZE-1:0] is_dealloc_req;
+    for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_mgmt_decode
+        assign is_alloc_req[bi]   = mgmt_valid[bi] && (mgmt_data[bi].op_type == INST_TCU_TMEM_ALLOC);
+        assign is_dealloc_req[bi] = mgmt_valid[bi] && (mgmt_data[bi].op_type == INST_TCU_TMEM_DEALLOC);
+    end
+    wire [BLOCK_SIZE-1:0] is_alloc_or_dealloc_req = is_alloc_req | is_dealloc_req;
+
+    wire [BLOCK_SIZE-1:0]          alloc_grant_onehot;
+    wire [`LOG2UP(BLOCK_SIZE)-1:0] alloc_grant_idx;
+    wire                           alloc_grant_valid;
+    VX_priority_encoder #(
+        .N (BLOCK_SIZE)
+    ) alloc_arb (
+        .data_in    (is_alloc_or_dealloc_req),
+        .onehot_out (alloc_grant_onehot),
+        .index_out  (alloc_grant_idx),
+        .valid_out  (alloc_grant_valid)
+    );
+
+    // Granted request's fields, extracted once from the winning block.
+    // req_ncols is meaningful only for ALLOC, req_handle only for DEALLOC
+    wire                          alloc_req_valid      = alloc_grant_valid;
+    wire                          alloc_req_is_dealloc = is_dealloc_req[alloc_grant_idx];
+    wire [NCTA_WIDTH-1:0]         alloc_req_cta_id     = mgmt_data[alloc_grant_idx].header.cta_id;
+    wire [7:0]                    alloc_req_ncols      = mgmt_data[alloc_grant_idx].rs1_data[0][7:0];
+    wire [TCU_TMEM_COL_BITS-1:0]  alloc_req_handle     = TCU_TMEM_COL_BITS'(mgmt_data[alloc_grant_idx].rs1_data[0]);
+
+    wire                          alloc_resp_valid;
+    wire [TCU_TMEM_COL_BITS-1:0]  alloc_resp_handle;
+
+    VX_tcu_tmem_alloc #(
+        .INSTANCE_ID (`SFORMATF(("%s-alloc", INSTANCE_ID)))
+    ) alloc (
+        .clk            (clk),
+        .reset          (reset),
+        .req_valid      (alloc_req_valid),
+        .req_is_dealloc (alloc_req_is_dealloc),
+        .req_cta_id     (alloc_req_cta_id),
+        .req_ncols      (alloc_req_ncols),
+        .req_handle     (alloc_req_handle),
+        .resp_valid     (alloc_resp_valid),
+        .resp_handle    (alloc_resp_handle)
+    );
+
+    // Bypass execute<->result handshake: same-cycle response, no queueing.
+    // ALLOC/DEALLOC only fires for the block the arbiter granted this cycle,
+    // gated on VX_tcu_tmem_alloc's resp_valid - every other requesting block
+    // retries next cycle
     for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_tmem_result
-        assign mgmt_ready[bi]         = result_ready[bi];
-        assign result_valid[bi]       = mgmt_valid[bi];
+        wire mgmt_fire = is_alloc_or_dealloc_req[bi]
+            ? (alloc_grant_onehot[bi] && alloc_resp_valid)
+            : mgmt_valid[bi];
+
+        assign mgmt_ready[bi]         = mgmt_fire && result_ready[bi];
+        assign result_valid[bi]       = mgmt_fire;
         assign result_data[bi].header = mgmt_data[bi].header;
-        wire is_tmem_ld_r = mgmt_data[bi].op_type == INST_TCU_TMEM_LD;
+        wire is_tmem_ld_r    = mgmt_data[bi].op_type == INST_TCU_TMEM_LD;
+        wire is_tmem_alloc_r = mgmt_data[bi].op_type == INST_TCU_TMEM_ALLOC;
         for (genvar t = 0; t < `VX_CFG_NUM_THREADS; ++t) begin : g_tmem_result_t
             if (`VX_CFG_XLEN > 32) begin : g_nanbox
                 assign result_data[bi].data[t] = is_tmem_ld_r
-                    ? {32'hffffffff, tmem_ld_rd_data[bi][t]} : '0;
+                    ? {32'hffffffff, tmem_ld_rd_data[bi][t]}
+                    : is_tmem_alloc_r ? `VX_CFG_XLEN'(alloc_resp_handle) : '0;
             end else begin : g_pass
                 assign result_data[bi].data[t] = is_tmem_ld_r
-                    ? `VX_CFG_XLEN'(tmem_ld_rd_data[bi][t]) : '0;
+                    ? `VX_CFG_XLEN'(tmem_ld_rd_data[bi][t])
+                    : is_tmem_alloc_r ? `VX_CFG_XLEN'(alloc_resp_handle) : '0;
             end
         end
     end

@@ -198,7 +198,18 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // TMEM addressing for UMMA. cta_rank/handle are warp-uniform (handle is
     // the base column returned by a prior TMEM_ALLOC), lane/col additionally
     // depend on the grid cell (i,j), computed per-cell alongside c_val.
-    wire [31:0] umma_handle = execute_if.data.rs3_data[0];
+    //
+    // rs3 (the handle register, x12/a2) is only populated by the register
+    // file on the macro-op's first micro-op. Must be latched on the first uop and
+    // reused for the rest of the macro-op.
+    reg [31:0] umma_handle_r;
+    always @(posedge clk) begin
+        if (execute_fire && is_umma && execute_if.data.op_args.tcu.is_first_uop) begin
+            umma_handle_r <= execute_if.data.rs3_data[0];
+        end
+    end
+    wire [31:0] umma_handle = execute_if.data.op_args.tcu.is_first_uop
+        ? execute_if.data.rs3_data[0] : umma_handle_r;
 `endif
 
     wire execute_fire = execute_if.valid && execute_if.ready;
@@ -299,6 +310,13 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // new UMMA op is admitted
     assign tmem_rd_lane_base = umma_lane_base;
     assign tmem_rd_col_base  = umma_col_base;
+
+    // TMEM lanes are sized to one warpgroup's width (TCU_TMEM_LANES =
+    // NUM_TCU_BLOCKS * NUM_THREADS, see VX_tcu_pkg.sv), so this design
+    // assumes CTA size == warpgroup size (NUM_TCU_BLOCKS)
+    `RUNTIME_ASSERT (~execute_fire || !is_umma || (32'(cta_rank) < 32'(`VX_CFG_NUM_TCU_BLOCKS)),
+        ("%s: cta_rank %0d exceeds NUM_TCU_BLOCKS (%0d) — CTA is larger than one warpgroup, violating TMEM's CTA-size==warpgroup-size assumption",
+         INSTANCE_ID, cta_rank, `VX_CFG_NUM_TCU_BLOCKS))
 
     // RAW-hazard interlock. k-outer UMMA loop order only avoids revisiting
     // the same TMEM tile before its prior write retires when
