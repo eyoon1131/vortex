@@ -27,6 +27,16 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     input wire          tbuf_ready,
 `endif
 
+    // TMEM read/write ports
+`ifdef TCU_TMEM_ENABLE
+    input wire [NW_WIDTH-1:0]                       cta_rank,
+    input wire [31:0]                               tmem_data[TCU_TMEM_LANES][TCU_TMEM_COLS],
+    output wire                                     tmem_wr_en,
+    output wire [TCU_TMEM_LANE_BITS-1:0]            tmem_wr_lane_base,
+    output wire [TCU_TMEM_COL_BITS-1:0]             tmem_wr_col_base,
+    output wire [TCU_TC_M-1:0][TCU_TC_N-1:0][31:0]  tmem_wr_data,
+`endif
+
     // External metadata write port from the shared VX_tcu_agu.
 `ifdef TCU_META_ENABLE
     input wire                     ext_meta_wr_en,
@@ -129,6 +139,11 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
               `endif
                  ;
     wire wg_a_smem = execute_if.data.op_args.tcu.a_from_smem;
+`ifdef TCU_TMEM_ENABLE
+    wire is_umma = (execute_if.data.op_type == INST_TCU_UMMA);
+    wire wg_or_umma = is_wgmma || is_umma;
+    wire wg_or_umma_a_smem = is_umma || wg_a_smem;
+`endif
 
     // A/B operand mux: tile buffer (smem) or register file. The
     // RF-side rs2_data is NUM_THREADS lanes wide; the WGMMA bbuf can be
@@ -138,15 +153,24 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     localparam WG_RS2_BITS = TCU_WG_RS2_WIDTH * `VX_CFG_XLEN;
     wire [WG_RS1_BITS-1:0] rs1_data_rf = WG_RS1_BITS'(execute_if.data.rs1_data);
     wire [WG_RS2_BITS-1:0] rs2_data_rf = WG_RS2_BITS'(execute_if.data.rs2_data);
+`ifdef TCU_TMEM_ENABLE
+    assign rs1_data = ((is_wgmma && wg_a_smem) || is_umma) ? tbuf_rs1_data : rs1_data_rf;
+    assign rs2_data = (is_wgmma || is_umma) ? tbuf_rs2_data : rs2_data_rf;
+`else
     assign rs1_data = (is_wgmma && wg_a_smem) ? tbuf_rs1_data : rs1_data_rf;
     assign rs2_data = is_wgmma ? tbuf_rs2_data : rs2_data_rf;
+`endif
 
   `ifdef VX_CFG_TCU_SPARSE_ENABLE
     // Sparse metadata lives in VX_tcu_sp_meta SRAM, preloaded via TCU_LD.
     wire [TCU_MAX_META_BLOCK_WIDTH-1:0] vld_meta_block = wmma_sp_meta;
   `endif
 
+`ifdef TCU_TMEM_ENABLE
+    assign exe_ready_extra = ~(is_wgmma || is_umma) || tbuf_ready;
+`else
     assign exe_ready_extra = ~is_wgmma || tbuf_ready;
+`endif
 `else
     assign rs1_data = execute_if.data.rs1_data;
     assign rs2_data = execute_if.data.rs2_data;
@@ -156,12 +180,23 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     assign exe_ready_extra = 1'b1;
 `endif
 
-    wire [3:0] step_m = execute_if.data.op_args.tcu.step_m;
-    wire [3:0] step_n = execute_if.data.op_args.tcu.step_n;
-    wire [3:0] step_k = execute_if.data.op_args.tcu.step_k;
+    // Widths match tcu_args_t: step_m/step_k only ever hold 0 or 1
+    // (m_steps fixed at 2, k_steps at most 2) but are kept wider for 
+    // headroom; step_n needs up to 6 bits for UMMA's NRC=128 case
+    // (n_steps=64)
+    wire [2:0] step_m = execute_if.data.op_args.tcu.step_m;
+    wire [5:0] step_n = execute_if.data.op_args.tcu.step_n;
+    wire [2:0] step_k = execute_if.data.op_args.tcu.step_k;
 
     wire [4:0] fmt_s = execute_if.data.op_args.tcu.fmt_s;
     wire [4:0] fmt_d = execute_if.data.op_args.tcu.fmt_d;
+
+`ifdef TCU_TMEM_ENABLE
+    // TMEM addressing for UMMA. cta_rank/handle are warp-uniform (handle is
+    // the base column returned by a prior TMEM_ALLOC), lane/col additionally
+    // depend on the grid cell (i,j), computed per-cell alongside c_val.
+    wire [31:0] umma_handle = execute_if.data.rs3_data[0];
+`endif
 
     wire execute_fire = execute_if.valid && execute_if.ready;
 `ifdef VX_CFG_TCU_WGMMA_ENABLE
@@ -249,9 +284,64 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     assign fedp_done        = fedp_delay_pipe[0];
     assign result_if.valid  = setup_valid_r || fedp_done;
     assign fedp_enable      = ~fedp_done || fedp_result_fire;
+
+`ifdef TCU_TMEM_ENABLE
+    // Tile-origin address for the incoming uop (pre +i/+j offset)
+    wire [TCU_TMEM_LANE_BITS-1:0] umma_lane_base = TCU_TMEM_LANE_BITS'(cta_rank) * TCU_TMEM_LANE_BITS'(TCU_WG_TILE_M)
+                                                  + TCU_TMEM_LANE_BITS'(step_m) * TCU_TMEM_LANE_BITS'(TCU_TC_M);
+    wire [TCU_TMEM_COL_BITS-1:0]  umma_col_base  = TCU_TMEM_COL_BITS'(umma_handle)
+                                                  + TCU_TMEM_COL_BITS'(step_n) * TCU_TMEM_COL_BITS'(TCU_TC_N);
+
+    // RAW-hazard interlock. k-outer UMMA loop order only avoids revisiting
+    // the same TMEM tile before its prior write retires when
+    // n_steps*m_steps >= FEDP_LATENCY+1. This tracks every in-flight
+    // write's address explicitly and stalls admission of a colliding new
+    // uop so correctness doesn't depend on that bound holding. Shifted
+    // in lockstep with fedp_delay_pipe, so position 0 always corresponds
+    // to the same uop fedp_done reports on.
+    typedef struct packed {
+        logic                          valid;
+        logic [TCU_TMEM_LANE_BITS-1:0] lane_base;
+        logic [TCU_TMEM_COL_BITS-1:0]  col_base;
+    } tmem_addr_t;
+
+    tmem_addr_t tmem_addr_pipe [PIPE_LATENCY];
+
+    always @(posedge clk) begin
+        if (reset) begin
+            for (int p = 0; p < PIPE_LATENCY; ++p)
+                tmem_addr_pipe[p] <= '0;
+        end else if (fedp_enable) begin
+            for (int p = 0; p < PIPE_LATENCY-1; ++p)
+                tmem_addr_pipe[p] <= tmem_addr_pipe[p+1];
+            tmem_addr_pipe[PIPE_LATENCY-1].valid     <= fedp_enqueue && is_umma;
+            tmem_addr_pipe[PIPE_LATENCY-1].lane_base <= umma_lane_base;
+            tmem_addr_pipe[PIPE_LATENCY-1].col_base  <= umma_col_base;
+        end
+    end
+
+    logic [PIPE_LATENCY-1:0] umma_hazard_match;
+    for (genvar p = 0; p < PIPE_LATENCY; ++p) begin : g_umma_hazard
+        assign umma_hazard_match[p] = tmem_addr_pipe[p].valid
+                                    && (tmem_addr_pipe[p].lane_base == umma_lane_base)
+                                    && (tmem_addr_pipe[p].col_base  == umma_col_base);
+    end
+    wire umma_hazard = is_umma && (|umma_hazard_match);
+
+    // TMEM write fires the same cycle fedp_done does, for whichever uop is
+    // now at position 0. tmem_addr_pipe[0].valid is 0 for non-UMMA uops.
+    assign tmem_wr_en        = fedp_done && tmem_addr_pipe[0].valid;
+    assign tmem_wr_lane_base = tmem_addr_pipe[0].lane_base;
+    assign tmem_wr_col_base  = tmem_addr_pipe[0].col_base;
+
+    assign execute_if.ready = is_wgmma_setup
+                            ? ((~setup_valid_r || result_if.ready) && exe_ready_extra)
+                            : (~mdata_queue_full && fedp_enable && exe_ready_extra && ~umma_hazard);
+`else
     assign execute_if.ready = is_wgmma_setup
                             ? ((~setup_valid_r || result_if.ready) && exe_ready_extra)
                             : (~mdata_queue_full && fedp_enable && exe_ready_extra);
+`endif
 
     wire mdata_push = fedp_enqueue;
 
@@ -420,22 +510,36 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                 `ifdef VX_CFG_TCU_WGMMA_ENABLE
                     wire [31:0] a_wgmma_smem = 32'(rs1_data[i * TCU_WG_FEDP_K + k_idx]);
                     wire [31:0] a_wgmma_reg  = 32'(execute_if.data.rs1_data[i * TCU_TC_K + k_idx]);
+                `ifdef TCU_TMEM_ENABLE
+                    assign a_row[k_idx] = wg_or_umma
+                        ? (wg_or_umma_a_smem ? a_wgmma_smem : a_wgmma_reg)
+                        : 32'(execute_if.data.rs1_data[a_off + i * TCU_TC_K + k_idx]);
+                `else
                     assign a_row[k_idx] = is_wgmma
                         ? (wg_a_smem ? a_wgmma_smem : a_wgmma_reg)
                         : 32'(execute_if.data.rs1_data[a_off + i * TCU_TC_K + k_idx]);
+                `endif
                 `else
                     assign a_row[k_idx] = 32'(rs1_data[a_off + i * TCU_TC_K + k_idx]);
                 `endif
                 `ifdef VX_CFG_TCU_SPARSE_ENABLE
                     assign b_col_dense[k_idx] =
                     `ifdef VX_CFG_TCU_WGMMA_ENABLE
+                      `ifdef TCU_TMEM_ENABLE
+                        wg_or_umma ? 32'(rs2_data[int'(b_off_wg) + WG_B_IDX]) :
+                      `else
                         is_wgmma ? 32'(rs2_data[int'(b_off_wg) + WG_B_IDX]) :
+                      `endif
                     `endif
                         32'(rs2_data[b_off_wm + j * TCU_TC_K + k_idx]);
                 `else
                     assign b_col[k_idx] =
                     `ifdef VX_CFG_TCU_WGMMA_ENABLE
+                      `ifdef TCU_TMEM_ENABLE
+                        wg_or_umma ? 32'(rs2_data[int'(b_off_wg) + WG_B_IDX]) :
+                      `else
                         is_wgmma ? 32'(rs2_data[int'(b_off_wg) + WG_B_IDX]) :
+                      `endif
                     `endif
                         32'(rs2_data[b_off_wm + j * TCU_TC_K + k_idx]);
                 `endif
@@ -451,24 +555,40 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                     `else
                         32'b0;
                     `endif
+                `ifdef TCU_TMEM_ENABLE
+                    assign a_row[k_idx] = (is_umma || (is_wgmma
+                        `ifdef VX_CFG_TCU_SPARSE_ENABLE
+                            && !is_sparse
+                        `endif
+                        )) ? (wg_or_umma_a_smem ? a_wgmma_smem : a_wgmma_reg) : 32'b0;
+                `else
                     assign a_row[k_idx] = (is_wgmma
                         `ifdef VX_CFG_TCU_SPARSE_ENABLE
                             && !is_sparse
                         `endif
                         ) ? (wg_a_smem ? a_wgmma_smem : a_wgmma_reg) : 32'b0;
+                `endif
                 `else
                     assign a_row[k_idx] = 32'b0;
                 `endif
                 `ifdef VX_CFG_TCU_SPARSE_ENABLE
                     assign b_col_dense[k_idx] =
                     `ifdef VX_CFG_TCU_WGMMA_ENABLE
+                      `ifdef TCU_TMEM_ENABLE
+                        (is_umma || (is_wgmma && !is_sparse)) ? 32'(rs2_data[int'(b_off_wg) + WG_B_IDX]) :
+                      `else
                         (is_wgmma && !is_sparse) ? 32'(rs2_data[int'(b_off_wg) + WG_B_IDX]) :
+                      `endif
                     `endif
                         32'b0;
                 `else
                     assign b_col[k_idx] =
                     `ifdef VX_CFG_TCU_WGMMA_ENABLE
+                      `ifdef TCU_TMEM_ENABLE
+                        wg_or_umma ? 32'(rs2_data[int'(b_off_wg) + WG_B_IDX]) :
+                      `else
                         is_wgmma ? 32'(rs2_data[int'(b_off_wg) + WG_B_IDX]) :
+                      `endif
                     `endif
                         32'b0;
                 `endif
@@ -498,7 +618,24 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             end
         `endif
 
+        `ifdef TCU_TMEM_ENABLE
+            // TMEM tile-origin address for this grid cell: lane depends on
+            // i (M direction), col depends on j (N direction) plus the
+            // handle base. Uses cta_rank (this warp's 0-indexed rank within
+            // its own CTA) because lanes are sized to one warpgroup's width
+            // (TCU_TMEM_LANES = NUM_TCU_BLOCKS * NUM_THREADS) and
+            // shared/reused across concurrent warpgroups.
+            wire [TCU_TMEM_LANE_BITS-1:0] tmem_lane = TCU_TMEM_LANE_BITS'(cta_rank) * TCU_TMEM_LANE_BITS'(TCU_WG_TILE_M)
+                                                     + TCU_TMEM_LANE_BITS'(step_m) * TCU_TMEM_LANE_BITS'(TCU_TC_M)
+                                                     + TCU_TMEM_LANE_BITS'(i);
+            wire [TCU_TMEM_COL_BITS-1:0]  tmem_col  = TCU_TMEM_COL_BITS'(umma_handle)
+                                                     + TCU_TMEM_COL_BITS'(step_n) * TCU_TMEM_COL_BITS'(TCU_TC_N)
+                                                     + TCU_TMEM_COL_BITS'(j);
+            wire [31:0] c_val = is_umma ? tmem_data[tmem_lane][tmem_col]
+                                        : 32'(execute_if.data.rs3_data[i * TCU_TC_N + j]);
+        `else
             wire [31:0] c_val = 32'(execute_if.data.rs3_data[i * TCU_TC_N + j]);
+        `endif
 
         `ifdef VX_CFG_TCU_SPARSE_ENABLE
             VX_tcu_sp_mux #(
@@ -690,6 +827,12 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             end else begin : g_result_passthrough
                 assign result_if.data.data[i * TCU_TC_N + j] = d_val[i][j];
             end
+
+        `ifdef TCU_TMEM_ENABLE
+            // UMMA's real destination — result_if.data.data[i*TCU_TC_N+j]
+            // above is harmless but unused for UMMA
+            assign tmem_wr_data[i][j] = d_val[i][j];
+        `endif
 
         `ifdef DBG_TRACE_TCU
             always @(posedge clk) begin

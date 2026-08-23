@@ -179,6 +179,11 @@ inline __attribute__((const)) int vx_warp_id() {
     return (int)csr_read_nv(VX_CSR_WARP_ID);
 }
 
+// Return this warp's 0-indexed rank within its own CTA (not the global warp id)
+inline __attribute__((const)) int vx_cta_rank() {
+    return (int)csr_read_nv(VX_CSR_CTA_RANK);
+}
+
 // Return current core identifier
 inline __attribute__((const)) int vx_core_id() {
     return (int)csr_read_nv(VX_CSR_CORE_ID);

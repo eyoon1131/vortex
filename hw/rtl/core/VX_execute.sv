@@ -41,6 +41,11 @@ module VX_execute import VX_gpu_pkg::*; #(
     VX_lsu_sched_if.master tcu_mem_if,
 `endif
 
+`ifdef TCU_TMEM_ENABLE
+    // Per-warp CTA-local rank table, sourced from VX_scheduler
+    input wire [`VX_CFG_NUM_WARPS-1:0][NW_WIDTH-1:0] cta_rank_table,
+`endif
+
     // dispatch interface
     VX_dispatch_if.slave    dispatch_if [NUM_EX_UNITS * `VX_CFG_ISSUE_WIDTH],
 
@@ -138,6 +143,9 @@ module VX_execute import VX_gpu_pkg::*; #(
     `endif
     `ifdef TCU_META_ENABLE
         .tcu_mem_if        (tcu_mem_if),
+    `endif
+    `ifdef TCU_TMEM_ENABLE
+        .cta_rank_table (cta_rank_table),
     `endif
         .dispatch_if    (dispatch_if[EX_TCU * `VX_CFG_ISSUE_WIDTH +: `VX_CFG_ISSUE_WIDTH]),
         .commit_if      (commit_if[EX_TCU * `VX_CFG_ISSUE_WIDTH +: `VX_CFG_ISSUE_WIDTH])

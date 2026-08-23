@@ -46,6 +46,11 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     input wire [NW_WIDTH-1:0]       schedule_wid,
     output wire [NCTA_WIDTH-1:0]    schedule_cta_id,
 
+`ifdef TCU_TMEM_ENABLE
+    // Per-warp CTA-local rank table
+    output wire [`VX_CFG_NUM_WARPS-1:0][NW_WIDTH-1:0] cta_rank_table,
+`endif
+
     output wire                     busy
 );
     `UNUSED_SPARAM (INSTANCE_ID)
@@ -676,6 +681,19 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
         end
     end
     assign schedule_cta_id = cta_id_per_warp_r[schedule_wid];
+
+`ifdef TCU_TMEM_ENABLE
+    // Per-warp -> CTA-rank map, same update mechanism as cta_id_per_warp_r.
+    // Exported as the whole table since its only consumer (VX_tcu_unit.sv)
+    // already has the reading warp's wid
+    reg [`VX_CFG_NUM_WARPS-1:0][NW_WIDTH-1:0] cta_rank_per_warp_r;
+    always @(posedge clk) begin
+        if (cta_fire) begin
+            cta_rank_per_warp_r[cta_wid] <= cta_csrs.cta_rank;
+        end
+    end
+    assign cta_rank_table = cta_rank_per_warp_r;
+`endif
 
     `UNUSED_VAR (kmu_bus_if.data.cta_id)
 

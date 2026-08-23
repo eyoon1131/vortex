@@ -42,6 +42,12 @@ module VX_scheduler import VX_gpu_pkg::*; #(
     VX_sched_csr_if.master  sched_csr_if,
     VX_gbar_bus_if.master   gbar_bus_if,
 
+`ifdef TCU_TMEM_ENABLE
+    // Per-warp CTA-local rank table, passed through from VX_cta_dispatch to
+    // VX_execute's TCU unit
+    output wire [`VX_CFG_NUM_WARPS-1:0][NW_WIDTH-1:0] cta_rank_table,
+`endif
+
     // status
     output wire             busy
 );
@@ -108,6 +114,9 @@ module VX_scheduler import VX_gpu_pkg::*; #(
         .cta_rd_tid (cta_rd_tid),
         .schedule_wid(schedule_wid),
         .schedule_cta_id(schedule_cta_id),
+    `ifdef TCU_TMEM_ENABLE
+        .cta_rank_table(cta_rank_table),
+    `endif
         .busy       (cta_dispatcher_busy)
     );
 

@@ -269,6 +269,12 @@ module VX_core import VX_gpu_pkg::*; #(
 `endif
 
     wire sched_busy;
+`ifdef TCU_TMEM_ENABLE
+    // Per-warp CTA-local rank table
+    // VX_execute's TCU unit is the only consumer
+    wire [`VX_CFG_NUM_WARPS-1:0][NW_WIDTH-1:0] cta_rank_table;
+`endif
+
     VX_scheduler #(
         .INSTANCE_ID (`SFORMATF(("%s-scheduler", INSTANCE_ID))),
         .CORE_ID (CORE_ID)
@@ -299,6 +305,10 @@ module VX_core import VX_gpu_pkg::*; #(
         .schedule_if    (schedule_if),
         .sched_csr_if   (sched_csr_if),
         .gbar_bus_if    (gbar_bus_if),
+
+    `ifdef TCU_TMEM_ENABLE
+        .cta_rank_table (cta_rank_table),
+    `endif
 
         .busy           (sched_busy)
     );
@@ -383,6 +393,9 @@ module VX_core import VX_gpu_pkg::*; #(
 
     `ifdef TCU_META_ENABLE
         .tcu_mem_if     (tcu_mem_if),
+    `endif
+    `ifdef TCU_TMEM_ENABLE
+        .cta_rank_table (cta_rank_table),
     `endif
 
         .dispatch_if    (dispatch_if),

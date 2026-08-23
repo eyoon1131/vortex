@@ -90,7 +90,7 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
   }
 
   // Epilogue: TMEM -> global memory.
-  ctx::store_output(handle, pC, tile_row, tile_col, N, warp_rank);
+  ctx::store_output(handle, pC, tile_row, tile_col, N);
   __syncthreads();
 
   vt::vx_tmem_dealloc(handle);

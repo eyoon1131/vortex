@@ -46,6 +46,14 @@ package VX_tcu_pkg;
     // Set configuration parameters
     localparam TCU_NT = `VX_CFG_NUM_THREADS;
 
+`ifdef TCU_TMEM_ENABLE
+    // TMEM parameters
+    localparam TCU_TMEM_LANES = `VX_CFG_NUM_TCU_BLOCKS * `VX_CFG_NUM_THREADS;
+    localparam TCU_TMEM_COLS  = 256;
+    localparam TCU_TMEM_LANE_BITS = $clog2(TCU_TMEM_LANES);
+    localparam TCU_TMEM_COL_BITS  = $clog2(TCU_TMEM_COLS);
+`endif
+
     localparam TCU_WG_NRA = 4;  // A registers per warp (fixed)
     localparam TCU_WG_NR = 32;  // max NRC (C/D registers, variable via cd_nregs)
 
@@ -97,6 +105,13 @@ package VX_tcu_pkg;
     localparam TCU_WG_FEDP_K = TCU_TC_K;
 `endif
     localparam TCU_WG_TILE_N = (TCU_WG_NR * TCU_NT) / TCU_WG_TILE_M;
+
+`ifdef TCU_TMEM_ENABLE
+    // UMMA geometry: same xtileM as WGMMA, but its own NRC ceiling (128)
+    localparam TCU_UMMA_NR      = 128;
+    localparam TCU_UMMA_TILE_N  = (TCU_UMMA_NR * TCU_NT) / TCU_WG_TILE_M;
+    localparam TCU_UMMA_N_STEPS = TCU_UMMA_TILE_N / TCU_TC_N;
+`endif
 
     // WG step counts: block geometry (TC_M/TC_N/TC_K) unchanged, tile is larger
     localparam TCU_WG_M_STEPS = TCU_WG_TILE_M / TCU_TC_M;
@@ -408,6 +423,19 @@ package VX_tcu_pkg;
             end
           `endif
         `endif
+        `ifdef TCU_TMEM_ENABLE
+            INST_TCU_TMEM_ALLOC:   `TRACE(level, ("TMEM_ALLOC"))
+            INST_TCU_TMEM_DEALLOC: `TRACE(level, ("TMEM_DEALLOC"))
+            INST_TCU_TMEM_ST:      `TRACE(level, ("TMEM_ST"))
+            INST_TCU_TMEM_LD:      `TRACE(level, ("TMEM_LD"))
+            INST_TCU_UMMA: begin
+                `TRACE(level, ("UMMA."));
+                trace_fmt(level, op_args.tcu.fmt_s);
+                `TRACE(level, ("."));
+                trace_fmt(level, op_args.tcu.fmt_d);
+                `TRACE(level, (".%0d.%0d.%0d", op_args.tcu.step_m, op_args.tcu.step_n, op_args.tcu.step_k));
+            end
+        `endif
             default: `TRACE(level, ("?"))
         endcase
     endtask
@@ -422,10 +450,10 @@ package VX_tcu_pkg;
         logic [UUID_WIDTH-1:0]      uuid;   // originating WGMMA instruction uuid
         logic [NW_WIDTH-1:0]        wid;
         logic [NCTA_WIDTH-1:0]      cta_id;
-        logic [3:0]                 step_m;
-        logic [3:0]                 step_n;
-        logic [3:0]                 step_k;
-        logic [1:0]                 cd_nregs;
+        logic [2:0]                 step_m;
+        logic [5:0]                 step_n;
+        logic [2:0]                 step_k;
+        logic [2:0]                 cd_nregs;
         logic [`VX_CFG_XLEN-1:0]    desc_a;
         logic [`VX_CFG_XLEN-1:0]    desc_b;
         logic                       a_is_smem;

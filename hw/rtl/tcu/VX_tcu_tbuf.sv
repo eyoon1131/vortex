@@ -145,10 +145,10 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     wire                          bbuf_req_setup;
     wire                          bbuf_req_is_first_uop;
     wire                          bbuf_req_is_sparse;
-    wire [3:0]                    bbuf_req_step_m;
-    wire [3:0]                    bbuf_req_step_k;
-    wire [3:0]                    bbuf_req_step_n;
-    wire [1:0]                    bbuf_req_cd_nregs;
+    wire [2:0]                    bbuf_req_step_m;
+    wire [2:0]                    bbuf_req_step_k;
+    wire [5:0]                    bbuf_req_step_n;
+    wire [2:0]                    bbuf_req_cd_nregs;
     wire [NCTA_WIDTH-1:0]         bbuf_req_cta_id;
     wire [`VX_CFG_XLEN-1:0]       bbuf_req_desc_b;
     wire [UUID_WIDTH-1:0]         bbuf_req_uuid;
@@ -192,10 +192,10 @@ module VX_tcu_tbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         // masked values is equivalent to selecting via the one-hot index.
         logic              sel_is_first_uop;
         logic              sel_is_sparse;
-        logic [3:0]        sel_step_m;
-        logic [3:0]        sel_step_k;
-        logic [3:0]        sel_step_n;
-        logic [1:0]        sel_cd_nregs;
+        logic [2:0]        sel_step_m;
+        logic [2:0]        sel_step_k;
+        logic [5:0]        sel_step_n;
+        logic [2:0]        sel_cd_nregs;
         logic [NCTA_WIDTH-1:0] sel_cta_id;
         logic [`VX_CFG_XLEN-1:0]  sel_desc_b;
         logic [UUID_WIDTH-1:0]    sel_uuid;

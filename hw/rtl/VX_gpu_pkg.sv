@@ -99,7 +99,9 @@ package VX_gpu_pkg;
     localparam UOP_TCU = UOP_PACKLD + 1;
     localparam UOP_GFXW = UOP_TCU + `VX_CFG_EXT_TCU_ENABLED;
     localparam UOP_MAX = UOP_GFXW + `EXT_GFX_ANY_ENABLED;
-    localparam UOP_CTR_W = 8;
+    // 9 bits: UMMA's worst-case uop_count is 256 (k_steps<=2, NRC<=128 are
+    // both hard bounds)
+    localparam UOP_CTR_W = 9;
 
     localparam CTA_TID_WIDTH = `UP(NW_BITS + NT_BITS);
 
@@ -602,6 +604,14 @@ package VX_gpu_pkg;
     // TCU_LD — warp-level load into a metadata SRAM namespace.
     localparam INST_TCU_LD         = 4'h5;
 `endif
+`ifdef TCU_TMEM_ENABLE
+    // UMMA: A/B from SMEM via descriptors, C/D accumulator in TMEM
+    localparam INST_TCU_TMEM_ALLOC   = 4'h6;
+    localparam INST_TCU_TMEM_DEALLOC = 4'h7;
+    localparam INST_TCU_TMEM_ST      = 4'h8;
+    localparam INST_TCU_TMEM_LD      = 4'h9;
+    localparam INST_TCU_UMMA         = 4'hA;
+`endif
     localparam INST_TCU_BITS = 4;
 `endif
 
@@ -785,15 +795,15 @@ package VX_gpu_pkg;
 
 `ifdef VX_CFG_EXT_TCU_ENABLE
     typedef struct packed {
-        logic is_last_uop;    // WGMMA: set on last sub-uop of an expansion
-        logic is_first_uop;   // WGMMA: set on first sub-uop of an expansion
+        logic is_last_uop;    // WGMMA/UMMA: set on last sub-uop of an expansion
+        logic is_first_uop;   // WGMMA/UMMA: set on first sub-uop of an expansion
         logic a_from_smem;    // 0=register, 1=shared memory (B is always smem)
         logic [1:0] cd_nregs; // 0=8, 1=16, 2=32 C/D registers
         logic [4:0] fmt_d;
         logic [4:0] fmt_s;
-        logic [3:0] step_k;
-        logic [3:0] step_n;
-        logic [3:0] step_m;
+        logic [2:0] step_k;   // step_k only ever hold 0 or 1 (k_steps <= 2)
+        logic [5:0] step_n;   // UMMA n_steps can reach 64 at NRC=128
+        logic [2:0] step_m;   // step_m only ever hold 0 or 1 (m_steps = 2)
     } tcu_args_t;
     `PACKAGE_ASSERT($bits(tcu_args_t) == INST_ARGS_BITS)
 `endif
@@ -1083,6 +1093,11 @@ package VX_gpu_pkg;
         logic [PERF_CTR_BITS-1:0] wgmma_stalls;      // cycles: WGMMA valid but stalled (tbuf or mdata)
         logic [PERF_CTR_BITS-1:0] wgmma_instrs;      // WGMMA µops executed
         logic [PERF_CTR_BITS-1:0] tbuf_stalls;         // cycles: WGMMA valid but stalled (uop cannot enter TCU core because tbuf data not ready)
+`ifdef TCU_TMEM_ENABLE
+        logic [PERF_CTR_BITS-1:0] umma_instrs;       // UMMA µops executed
+        logic [PERF_CTR_BITS-1:0] tmem_reads;        // TMEM elements read (UMMA C + tmem_ld)
+        logic [PERF_CTR_BITS-1:0] tmem_writes;       // TMEM elements written (UMMA D + tmem_st)
+`endif
     } tcu_perf_t;
 `endif
 

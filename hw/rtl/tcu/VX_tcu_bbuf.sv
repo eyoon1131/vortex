@@ -56,10 +56,10 @@ module VX_tcu_bbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     input  wire                     req_setup,
     input  wire                     req_is_first_uop,
     input  wire                     req_is_sparse,
-    input  wire [3:0]               req_step_m,
-    input  wire [3:0]               req_step_k,
-    input  wire [3:0]               req_step_n,
-    input  wire [1:0]               req_cd_nregs,
+    input  wire [2:0]               req_step_m,
+    input  wire [2:0]               req_step_k,
+    input  wire [5:0]               req_step_n,
+    input  wire [2:0]               req_cd_nregs,
     input  wire [NCTA_WIDTH-1:0]    req_cta_id,
     input  wire [`VX_CFG_XLEN-1:0]  req_desc_b,
     input  wire [UUID_WIDTH-1:0]    req_uuid,
@@ -113,24 +113,29 @@ module VX_tcu_bbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     localparam LG_B_BLOCK_WORDS   = $clog2(B_BLOCK_WORDS);
     localparam KM_CTR_W           = $clog2(TCU_TC_N + 1);
     // 32-bit-word offset width for K-major address arithmetic.
-    //   step_n × TCU_TC_N + j has ≤ 4+4 bits; × ldm_words adds LDM_W.
-    localparam KM_OFF_W           = LDM_W + 4 + 4;
+    //   step_n × TCU_TC_N + j has ≤ 6+4 bits (step_n now 6 bits wide to
+    //   cover UMMA's full n_steps range); × ldm_words adds LDM_W.
+    localparam KM_OFF_W           = LDM_W + 6 + 4;
 
     // -----------------------------------------------------------------------
     // Block-index compute (variable N_STEPS via cd_nregs).
-    // K_STEPS=2 always; N_STEPS=4/8/16 for cd_nregs=0/1/2 (NRC=8/16/32).
+    // K_STEPS=2 always; N_STEPS=4/8/16/32/64 for cd_nregs=0/1/2/3/4
+    // (WGMMA NRC=8/16/32; UMMA additionally 64/128 via its repurposed
+    // {a_from_smem,cd_nregs} 3-bit code)
     // -----------------------------------------------------------------------
 
-    logic [4:0] block_index;
+    logic [6:0] block_index;
     always_comb begin
         case (req_cd_nregs)
-            2'd0:    block_index = {2'b0, req_step_k[0], req_step_n[1:0]};   // N_STEPS=4
-            2'd1:    block_index = {1'b0, req_step_k[0], req_step_n[2:0]};   // N_STEPS=8
-            default: block_index = {req_step_k[0], req_step_n[3:0]};         // N_STEPS=16
+            3'd0:    block_index = {4'b0, req_step_k[0], req_step_n[1:0]};   // N_STEPS=4  (NRC=8)
+            3'd1:    block_index = {3'b0, req_step_k[0], req_step_n[2:0]};   // N_STEPS=8  (NRC=16)
+            3'd2:    block_index = {2'b0, req_step_k[0], req_step_n[3:0]};   // N_STEPS=16 (NRC=32)
+            3'd3:    block_index = {1'b0, req_step_k[0], req_step_n[4:0]};   // N_STEPS=32 (NRC=64)
+            default: block_index = {      req_step_k[0], req_step_n[5:0]};   // N_STEPS=64 (NRC=128)
         endcase
     end
-    if (4 > 1) begin : g_step_k_upper_unused
-        `UNUSED_VAR (req_step_k[3:1])
+    if (3 > 1) begin : g_step_k_upper_unused
+        `UNUSED_VAR (req_step_k[2:1])
     end
 
     // LMEM bank-row offset.
@@ -142,9 +147,9 @@ module VX_tcu_bbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // Sparse blocks use the flat producer layout and can span one or two
     // logical 32-bit bank rows.
     localparam TOTAL_SHIFT = LG_B_SUB_BLOCKS + LG_XLEN_RATIO;
-    wire [4:0] dense_offset = (TOTAL_SHIFT == 0)
+    wire [6:0] dense_offset = (TOTAL_SHIFT == 0)
                             ? block_index
-                            : 5'(block_index >> TOTAL_SHIFT);
+                            : 7'(block_index >> TOTAL_SHIFT);
 
     // Dense within-physical-bank-row selector (XLEN>32 only). Picks which
     // of the XLEN_RATIO logical 32-bit bank-rows to copy into slot A.
@@ -152,7 +157,7 @@ module VX_tcu_bbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     wire [SUB_HALF_W-1:0] dense_sub_half =
         (LG_XLEN_RATIO == 0)
         ? '0
-        : SUB_HALF_W'(({27'b0, block_index} >> LG_B_SUB_BLOCKS) & ((1 << LG_XLEN_RATIO) - 1));
+        : SUB_HALF_W'(({25'b0, block_index} >> LG_B_SUB_BLOCKS) & ((1 << LG_XLEN_RATIO) - 1));
 
     localparam SP_LOGROW_W = 6;
     wire [SP_LOGROW_W-1:0] sp_logrow_a =
@@ -203,8 +208,8 @@ module VX_tcu_bbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // on setup; per-compute step fields are latched when a fetch is allocated.
     logic                       slot_row_major_r;
     logic [LDM_W-1:0]           slot_ldm_words_r;
-    logic [3:0]                 slot_step_k_r;
-    logic [3:0]                 slot_step_n_r;
+    logic [2:0]                 slot_step_k_r;
+    logic [5:0]                 slot_step_n_r;
     logic [NCTA_WIDTH-1:0]      slot_cta_id_r;
     // K-major descriptors can point to storage rewritten between WGMMA instructions.
     logic                       refetched_for_first_uop_r;

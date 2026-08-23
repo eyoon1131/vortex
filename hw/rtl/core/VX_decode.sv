@@ -649,6 +649,57 @@ module VX_decode import
                             `USED_IREG (rs1);
                         end else
                     `endif
+                    `ifdef TCU_TMEM_ENABLE
+                        if (funct3 >= 3'h3) begin
+                            op_args.tcu.cd_nregs     = '0;
+                            op_args.tcu.a_from_smem  = 1'b0;
+                            op_args.tcu.fmt_s        = '0;
+                            op_args.tcu.fmt_d        = '0;
+                            op_args.tcu.step_m       = '0;
+                            op_args.tcu.step_n       = '0;
+                            op_args.tcu.step_k       = '0;
+                            op_args.tcu.is_first_uop = 1'b0;
+                            op_args.tcu.is_last_uop  = 1'b0;
+                            case (funct3)
+                            3'h3: begin
+                                // TMEM_ALLOC — rd receives the handle, rs1 carries ncols
+                                op_type = INST_OP_BITS'(INST_TCU_TMEM_ALLOC);
+                                `USED_IREG (rd);
+                                `USED_IREG (rs1);
+                            end
+                            3'h4: begin
+                                // TMEM_DEALLOC — rs1 carries the handle to free
+                                op_type = INST_OP_BITS'(INST_TCU_TMEM_DEALLOC);
+                                `USED_IREG (rs1);
+                            end
+                            3'h5: begin
+                                // TMEM_ST — rs1=tmem_addr, rs2=value
+                                op_type = INST_OP_BITS'(INST_TCU_TMEM_ST);
+                                `USED_IREG (rs1);
+                                `USED_FREG (rs2);
+                            end
+                            3'h6: begin
+                                // TMEM_LD — rd=result, rs1=tmem_addr
+                                op_type = INST_OP_BITS'(INST_TCU_TMEM_LD);
+                                `USED_FREG (rd);
+                                `USED_IREG (rs1);
+                            end
+                            default: begin // 3'h7: UMMA
+                                // A/B from SMEM via descriptors (shares WGMMA's
+                                // tbuf/lockstep path), C/D accumulator in TMEM.
+                                // rs2[3:1] carries the NRC encoding (0..4 -> 8/16/32/
+                                // 64/128); repurposed onto {a_from_smem,
+                                // cd_nregs} since UMMA has no dedicated NRC
+                                // field in the packed tcu_args_t
+                                op_type = INST_OP_BITS'(INST_TCU_UMMA);
+                                op_args.tcu.cd_nregs    = rs2[2:1];
+                                op_args.tcu.a_from_smem = rs2[3];
+                                op_args.tcu.fmt_s       = rs1[4:0];
+                                op_args.tcu.fmt_d       = rd[4:0];
+                            end
+                            endcase
+                        end else
+                    `endif
                         begin
                             // WMMA / WGMMA (dense or sparse).
                     `ifdef VX_CFG_TCU_SPARSE_ENABLE

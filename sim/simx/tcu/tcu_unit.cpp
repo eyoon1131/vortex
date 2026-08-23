@@ -1325,13 +1325,16 @@ public:
     cur_xtile_n_ = xtileN;
     uint32_t use_handle = umma_handle_[wid];
 
+    // TMEM lane addressing uses this warp's CTA-local rank
+    uint32_t cta_rank = core_->scheduler().warp(wid).cta_csrs.cta_rank;
+
     // Bounds check once per uop rather than per element.
     auto alloc_it = tmem_allocs_.find(use_handle);
     if (alloc_it == tmem_allocs_.end()) {
       std::cout << "Error: UMMA invalid TMEM handle " << use_handle << std::endl;
       std::abort();
     }
-    uint32_t max_lane = wid * xtileM + step_m * cfg::tcM + cfg::tcM;
+    uint32_t max_lane = cta_rank * xtileM + step_m * cfg::tcM + cfg::tcM;
     if (max_lane > kTmemLanes) {
       std::cout << "Error: UMMA lane range exceeds kTmemLanes=" << kTmemLanes << std::endl;
       std::abort();
@@ -1367,7 +1370,7 @@ public:
     PFN_FEDP_N fedp = select_FEDP_N(fmt_s, fmt_d);
     for (uint32_t i = 0; i < cfg::tcM; ++i) {
       for (uint32_t j = 0; j < cfg::tcN; ++j) {
-        uint32_t lane = wid * xtileM + step_m * cfg::tcM + i;
+        uint32_t lane = cta_rank * xtileM + step_m * cfg::tcM + i;
         uint32_t col  = use_handle + step_n * cfg::tcN + j;
         auto a_row = &a_tile[i * k_words];
         auto b_col = &b_tile[(i * cfg::tcN + j) * k_words];
@@ -1684,7 +1687,10 @@ private:
   // SM-scoped instead of per-TC (which would also break the
   // CTA-scoped handle cache in tmem_alloc()/tmem_dealloc()).
   static constexpr uint32_t kTmemCols  = 256;
-  static constexpr uint32_t kTmemLanes = VX_CFG_NUM_THREADS * VX_CFG_NUM_WARPS;
+  // Lanes are sized to one warpgroup's width (VX_CFG_NUM_TCU_BLOCKS) and
+  // shared/reused across concurrent warpgroups, addressed by each warp's
+  // CTA-local rank
+  static constexpr uint32_t kTmemLanes = VX_CFG_NUM_THREADS * VX_CFG_NUM_TCU_BLOCKS;
   static_assert(kTmemLanes <= 128, "TMEM lanes exceed cap");
 
   std::array<std::array<uint32_t, kTmemCols>, kTmemLanes> tmem_data_{};

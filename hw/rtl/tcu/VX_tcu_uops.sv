@@ -57,17 +57,26 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
     localparam MAX_WG_UOPS_DENSE = TCU_WG_UOPS;
   `endif
     localparam CTR_W_MAX_WMMA = MAX_UOPS > MAX_WG_UOPS_DENSE ? MAX_UOPS : MAX_WG_UOPS_DENSE;
-    localparam CTR_W_BASE = $clog2(CTR_W_MAX_WMMA > MAX_WG_UOPS_SP ? CTR_W_MAX_WMMA : MAX_WG_UOPS_SP);
+    localparam CTR_W_BASE0 = $clog2(CTR_W_MAX_WMMA > MAX_WG_UOPS_SP ? CTR_W_MAX_WMMA : MAX_WG_UOPS_SP);
   `else
   `ifdef VX_CFG_TCU_FEDP2K
     localparam MAX_WG_UOPS_DENSE = TCU_WG_UOPS + 1;
   `else
     localparam MAX_WG_UOPS_DENSE = TCU_WG_UOPS;
   `endif
-    localparam CTR_W_BASE = $clog2(MAX_UOPS > MAX_WG_UOPS_DENSE ? MAX_UOPS : MAX_WG_UOPS_DENSE);
+    localparam CTR_W_BASE0 = $clog2(MAX_UOPS > MAX_WG_UOPS_DENSE ? MAX_UOPS : MAX_WG_UOPS_DENSE);
   `endif
 `else
-    localparam CTR_W_BASE = $clog2(MAX_UOPS);
+    localparam CTR_W_BASE0 = $clog2(MAX_UOPS);
+`endif
+    // UMMA's own NRC ceiling (128) exceeds WGMMA's (32), so its worst-case
+    // uop count (128 * TCU_WG_K_STEPS, up to 256) needs its own entry
+`ifdef TCU_TMEM_ENABLE
+    localparam MAX_UMMA_UOPS = 128 * TCU_WG_K_STEPS;
+    localparam CTR_W_UMMA = $clog2(MAX_UMMA_UOPS);
+    localparam CTR_W_BASE = (CTR_W_BASE0 > CTR_W_UMMA) ? CTR_W_BASE0 : CTR_W_UMMA;
+`else
+    localparam CTR_W_BASE = CTR_W_BASE0;
 `endif
     localparam CTR_W = (CTR_W_BASE > IDX_BITS) ? CTR_W_BASE : IDX_BITS;
     `STATIC_ASSERT (CTR_W <= UOP_CTR_W, ("invalid parameter"))
@@ -211,6 +220,69 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
     end
 `endif
 
+`ifdef TCU_TMEM_ENABLE
+    // UMMA: A/B from SMEM via descriptors (fixed regs x10/x11, same as
+    // WGMMA's smem-A convention), C/D accumulator in TMEM addressed via a
+    // handle carried in a fixed reg (x12)
+    wire is_umma = (ibuf_in.op_type == INST_TCU_UMMA);
+    wire is_first_uop_umma = (ctr == '0);
+
+    // NRC encoding (0..4 -> 8/16/32/64/128) repurposed onto {a_from_smem,
+    // cd_nregs}
+    wire [2:0] umma_nrc_enc = {ibuf_in.op_args.tcu.a_from_smem, ibuf_in.op_args.tcu.cd_nregs};
+
+    localparam LG_N_UMMA_MAX = $clog2(TCU_UMMA_N_STEPS); // 6 (NRC=128)
+
+    localparam UMMA_UOPS_NR8   =   8 * TCU_WG_K_STEPS;
+    localparam UMMA_UOPS_NR16  =  16 * TCU_WG_K_STEPS;
+    localparam UMMA_UOPS_NR32  =  32 * TCU_WG_K_STEPS;
+    localparam UMMA_UOPS_NR64  =  64 * TCU_WG_K_STEPS;
+    localparam UMMA_UOPS_NR128 = 128 * TCU_WG_K_STEPS;
+
+    reg [UOP_CTR_W-1:0] umma_uop_cnt;
+    always_comb begin
+        case (umma_nrc_enc)
+            3'd0: umma_uop_cnt = UOP_CTR_W'(UMMA_UOPS_NR8);
+            3'd1: umma_uop_cnt = UOP_CTR_W'(UMMA_UOPS_NR16);
+            3'd2: umma_uop_cnt = UOP_CTR_W'(UMMA_UOPS_NR32);
+            3'd3: umma_uop_cnt = UOP_CTR_W'(UMMA_UOPS_NR64);
+            default: umma_uop_cnt = UOP_CTR_W'(UMMA_UOPS_NR128);
+        endcase
+    end
+
+    // K-outer index extraction, same shape as WGMMA's:
+    //   ctr = k * (n_steps * m_steps) + n * m_steps + m
+    // m is always bit 0 (m_steps=2); n's width varies by NRC, so k's bit
+    // position shifts accordingly
+    wire [`UP(LG_M_WG)-1:0] umma_m_index = ctr[0 +: `UP(LG_M_WG)];
+    reg [`UP(LG_K_WG)-1:0] umma_k_index;
+    reg [`UP(LG_N_UMMA_MAX)-1:0] umma_n_index;
+    always_comb begin
+        case (umma_nrc_enc)
+            3'd0: begin // NRC=8, n_steps=4
+                umma_n_index = `UP(LG_N_UMMA_MAX)'(ctr[LG_M_WG +: 2]);
+                umma_k_index = `UP(LG_K_WG)'(ctr[LG_M_WG + 2 +: `UP(LG_K_WG)]);
+            end
+            3'd1: begin // NRC=16, n_steps=8
+                umma_n_index = `UP(LG_N_UMMA_MAX)'(ctr[LG_M_WG +: 3]);
+                umma_k_index = `UP(LG_K_WG)'(ctr[LG_M_WG + 3 +: `UP(LG_K_WG)]);
+            end
+            3'd2: begin // NRC=32, n_steps=16
+                umma_n_index = `UP(LG_N_UMMA_MAX)'(ctr[LG_M_WG +: 4]);
+                umma_k_index = `UP(LG_K_WG)'(ctr[LG_M_WG + 4 +: `UP(LG_K_WG)]);
+            end
+            3'd3: begin // NRC=64, n_steps=32
+                umma_n_index = `UP(LG_N_UMMA_MAX)'(ctr[LG_M_WG +: 5]);
+                umma_k_index = `UP(LG_K_WG)'(ctr[LG_M_WG + 5 +: `UP(LG_K_WG)]);
+            end
+            default: begin // NRC=128, n_steps=64
+                umma_n_index = `UP(LG_N_UMMA_MAX)'(ctr[LG_M_WG +: 6]);
+                umma_k_index = `UP(LG_K_WG)'(ctr[LG_M_WG + 6 +: `UP(LG_K_WG)]);
+            end
+        endcase
+    end
+`endif
+
 `ifdef VX_CFG_TCU_SPARSE_ENABLE
     // is_sparse covers WMMA_SP (and WGMMA_SP, since the WGMMA path branches earlier).
     wire is_sparse = (ibuf_in.op_type == INST_TCU_WMMA_SP)
@@ -223,6 +295,9 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
     // Dense FEDP2K RS adds one descriptor setup uop. Other WGMMA modes fuse
     // descriptor transport into their first compute uop.
     assign uop_count =
+`ifdef TCU_TMEM_ENABLE
+        is_umma ? umma_uop_cnt :
+`endif
 `ifdef VX_CFG_TCU_WGMMA_ENABLE
         is_wgmma ? wg_uop_cnt :
 `endif
@@ -347,11 +422,28 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
         n_sp_s = '0;
         m_sp_s = '0;
     `endif
+    `ifdef TCU_TMEM_ENABLE
+        if (is_umma) begin
+            ibuf_r.op_args.tcu.step_m = 3'(umma_m_index);
+            ibuf_r.op_args.tcu.step_n = 6'(umma_n_index);
+            ibuf_r.op_args.tcu.step_k = 3'(umma_k_index);
+            // No register writeback
+            ibuf_r.wb = 1'b0;
+            // A descriptor (x10), B descriptor (x11), TMEM handle (x12)
+            // all fixed integer regs, read once on the first uop only
+            ibuf_r.rs1 = make_reg_num(REG_TYPE_I, 5'd10);
+            ibuf_r.rs2 = make_reg_num(REG_TYPE_I, 5'd11);
+            ibuf_r.rs3 = make_reg_num(REG_TYPE_I, 5'd12);
+            ibuf_r.used_rs[0] = is_first_uop_umma;
+            ibuf_r.used_rs[1] = is_first_uop_umma;
+            ibuf_r.used_rs[2] = is_first_uop_umma;
+        end else
+    `endif
     `ifdef VX_CFG_TCU_WGMMA_ENABLE
         if (is_wgmma) begin
-            ibuf_r.op_args.tcu.step_m = is_wg_setup_uop ? 4'd0 : 4'(wg_m_index);
-            ibuf_r.op_args.tcu.step_n = is_wg_setup_uop ? 4'd0 : 4'(wg_n_index);
-            ibuf_r.op_args.tcu.step_k = is_wg_setup_uop ? 4'd0 : 4'(wg_k_index);
+            ibuf_r.op_args.tcu.step_m = is_wg_setup_uop ? 3'd0 : 3'(wg_m_index);
+            ibuf_r.op_args.tcu.step_n = is_wg_setup_uop ? 6'd0 : 6'(wg_n_index);
+            ibuf_r.op_args.tcu.step_k = is_wg_setup_uop ? 3'd0 : 3'(wg_k_index);
             ibuf_r.wb  = !is_wg_setup_uop;
             ibuf_r.rd  = make_reg_num(REG_TYPE_F, TCU_WG_RC + wg_rs3_off);
             ibuf_r.rs3 = make_reg_num(REG_TYPE_F, TCU_WG_RC + wg_rs3_off);
@@ -391,9 +483,9 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
             m_sp_s = 4'(eff_ctr[(LG_N + LG_K) +: LG_M]);
         end
 
-        ibuf_r.op_args.tcu.step_m = SYM_SPARSE && is_sparse ? 4'(m_sp_s) : 4'(m_index);
-        ibuf_r.op_args.tcu.step_n = SYM_SPARSE && is_sparse ? 4'(n_sp_s >> LG_K) : 4'(n_index);
-        ibuf_r.op_args.tcu.step_k = SYM_SPARSE && is_sparse ? 4'(0)      : 4'(k_index);
+        ibuf_r.op_args.tcu.step_m = SYM_SPARSE && is_sparse ? 3'(m_sp_s) : 3'(m_index);
+        ibuf_r.op_args.tcu.step_n = SYM_SPARSE && is_sparse ? 6'(n_sp_s >> LG_K) : 6'(n_index);
+        ibuf_r.op_args.tcu.step_k = SYM_SPARSE && is_sparse ? 3'(0)      : 3'(k_index);
         ibuf_r.wb = 1'b1;
         ibuf_r.rd = make_reg_num(REG_TYPE_F, rs3);
         ibuf_r.rs1 = make_reg_num(REG_TYPE_F, rs1);
@@ -403,9 +495,9 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
         ibuf_r.used_rs[1] = 1'b1;
         ibuf_r.used_rs[2] = 1'b1;
     `else
-        ibuf_r.op_args.tcu.step_m = 4'(m_index);
-        ibuf_r.op_args.tcu.step_n = 4'(n_index);
-        ibuf_r.op_args.tcu.step_k = 4'(k_index);
+        ibuf_r.op_args.tcu.step_m = 3'(m_index);
+        ibuf_r.op_args.tcu.step_n = 6'(n_index);
+        ibuf_r.op_args.tcu.step_k = 3'(k_index);
         ibuf_r.wb  = 1'b1;
         ibuf_r.rd  = make_reg_num(REG_TYPE_F, rs3);
         ibuf_r.rs1 = make_reg_num(REG_TYPE_F, rs1);
@@ -416,6 +508,16 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
         ibuf_r.used_rs[2] = 1'b1;
     `endif
         end
+    `ifdef TCU_TMEM_ENABLE
+        if (is_umma) begin
+            ibuf_r.fu_lock   = (uop_idx == '0);
+            ibuf_r.fu_unlock = (uop_idx == (uop_count - UOP_CTR_W'(1)));
+            // No is_wg_setup_uop-equivalent exclusion needed: that only exists for
+            // WGMMA's RS mode
+            ibuf_r.op_args.tcu.is_first_uop = is_first_uop_umma;
+            ibuf_r.op_args.tcu.is_last_uop  = (uop_idx == (uop_count - UOP_CTR_W'(1)));
+        end else
+    `endif
     `ifdef VX_CFG_TCU_WGMMA_ENABLE
         if (is_wgmma) begin
             ibuf_r.fu_lock   = (uop_idx == '0);

@@ -1302,10 +1302,10 @@ public:
 
   // Initialize this warp's accumulator tile in TMEM to `value`.
   static __attribute__((always_inline)) void fill_tmem(uint32_t handle, output_t value) {
-    uint32_t wid = vx_warp_id();
+    uint32_t rank = vx_cta_rank();
     constexpr uint32_t rows_per_thread = xtileM / NT;
     for (uint32_t r = 0; r < rows_per_thread; ++r) {
-      uint32_t lane_base = wid * xtileM + r * NT;
+      uint32_t lane_base = rank * xtileM + r * NT;
       for (uint32_t col = 0; col < xtileN; ++col) {
         vx_tmem_st(vx_make_tmem_addr(lane_base, handle + col), static_cast<float>(value));
       }
@@ -1340,27 +1340,23 @@ public:
     );
   }
 
-  // Store this warp's accumulator tile from TMEM to global memory.
-  // `rank` is this warp's CTA-relative index (e.g. tid/NT), distinct from
-  // vx_warp_id(), which is the global hardware wid TMEM addressing uses.
+  // Store this warp's accumulator tile from TMEM to global memory
   static __attribute__((always_inline)) void store_output(uint32_t handle,
                                                           output_t* C_global,
                                                           uint32_t  tile_row,
                                                           uint32_t  tile_col,
-                                                          uint32_t  N,
-                                                          uint32_t  rank) {
+                                                          uint32_t  N) {
     uint32_t tid = vx_thread_id();
-    uint32_t wid = vx_warp_id();
+    uint32_t rank = vx_cta_rank();
     uint32_t tid_in_warp = tid % NT;
     constexpr uint32_t rows_per_thread = xtileM / NT;
 
     for (uint32_t r = 0; r < rows_per_thread; ++r) {
-      uint32_t lane_base  = wid * xtileM + r * NT;   // TMEM address: global wid
-      uint32_t local_base = rank * xtileM + r * NT;  // output row: CTA-relative
-      uint32_t out_row   = tile_row + local_base + tid_in_warp;
-      output_t* row_ptr  = C_global + out_row * N + tile_col;
+      uint32_t base = rank * xtileM + r * NT;
+      uint32_t out_row  = tile_row + base + tid_in_warp;
+      output_t* row_ptr = C_global + out_row * N + tile_col;
       for (uint32_t col = 0; col < xtileN; ++col) {
-        row_ptr[col] = static_cast<output_t>(vx_tmem_ld(vx_make_tmem_addr(lane_base, handle + col)));
+        row_ptr[col] = static_cast<output_t>(vx_tmem_ld(vx_make_tmem_addr(base, handle + col)));
       }
     }
   }

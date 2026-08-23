@@ -45,8 +45,8 @@ module VX_tcu_meta import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // Unified read port (warp id from the FEDP path).
     input wire [NW_WIDTH-1:0]      rd_wid
 `ifdef VX_CFG_TCU_SPARSE_ENABLE
-    , input wire [3:0]             step_m
-    , input wire [3:0]             step_k
+    , input wire [2:0]             step_m
+    , input wire [2:0]             step_k
     , output wire [TCU_MAX_META_BLOCK_WIDTH-1:0] vld_block
 `endif
 `ifdef VX_CFG_TCU_MX_ENABLE
