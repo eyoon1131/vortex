@@ -1690,7 +1690,7 @@ private:
   // Lanes are sized to one warpgroup's width (VX_CFG_NUM_TCU_BLOCKS) and
   // shared/reused across concurrent warpgroups, addressed by each warp's
   // CTA-local rank
-  static constexpr uint32_t kTmemLanes = VX_CFG_NUM_THREADS * VX_CFG_NUM_TCU_BLOCKS;
+  static constexpr uint32_t kTmemLanes = wg_cfg::xtileM * VX_CFG_NUM_TCU_BLOCKS;
   static_assert(kTmemLanes <= 128, "TMEM lanes exceed cap");
 
   std::array<std::array<uint32_t, kTmemCols>, kTmemLanes> tmem_data_{};

@@ -87,6 +87,7 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     localparam BANK_IDX_W  = `LOG2UP(BLOCK_SIZE);
     localparam ROW_IDX_W   = `LOG2UP(TCU_WG_TILE_M);
     localparam COL_IDX_W   = `LOG2UP(TCU_TC_N);
+    localparam COL_SEL_W   = $clog2(TCU_TC_N);
     localparam ARB_W       = 2 * BLOCK_SIZE;
     localparam ARB_IDX_W   = `LOG2UP(ARB_W);
 
@@ -120,14 +121,15 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
     for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_compute_decode
         // TCU_WG_TILE_M and TCU_TC_N are always powers of 2 so
-        // lane_base/col_base are bit-sliced
+        // lane_base/col_base are bit-sliced. Word uses COL_SEL_W (the true
+        // bit count), not COL_IDX_W
         assign rd_bank[bi] = BANK_IDX_W'(rd_lane_base[bi][TCU_TMEM_LANE_BITS-1:ROW_IDX_W]);
         assign rd_row0[bi] = ROW_IDX_W'(rd_lane_base[bi][ROW_IDX_W-1:0]);
-        assign rd_word[bi] = BANK_ADDR_W'(rd_col_base[bi][TCU_TMEM_COL_BITS-1:COL_IDX_W]);
+        assign rd_word[bi] = BANK_ADDR_W'(rd_col_base[bi][TCU_TMEM_COL_BITS-1:COL_SEL_W]);
 
         assign wrb_bank[bi] = BANK_IDX_W'(wr_lane_base[bi][TCU_TMEM_LANE_BITS-1:ROW_IDX_W]);
         assign wrb_row0[bi] = ROW_IDX_W'(wr_lane_base[bi][ROW_IDX_W-1:0]);
-        assign wrb_word[bi] = BANK_ADDR_W'(wr_col_base[bi][TCU_TMEM_COL_BITS-1:COL_IDX_W]);
+        assign wrb_word[bi] = BANK_ADDR_W'(wr_col_base[bi][TCU_TMEM_COL_BITS-1:COL_SEL_W]);
     end
 
     wire [BLOCK_SIZE-1:0] is_tmem_ld;
@@ -146,8 +148,12 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
         assign ldst_bank[bi] = BANK_IDX_W'(ldst_lane[TCU_TMEM_LANE_BITS-1:ROW_IDX_W]);
         assign ldst_row0[bi] = ROW_IDX_W'(ldst_lane[ROW_IDX_W-1:0]);
-        assign ldst_word[bi] = BANK_ADDR_W'(ldst_addr_col[TCU_TMEM_COL_BITS-1:COL_IDX_W]);
-        assign ldst_col[bi]  = COL_IDX_W'(ldst_addr_col[COL_IDX_W-1:0]);
+        assign ldst_word[bi] = BANK_ADDR_W'(ldst_addr_col[TCU_TMEM_COL_BITS-1:COL_SEL_W]);
+        if (COL_SEL_W == 0) begin : g_col_trivial
+            assign ldst_col[bi] = '0;
+        end else begin : g_col_real
+            assign ldst_col[bi] = COL_IDX_W'(ldst_addr_col[COL_SEL_W-1:0]);
+        end
     end
 
     // -----------------------------------------------------------------------
@@ -471,20 +477,46 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     end
 
 `ifdef PERF_ENABLE
+    // Elements read/written this cycle: a granted UMMA compute access moves
+    // a whole TCU_TC_M x TCU_TC_N tile; a granted TMEM_LD/ST moves one
+    // element per active thread.
+    logic [PERF_CTR_BITS-1:0] tmem_reads_this_cycle;
+    logic [PERF_CTR_BITS-1:0] tmem_writes_this_cycle;
+    always_comb begin
+        tmem_reads_this_cycle  = '0;
+        tmem_writes_this_cycle = '0;
+        for (integer bi = 0; bi < BLOCK_SIZE; ++bi) begin
+            if (rd_grant[bi])    tmem_reads_this_cycle  += PERF_CTR_BITS'(TCU_TC_M * TCU_TC_N);
+            if (ldst_rd_won[bi]) tmem_reads_this_cycle  += PERF_CTR_BITS'($countones(mgmt_data[bi].header.tmask));
+            if (wr_grant[bi])    tmem_writes_this_cycle += PERF_CTR_BITS'(TCU_TC_M * TCU_TC_N);
+            if (ldst_wr_won[bi]) tmem_writes_this_cycle += PERF_CTR_BITS'($countones(mgmt_data[bi].header.tmask));
+        end
+    end
+
     // Bank-conflict stall counting
     logic [PERF_CTR_BITS-1:0] tmem_bank_stalls_r;
+    logic [PERF_CTR_BITS-1:0] umma_instrs_r;
+    logic [PERF_CTR_BITS-1:0] tmem_reads_r;
+    logic [PERF_CTR_BITS-1:0] tmem_writes_r;
     always @(posedge clk) begin
         if (reset) begin
             tmem_bank_stalls_r <= '0;
+            umma_instrs_r      <= '0;
+            tmem_reads_r       <= '0;
+            tmem_writes_r      <= '0;
         end else begin
             tmem_bank_stalls_r <= tmem_bank_stalls_r
                 + PERF_CTR_BITS'($countones(bank_rd_conflict))
                 + PERF_CTR_BITS'($countones(bank_wr_conflict));
+            // UMMA writeback is granted once per completed micro-op
+            umma_instrs_r <= umma_instrs_r + PERF_CTR_BITS'($countones(wr_grant));
+            tmem_reads_r  <= tmem_reads_r  + tmem_reads_this_cycle;
+            tmem_writes_r <= tmem_writes_r + tmem_writes_this_cycle;
         end
     end
-    assign tcu_perf.umma_instrs      = '0;
-    assign tcu_perf.tmem_reads       = '0;
-    assign tcu_perf.tmem_writes      = '0;
+    assign tcu_perf.umma_instrs      = umma_instrs_r;
+    assign tcu_perf.tmem_reads       = tmem_reads_r;
+    assign tcu_perf.tmem_writes      = tmem_writes_r;
     assign tcu_perf.tmem_bank_stalls = tmem_bank_stalls_r;
 `endif
 

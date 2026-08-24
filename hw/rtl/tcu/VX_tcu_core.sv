@@ -205,14 +205,14 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // rs3 (the handle register, x12/a2) is only populated by the register
     // file on the macro-op's first micro-op. Must be latched on the first uop and
     // reused for the rest of the macro-op.
-    reg [31:0] umma_handle_r;
+    reg [TCU_TMEM_COL_BITS-1:0] umma_handle_r;
     always @(posedge clk) begin
         if (execute_fire && is_umma && execute_if.data.op_args.tcu.is_first_uop) begin
-            umma_handle_r <= execute_if.data.rs3_data[0];
+            umma_handle_r <= TCU_TMEM_COL_BITS'(execute_if.data.rs3_data[0]);
         end
     end
-    wire [31:0] umma_handle = execute_if.data.op_args.tcu.is_first_uop
-        ? execute_if.data.rs3_data[0] : umma_handle_r;
+    wire [TCU_TMEM_COL_BITS-1:0] umma_handle = execute_if.data.op_args.tcu.is_first_uop
+        ? TCU_TMEM_COL_BITS'(execute_if.data.rs3_data[0]) : umma_handle_r;
 `endif
 
     wire execute_fire = execute_if.valid && execute_if.ready;
@@ -313,22 +313,29 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // Tile-origin address for the incoming uop (pre +i/+j offset)
     wire [TCU_TMEM_LANE_BITS-1:0] umma_lane_base = TCU_TMEM_LANE_BITS'(cta_rank) * TCU_TMEM_LANE_BITS'(TCU_WG_TILE_M)
                                                   + TCU_TMEM_LANE_BITS'(step_m) * TCU_TMEM_LANE_BITS'(TCU_TC_M);
-    wire [TCU_TMEM_COL_BITS-1:0]  umma_col_base  = TCU_TMEM_COL_BITS'(umma_handle)
+    wire [TCU_TMEM_COL_BITS-1:0]  umma_col_base  = umma_handle
                                                   + TCU_TMEM_COL_BITS'(step_n) * TCU_TMEM_COL_BITS'(TCU_TC_N);
 
     // Read request to VX_tcu_tmem: this op's tile origin, valid whenever a
     // new UMMA op is admitted. tmem_rd_valid marks whether there's a
-    // pending request this cycle. 
+    // pending request this cycle.
     // Gated on ~umma_hazard: with registered read the fetch and admission
     // are different cycles. Submitting the request while a hazard is live
     // would still win bank arbitration and latch stale data that cycle,
     // which could get captured once the hazard clears one cycle later
     // without refetching.
-    // Also gated on ~tmem_rd_grant: with registered read same request
-    // would resubmit and could win bank arbitration a second time while
-    // its first grant is still being consumed, producing stale extra
-    // grant
-    assign tmem_rd_valid     = is_umma && execute_if.valid && ~umma_hazard && ~tmem_rd_grant;
+    // Also gated on ~umma_rd_won: stays high from the grant cycle through
+    // to the cycle this op is actually admitted (execute_fire), then
+    // drops so the next op's request is unsuppressed.
+    reg umma_rd_won_r;
+    always @(posedge clk) begin
+        if (reset)             umma_rd_won_r <= 1'b0;
+        else if (execute_fire) umma_rd_won_r <= 1'b0;
+        else if (tmem_rd_grant) umma_rd_won_r <= 1'b1;
+    end
+    wire umma_rd_won = tmem_rd_grant || umma_rd_won_r;
+
+    assign tmem_rd_valid     = is_umma && execute_if.valid && ~umma_hazard && ~umma_rd_won;
     assign tmem_rd_lane_base = umma_lane_base;
     assign tmem_rd_col_base  = umma_col_base;
 
@@ -375,9 +382,9 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     end
     wire umma_hazard = is_umma && (|umma_hazard_match);
 
-    // Bank-port stall: this op's TMEM read lost arbitration to another
-    // block targeting the same bank this cycle. Retries next cycle.
-    wire umma_rd_stall = is_umma && ~tmem_rd_grant;
+    // Bank-port stall: this op's TMEM read hasn't won its bank yet (or is
+    // won and waiting on other admission conditions). Retries next cycle.
+    wire umma_rd_stall = is_umma && ~umma_rd_won;
 
     // TMEM write fires the same cycle fedp_done does, for whichever uop is
     // now at position 0. tmem_addr_pipe[0].valid is 0 for non-UMMA uops.
