@@ -1097,6 +1097,7 @@ package VX_gpu_pkg;
         logic [PERF_CTR_BITS-1:0] umma_instrs;       // UMMA µops executed
         logic [PERF_CTR_BITS-1:0] tmem_reads;        // TMEM elements read (UMMA C + tmem_ld)
         logic [PERF_CTR_BITS-1:0] tmem_writes;       // TMEM elements written (UMMA D + tmem_st)
+        logic [PERF_CTR_BITS-1:0] tmem_bank_stalls;  // cycles: a TMEM bank request (compute or tmem_ld/st) lost arbitration and retried
 `endif
     } tcu_perf_t;
 `endif

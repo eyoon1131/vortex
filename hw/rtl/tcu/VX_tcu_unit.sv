@@ -303,14 +303,17 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     end
 
     // UMMA compute read (operand C) / writeback ports to/from tcu_core.
+    wire [BLOCK_SIZE-1:0]                   tmem_rd_valid;
     wire [TCU_TMEM_LANE_BITS-1:0]           tmem_rd_lane_base [BLOCK_SIZE];
     wire [TCU_TMEM_COL_BITS-1:0]            tmem_rd_col_base  [BLOCK_SIZE];
+    wire [BLOCK_SIZE-1:0]                   tmem_rd_grant;
     wire [TCU_TC_M-1:0][TCU_TC_N-1:0][31:0] tmem_rd_data      [BLOCK_SIZE];
 
-    wire                                    tmem_wr_en        [BLOCK_SIZE];
+    wire                                    tmem_wr_valid     [BLOCK_SIZE];
     wire [TCU_TMEM_LANE_BITS-1:0]           tmem_wr_lane_base [BLOCK_SIZE];
     wire [TCU_TMEM_COL_BITS-1:0]            tmem_wr_col_base  [BLOCK_SIZE];
     wire [TCU_TC_M-1:0][TCU_TC_N-1:0][31:0] tmem_wr_data      [BLOCK_SIZE];
+    wire [BLOCK_SIZE-1:0]                   tmem_wr_grant;
 
     VX_tcu_tmem #(
         .INSTANCE_ID (`SFORMATF(("%s-tmem", INSTANCE_ID))),
@@ -327,13 +330,16 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         .result_valid  (tmem_result_valid_w),
         .result_data   (tmem_result_data_w),
         .result_ready  (tmem_result_ready_w),
+        .rd_valid      (tmem_rd_valid),
         .rd_lane_base  (tmem_rd_lane_base),
         .rd_col_base   (tmem_rd_col_base),
+        .rd_grant      (tmem_rd_grant),
         .rd_data       (tmem_rd_data),
-        .wr_en         (tmem_wr_en),
+        .wr_valid      (tmem_wr_valid),
         .wr_lane_base  (tmem_wr_lane_base),
         .wr_col_base   (tmem_wr_col_base),
-        .wr_data       (tmem_wr_data)
+        .wr_data       (tmem_wr_data),
+        .wr_grant      (tmem_wr_grant)
     );
 `endif // TCU_TMEM_ENABLE
 
@@ -360,13 +366,16 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         `endif
         `ifdef TCU_TMEM_ENABLE
             .cta_rank         (block_cta_rank),
+            .tmem_rd_valid    (tmem_rd_valid[block_idx]),
             .tmem_rd_lane_base(tmem_rd_lane_base[block_idx]),
             .tmem_rd_col_base (tmem_rd_col_base[block_idx]),
+            .tmem_rd_grant    (tmem_rd_grant[block_idx]),
             .tmem_rd_data     (tmem_rd_data[block_idx]),
-            .tmem_wr_en       (tmem_wr_en[block_idx]),
+            .tmem_wr_valid    (tmem_wr_valid[block_idx]),
             .tmem_wr_lane_base(tmem_wr_lane_base[block_idx]),
             .tmem_wr_col_base (tmem_wr_col_base[block_idx]),
             .tmem_wr_data     (tmem_wr_data[block_idx]),
+            .tmem_wr_grant    (tmem_wr_grant[block_idx]),
         `endif
         `ifdef TCU_META_ENABLE
             .ext_meta_wr_en   (agu_meta_wr_en),

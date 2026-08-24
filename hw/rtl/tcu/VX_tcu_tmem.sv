@@ -21,7 +21,17 @@
 // VX_tcu_tmem_alloc: one block's ALLOC-or-DEALLOC request is arbitrated to
 // a single winner per cycle. alloc() only ever reserves a column range —
 // it does not initialize TMEM contents, so the allocator has no dependency
-// on tmem_data
+// on bank storage.
+//
+// Storage is BLOCK_SIZE banks, one per cta_rank. Bank r holds the
+// TCU_WG_TILE_M-row lane range belonging to cta_rank r. Each bank word
+// spans the bank's entire row range (TCU_WG_TILE_M rows x TCU_TC_N cols),
+// addressed by column-group (col / TCU_TC_N):
+//   - compute reads/writes access a TCU_TC_M-row sub-range of one word,
+//     selected by step_m
+//   - TMEM_LD/TMEM_ST are NUM_THREADS-wide at a single column
+// Every bank is a single-read/single-write port. Losing requesters
+// stall and retry next cycle.
 
 module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     parameter `STRING INSTANCE_ID = "",
@@ -46,83 +56,341 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
     // UMMA compute read (operand C) — request is this op's tile origin
     // (lane_base/col_base, same value for every cell); response is the
-    // whole TC_M x TC_N tile
+    // whole TC_M x TC_N tile. rd_valid marks a pending request; rd_grant
+    // reports whether it won its bank's read port this cycle. The
+    // requester must not admit/consume the op unless granted.
+    input  wire [BLOCK_SIZE-1:0]                    rd_valid,
     input  wire [TCU_TMEM_LANE_BITS-1:0]            rd_lane_base [BLOCK_SIZE],
     input  wire [TCU_TMEM_COL_BITS-1:0]             rd_col_base  [BLOCK_SIZE],
+    output wire [BLOCK_SIZE-1:0]                    rd_grant,
     output wire [TCU_TC_M-1:0][TCU_TC_N-1:0][31:0]  rd_data      [BLOCK_SIZE],
 
-    // UMMA compute writeback, driven off the FEDP result once it retires
-    input wire                                     wr_en        [BLOCK_SIZE],
-    input wire [TCU_TMEM_LANE_BITS-1:0]            wr_lane_base [BLOCK_SIZE],
-    input wire [TCU_TMEM_COL_BITS-1:0]             wr_col_base  [BLOCK_SIZE],
-    input wire [TCU_TC_M-1:0][TCU_TC_N-1:0][31:0]  wr_data      [BLOCK_SIZE]
+    // UMMA compute writeback, driven off the FEDP result once it retires.
+    // wr_valid marks pending write request; wr_grant reports whether it won
+    // its bank's write port this cycle. The requester must hold retirement
+    // until granted.
+    input  wire                                    wr_valid     [BLOCK_SIZE],
+    input  wire [TCU_TMEM_LANE_BITS-1:0]           wr_lane_base [BLOCK_SIZE],
+    input  wire [TCU_TMEM_COL_BITS-1:0]            wr_col_base  [BLOCK_SIZE],
+    input  wire [TCU_TC_M-1:0][TCU_TC_N-1:0][31:0] wr_data      [BLOCK_SIZE],
+    output wire [BLOCK_SIZE-1:0]                   wr_grant
 );
     `UNUSED_SPARAM (INSTANCE_ID)
 
-    logic [31:0] tmem_data [TCU_TMEM_LANES][TCU_TMEM_COLS];
+    // -----------------------------------------------------------------------
+    // Bank storage: BLOCK_SIZE banks x BANK_WORDS column-groups x
+    // TCU_WG_TILE_M rows x TCU_TC_N cols
+    // -----------------------------------------------------------------------
+
+    localparam BANK_WORDS  = TCU_TMEM_COLS / TCU_TC_N;
+    localparam BANK_ADDR_W = `LOG2UP(BANK_WORDS);
+    localparam BANK_IDX_W  = `LOG2UP(BLOCK_SIZE);
+    localparam ROW_IDX_W   = `LOG2UP(TCU_WG_TILE_M);
+    localparam COL_IDX_W   = `LOG2UP(TCU_TC_N);
+    localparam ARB_W       = 2 * BLOCK_SIZE;
+    localparam ARB_IDX_W   = `LOG2UP(ARB_W);
+
+    // Per-bank storage
+
+    // OUT_REG=1, RDW_MODE="R" makes bank
+    // reads synchronous: rdata reflects whichever raddr/read was presented
+    // last cycle, one cycle after an arbitration win. Handled by delaying
+    // the read grant by one cycle. Writes are unaffected by OUT_REG so the
+    // write side is also unchanged. Could introduce a same-cycle read and
+    // write to same bank at same address returning stale data. Doesn't
+    // apply to the compute path due to existing RAW interlock
+    localparam BANK_DATAW = TCU_WG_TILE_M * TCU_TC_N * 32;
+    localparam BANK_WRENW = TCU_WG_TILE_M * TCU_TC_N;
+
+    wire [BANK_WRENW-1:0] bank_wren  [BLOCK_SIZE];
+    wire [BANK_DATAW-1:0] bank_wdata [BLOCK_SIZE];
+    wire [BANK_DATAW-1:0] bank_rdata [BLOCK_SIZE];
 
     // -----------------------------------------------------------------------
-    // UMMA compute read: decode once per (block, tile row), reuse across
-    // that row's TC_N columns, forward only the resulting tile.
+    // Decode every requester into {bank, word, local-row-origin[, local-col]}
     // -----------------------------------------------------------------------
-    for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_tmem_rd
-        for (genvar ii = 0; ii < TCU_TC_M; ++ii) begin : g_rd_row
-            wire [TCU_TMEM_LANE_BITS-1:0] rd_row = rd_lane_base[bi] + TCU_TMEM_LANE_BITS'(ii);
-            for (genvar jj = 0; jj < TCU_TC_N; ++jj) begin : g_rd_col
-                wire [TCU_TMEM_COL_BITS-1:0] rd_col = rd_col_base[bi] + TCU_TMEM_COL_BITS'(jj);
-                assign rd_data[bi][ii][jj] = tmem_data[rd_row][rd_col];
+
+    wire [BANK_IDX_W-1:0]  rd_bank [BLOCK_SIZE];
+    wire [BANK_ADDR_W-1:0] rd_word [BLOCK_SIZE];
+    wire [ROW_IDX_W-1:0]   rd_row0 [BLOCK_SIZE]; // = step_m*TCU_TC_M (tile row origin)
+
+    wire [BANK_IDX_W-1:0]  wrb_bank [BLOCK_SIZE];
+    wire [BANK_ADDR_W-1:0] wrb_word [BLOCK_SIZE];
+    wire [ROW_IDX_W-1:0]   wrb_row0 [BLOCK_SIZE];
+
+    for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_compute_decode
+        // TCU_WG_TILE_M and TCU_TC_N are always powers of 2 so
+        // lane_base/col_base are bit-sliced
+        assign rd_bank[bi] = BANK_IDX_W'(rd_lane_base[bi][TCU_TMEM_LANE_BITS-1:ROW_IDX_W]);
+        assign rd_row0[bi] = ROW_IDX_W'(rd_lane_base[bi][ROW_IDX_W-1:0]);
+        assign rd_word[bi] = BANK_ADDR_W'(rd_col_base[bi][TCU_TMEM_COL_BITS-1:COL_IDX_W]);
+
+        assign wrb_bank[bi] = BANK_IDX_W'(wr_lane_base[bi][TCU_TMEM_LANE_BITS-1:ROW_IDX_W]);
+        assign wrb_row0[bi] = ROW_IDX_W'(wr_lane_base[bi][ROW_IDX_W-1:0]);
+        assign wrb_word[bi] = BANK_ADDR_W'(wr_col_base[bi][TCU_TMEM_COL_BITS-1:COL_IDX_W]);
+    end
+
+    wire [BLOCK_SIZE-1:0] is_tmem_ld;
+    wire [BLOCK_SIZE-1:0] is_tmem_st;
+    wire [BANK_IDX_W-1:0]  ldst_bank [BLOCK_SIZE];
+    wire [BANK_ADDR_W-1:0] ldst_word [BLOCK_SIZE];
+    wire [ROW_IDX_W-1:0]   ldst_row0 [BLOCK_SIZE]; // base lane's local row (thread 0)
+    wire [COL_IDX_W-1:0]   ldst_col  [BLOCK_SIZE];
+
+    for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_ldst_decode
+        assign is_tmem_ld[bi] = mgmt_valid[bi] && (mgmt_data[bi].op_type == INST_TCU_TMEM_LD);
+        assign is_tmem_st[bi] = mgmt_valid[bi] && (mgmt_data[bi].op_type == INST_TCU_TMEM_ST);
+
+        wire [TCU_TMEM_LANE_BITS-1:0] ldst_lane     = TCU_TMEM_LANE_BITS'(mgmt_data[bi].rs1_data[0][31:16]);
+        wire [TCU_TMEM_COL_BITS-1:0]  ldst_addr_col = TCU_TMEM_COL_BITS'(mgmt_data[bi].rs1_data[0][15:0]);
+
+        assign ldst_bank[bi] = BANK_IDX_W'(ldst_lane[TCU_TMEM_LANE_BITS-1:ROW_IDX_W]);
+        assign ldst_row0[bi] = ROW_IDX_W'(ldst_lane[ROW_IDX_W-1:0]);
+        assign ldst_word[bi] = BANK_ADDR_W'(ldst_addr_col[TCU_TMEM_COL_BITS-1:COL_IDX_W]);
+        assign ldst_col[bi]  = COL_IDX_W'(ldst_addr_col[COL_IDX_W-1:0]);
+    end
+
+    // -----------------------------------------------------------------------
+    // Per-bank READ arbitration: compute-read and TMEM_LD share one
+    // unified, fairly-rotated pool per bank
+    // -----------------------------------------------------------------------
+
+    logic [ARB_IDX_W-1:0] rot_ctr;
+    always @(posedge clk) begin
+        if (reset) rot_ctr <= '0;
+        else       rot_ctr <= (rot_ctr == ARB_IDX_W'(ARB_W-1)) ? '0 : (rot_ctr + ARB_IDX_W'(1));
+    end
+
+    logic [31:0]            bank_rd_word [BLOCK_SIZE][TCU_WG_TILE_M][TCU_TC_N];
+    wire [BANK_ADDR_W-1:0]  bank_raddr [BLOCK_SIZE];
+    wire [ARB_W-1:0]        bank_rd_grant_onehot [BLOCK_SIZE];
+    wire [BLOCK_SIZE-1:0]   bank_rd_conflict;
+
+    for (genvar r = 0; r < BLOCK_SIZE; ++r) begin : g_rd_arb
+        wire [BLOCK_SIZE-1:0] cmp_req;
+        wire [BLOCK_SIZE-1:0] ldst_req;
+        for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_req
+            // ~ldst_rd_won[bi]: don't re-arbitrate a request that's already
+            // being granted this cycle
+            assign cmp_req[bi]  = rd_valid[bi] && (rd_bank[bi] == BANK_IDX_W'(r));
+            assign ldst_req[bi] = is_tmem_ld[bi] && (ldst_bank[bi] == BANK_IDX_W'(r)) && ~ldst_rd_won[bi];
+        end
+        wire [ARB_W-1:0] req_vec = {ldst_req, cmp_req};
+
+        wire [ARB_W-1:0] req_vec_rot;
+        for (genvar k = 0; k < ARB_W; ++k) begin : g_rotate_in
+            assign req_vec_rot[k] = req_vec[(k + rot_ctr) % ARB_W];
+        end
+
+        wire [ARB_W-1:0] grant_onehot_rot;
+        VX_priority_encoder #(
+            .N (ARB_W)
+        ) rd_arb (
+            .data_in    (req_vec_rot),
+            .onehot_out (grant_onehot_rot),
+            `UNUSED_PIN (index_out),
+            `UNUSED_PIN (valid_out)
+        );
+        for (genvar p = 0; p < ARB_W; ++p) begin : g_rotate_out
+            assign bank_rd_grant_onehot[r][p] = grant_onehot_rot[(p + ARB_W - rot_ctr) % ARB_W];
+        end
+
+        assign bank_rd_conflict[r] = $countones(req_vec) > 1;
+
+        logic [BANK_ADDR_W-1:0] winner_word;
+        always_comb begin
+            winner_word = '0;
+            for (integer bi = 0; bi < BLOCK_SIZE; ++bi) begin
+                if (bank_rd_grant_onehot[r][bi])              winner_word |= rd_word[bi];
+                if (bank_rd_grant_onehot[r][BLOCK_SIZE + bi]) winner_word |= ldst_word[bi];
+            end
+        end
+        assign bank_raddr[r] = winner_word;
+    end
+
+    // Bank's rdata this cycle reflects whichever raddr/read was presented
+    // last cycle, one cycle after the arbitration win that chose it. Delay
+    // the grant by one cycle to match.
+    logic [ARB_W-1:0] bank_rd_grant_onehot_d [BLOCK_SIZE];
+    always_ff @(posedge clk) begin
+        for (integer r = 0; r < BLOCK_SIZE; ++r) begin
+            if (reset) bank_rd_grant_onehot_d[r] <= '0;
+            else       bank_rd_grant_onehot_d[r] <= bank_rd_grant_onehot[r];
+        end
+    end
+
+    // Un-flatten VX_dp_ram output back into the [row][col] shape the
+    // routing code expects
+    for (genvar r = 0; r < BLOCK_SIZE; ++r) begin : g_rd_unflatten
+        for (genvar row = 0; row < TCU_WG_TILE_M; ++row) begin : g_row
+            for (genvar col = 0; col < TCU_TC_N; ++col) begin : g_col
+                assign bank_rd_word[r][row][col] = bank_rdata[r][(row*TCU_TC_N+col)*32 +: 32];
             end
         end
     end
 
-    // TMEM_LD is combinational, never conflicts across blocks
-    wire [31:0] tmem_ld_rd_data [BLOCK_SIZE][`VX_CFG_NUM_THREADS];
-    for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_tmem_ld
-        wire is_tmem_ld = mgmt_valid[bi]
-                        && (mgmt_data[bi].op_type == INST_TCU_TMEM_LD);
-        wire [TCU_TMEM_LANE_BITS-1:0] ld_lane_base =
-            TCU_TMEM_LANE_BITS'(mgmt_data[bi].rs1_data[0][31:16]);
-        wire [TCU_TMEM_COL_BITS-1:0] ld_col =
-            TCU_TMEM_COL_BITS'(mgmt_data[bi].rs1_data[0][15:0]);
-        for (genvar t = 0; t < `VX_CFG_NUM_THREADS; ++t) begin : g_tmem_ld_t
-            assign tmem_ld_rd_data[bi][t] = is_tmem_ld
-                ? tmem_data[TCU_TMEM_LANE_BITS'(ld_lane_base) + TCU_TMEM_LANE_BITS'(t)][ld_col]
+    // Route each bank's winner back out to whichever bi won.
+    for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_rd_route
+        assign rd_grant[bi] = bank_rd_grant_onehot_d[rd_bank[bi]][bi];
+        for (genvar i = 0; i < TCU_TC_M; ++i) begin : g_i
+            for (genvar j = 0; j < TCU_TC_N; ++j) begin : g_j
+                assign rd_data[bi][i][j] = bank_rd_word[rd_bank[bi]][rd_row0[bi] + ROW_IDX_W'(i)][j];
+            end
+        end
+    end
+
+    wire [BLOCK_SIZE-1:0] ldst_rd_won;
+    logic [31:0] tmem_ld_rd_data [BLOCK_SIZE][`VX_CFG_NUM_THREADS];
+    for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_ld_route
+        assign ldst_rd_won[bi] = bank_rd_grant_onehot_d[ldst_bank[bi]][BLOCK_SIZE + bi];
+        for (genvar t = 0; t < `VX_CFG_NUM_THREADS; ++t) begin : g_t
+            assign tmem_ld_rd_data[bi][t] = is_tmem_ld[bi]
+                ? bank_rd_word[ldst_bank[bi]][ldst_row0[bi] + ROW_IDX_W'(t)][ldst_col[bi]]
                 : '0;
         end
     end
 
-    // UMMA compute writeback + TMEM_ST: both write their own tmem_data
-    // cells independently, never touching shared allocator state, so
-    // neither needs arbitration across blocks
-    always_ff @(posedge clk) begin
-        // UMMA compute writeback
-        for (int b = 0; b < BLOCK_SIZE; ++b) begin
-            if (wr_en[b]) begin
-                for (int i = 0; i < TCU_TC_M; ++i) begin
-                    for (int j = 0; j < TCU_TC_N; ++j) begin
-                        tmem_data[TCU_TMEM_LANE_BITS'(wr_lane_base[b]) + TCU_TMEM_LANE_BITS'(i)]
-                                 [TCU_TMEM_COL_BITS'(wr_col_base[b])  + TCU_TMEM_COL_BITS'(j)]
-                            <= wr_data[b][i][j];
-                    end
-                end
-            end
+    // -----------------------------------------------------------------------
+    // Per-bank WRITE arbitration: compute-write vs TMEM_ST plus the actual
+    // clocked storage update.
+    // -----------------------------------------------------------------------
+
+    wire [ARB_W-1:0] bank_wr_grant_onehot [BLOCK_SIZE];
+    wire [BLOCK_SIZE-1:0] bank_wr_conflict;
+
+    for (genvar r = 0; r < BLOCK_SIZE; ++r) begin : g_wr_arb
+        wire [BLOCK_SIZE-1:0] cmp_req;
+        wire [BLOCK_SIZE-1:0] ldst_req;
+        for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_req
+            assign cmp_req[bi]  = wr_valid[bi] && (wrb_bank[bi] == BANK_IDX_W'(r));
+            assign ldst_req[bi] = is_tmem_st[bi] && (ldst_bank[bi] == BANK_IDX_W'(r));
+        end
+        wire [ARB_W-1:0] req_vec = {ldst_req, cmp_req};
+
+        wire [ARB_W-1:0] req_vec_rot;
+        for (genvar k = 0; k < ARB_W; ++k) begin : g_rotate_in
+            assign req_vec_rot[k] = req_vec[(k + rot_ctr) % ARB_W];
         end
 
-        // TMEM_ST
-        for (int b = 0; b < BLOCK_SIZE; ++b) begin
-            if (mgmt_valid[b] && (mgmt_data[b].op_type == INST_TCU_TMEM_ST)) begin
-                for (int t = 0; t < `VX_CFG_NUM_THREADS; ++t) begin
-                    if (mgmt_data[b].header.tmask[t]) begin
-                        automatic logic [TCU_TMEM_LANE_BITS-1:0] st_lane_base =
-                            TCU_TMEM_LANE_BITS'(mgmt_data[b].rs1_data[0][31:16]);
-                        automatic logic [TCU_TMEM_COL_BITS-1:0] st_col =
-                            TCU_TMEM_COL_BITS'(mgmt_data[b].rs1_data[0][15:0]);
-                        tmem_data[TCU_TMEM_LANE_BITS'(st_lane_base) + TCU_TMEM_LANE_BITS'(t)][st_col]
-                            <= mgmt_data[b].rs2_data[t][31:0];
+        wire [ARB_W-1:0] grant_onehot_rot;
+        VX_priority_encoder #(
+            .N (ARB_W)
+        ) wr_arb (
+            .data_in    (req_vec_rot),
+            .onehot_out (grant_onehot_rot),
+            `UNUSED_PIN (index_out),
+            `UNUSED_PIN (valid_out)
+        );
+        for (genvar p = 0; p < ARB_W; ++p) begin : g_rotate_out
+            assign bank_wr_grant_onehot[r][p] = grant_onehot_rot[(p + ARB_W - rot_ctr) % ARB_W];
+        end
+
+        assign bank_wr_conflict[r] = $countones(req_vec) > 1;
+    end
+
+    for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_wr_route
+        assign wr_grant[bi] = wr_valid[bi] && bank_wr_grant_onehot[wrb_bank[bi]][bi];
+    end
+    wire [BLOCK_SIZE-1:0] ldst_wr_won;
+    for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_st_route
+        assign ldst_wr_won[bi] = is_tmem_st[bi] && bank_wr_grant_onehot[ldst_bank[bi]][BLOCK_SIZE + bi];
+    end
+
+    // Pre-mux the winning write per bank BEFORE touching bank_mem
+    logic [BANK_ADDR_W-1:0] write_word    [BLOCK_SIZE];
+    logic [ROW_IDX_W-1:0]   write_row0    [BLOCK_SIZE];
+    logic [COL_IDX_W-1:0]   write_col     [BLOCK_SIZE]; // meaningful only when write_is_ldst
+    logic                   write_is_ldst [BLOCK_SIZE];
+    logic                   write_valid   [BLOCK_SIZE];
+    logic [`VX_CFG_NUM_THREADS-1:0] write_tmask [BLOCK_SIZE]; // meaningful only when write_is_ldst
+    logic [31:0] write_cdata [BLOCK_SIZE][TCU_TC_M][TCU_TC_N];
+    logic [31:0] write_ldata [BLOCK_SIZE][`VX_CFG_NUM_THREADS];
+
+    always_comb begin
+        for (integer r = 0; r < BLOCK_SIZE; ++r) begin
+            write_word[r]    = '0;
+            write_row0[r]    = '0;
+            write_col[r]     = '0;
+            write_is_ldst[r] = 1'b0;
+            write_valid[r]   = 1'b0;
+            write_tmask[r]   = '0;
+            for (integer i = 0; i < TCU_TC_M; ++i) begin
+                for (integer j = 0; j < TCU_TC_N; ++j) begin
+                    write_cdata[r][i][j] = '0;
+                end
+            end
+            for (integer t = 0; t < `VX_CFG_NUM_THREADS; ++t) begin
+                write_ldata[r][t] = '0;
+            end
+
+            for (integer bi = 0; bi < BLOCK_SIZE; ++bi) begin
+                // Compute writeback candidate
+                if (bank_wr_grant_onehot[r][bi] && wr_valid[bi]) begin
+                    write_valid[r] = 1'b1;
+                    write_word[r] |= wrb_word[bi];
+                    write_row0[r] |= wrb_row0[bi];
+                    for (integer i = 0; i < TCU_TC_M; ++i) begin
+                        for (integer j = 0; j < TCU_TC_N; ++j) begin
+                            write_cdata[r][i][j] |= wr_data[bi][i][j];
+                        end
+                    end
+                end
+                // TMEM_ST candidate
+                if (bank_wr_grant_onehot[r][BLOCK_SIZE + bi] && is_tmem_st[bi]) begin
+                    write_valid[r]   = 1'b1;
+                    write_is_ldst[r] = 1'b1;
+                    write_word[r]  |= ldst_word[bi];
+                    write_row0[r]  |= ldst_row0[bi];
+                    write_col[r]   |= ldst_col[bi];
+                    write_tmask[r] |= mgmt_data[bi].header.tmask;
+                    for (integer t = 0; t < `VX_CFG_NUM_THREADS; ++t) begin
+                        write_ldata[r][t] |= mgmt_data[bi].rs2_data[t][31:0];
                     end
                 end
             end
         end
+    end
+
+    // Per (row,col), check whether the resolved winner's row0 places it
+    // in range, and if so read the corresponding cell out of
+    // write_cdata/write_ldata at a dynamic local-row index.
+    for (genvar r = 0; r < BLOCK_SIZE; ++r) begin : g_wr_flatten
+        for (genvar row = 0; row < TCU_WG_TILE_M; ++row) begin : g_row
+            for (genvar col = 0; col < TCU_TC_N; ++col) begin : g_col
+                wire in_range    = write_valid[r] && (ROW_IDX_W'(row) >= write_row0[r]);
+                wire [ROW_IDX_W-1:0] local_row = ROW_IDX_W'(row) - write_row0[r];
+                wire compute_hit = in_range && !write_is_ldst[r]
+                                 && (32'(local_row) < 32'(TCU_TC_M));
+                wire ldst_hit    = in_range && write_is_ldst[r]
+                                 && (COL_IDX_W'(col) == write_col[r])
+                                 && (32'(local_row) < 32'(`VX_CFG_NUM_THREADS))
+                                 && write_tmask[r][local_row];
+                assign bank_wren[r][row*TCU_TC_N+col] = compute_hit || ldst_hit;
+                assign bank_wdata[r][(row*TCU_TC_N+col)*32 +: 32] = compute_hit
+                    ? write_cdata[r][`LOG2UP(TCU_TC_M)'(local_row)][col]
+                    : write_ldata[r][`LOG2UP(`VX_CFG_NUM_THREADS)'(local_row)];
+            end
+        end
+    end
+
+    for (genvar r = 0; r < BLOCK_SIZE; ++r) begin : g_bank_ram
+        VX_dp_ram #(
+            .DATAW    (BANK_DATAW),
+            .SIZE     (BANK_WORDS),
+            .WRENW    (BANK_WRENW),
+            .OUT_REG  (1),
+            .RDW_MODE ("R")
+        ) bank_ram (
+            .clk   (clk),
+            .reset (reset),
+            .read  (bank_rd_grant_onehot[r] != '0),
+            .write (write_valid[r]),
+            .wren  (bank_wren[r]),
+            .waddr (write_word[r]),
+            .wdata (bank_wdata[r]),
+            .raddr (bank_raddr[r]),
+            .rdata (bank_rdata[r])
+        );
     end
 
     // -----------------------------------------------------------------------
@@ -175,12 +443,14 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
     // Bypass execute<->result handshake: same-cycle response, no queueing.
     // ALLOC/DEALLOC only fires for the block the arbiter granted this cycle,
-    // gated on VX_tcu_tmem_alloc's resp_valid - every other requesting block
-    // retries next cycle
+    // gated on VX_tcu_tmem_alloc's resp_valid; TMEM_LD/ST only fire for the
+    // block that won its bank's read/write port this cycle. Every other
+    // requesting block retries next cycle.
     for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_tmem_result
-        wire mgmt_fire = is_alloc_or_dealloc_req[bi]
-            ? (alloc_grant_onehot[bi] && alloc_resp_valid)
-            : mgmt_valid[bi];
+        wire mgmt_fire = is_alloc_or_dealloc_req[bi] ? (alloc_grant_onehot[bi] && alloc_resp_valid)
+                        : is_tmem_ld[bi]             ? ldst_rd_won[bi]
+                        : is_tmem_st[bi]             ? ldst_wr_won[bi]
+                        : mgmt_valid[bi];
 
         assign mgmt_ready[bi]         = mgmt_fire && result_ready[bi];
         assign result_valid[bi]       = mgmt_fire;
@@ -201,10 +471,21 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     end
 
 `ifdef PERF_ENABLE
-    // Stub for now
-    assign tcu_perf.umma_instrs = '0;
-    assign tcu_perf.tmem_reads  = '0;
-    assign tcu_perf.tmem_writes = '0;
+    // Bank-conflict stall counting
+    logic [PERF_CTR_BITS-1:0] tmem_bank_stalls_r;
+    always @(posedge clk) begin
+        if (reset) begin
+            tmem_bank_stalls_r <= '0;
+        end else begin
+            tmem_bank_stalls_r <= tmem_bank_stalls_r
+                + PERF_CTR_BITS'($countones(bank_rd_conflict))
+                + PERF_CTR_BITS'($countones(bank_wr_conflict));
+        end
+    end
+    assign tcu_perf.umma_instrs      = '0;
+    assign tcu_perf.tmem_reads       = '0;
+    assign tcu_perf.tmem_writes      = '0;
+    assign tcu_perf.tmem_bank_stalls = tmem_bank_stalls_r;
 `endif
 
 endmodule

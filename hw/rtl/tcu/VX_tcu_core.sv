@@ -31,13 +31,16 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // whole TC_M x TC_N tile back
 `ifdef TCU_TMEM_ENABLE
     input wire [NW_WIDTH-1:0]                       cta_rank,
+    output wire                                     tmem_rd_valid,
     output wire [TCU_TMEM_LANE_BITS-1:0]            tmem_rd_lane_base,
     output wire [TCU_TMEM_COL_BITS-1:0]             tmem_rd_col_base,
+    input wire                                      tmem_rd_grant,
     input wire [TCU_TC_M-1:0][TCU_TC_N-1:0][31:0]   tmem_rd_data,
-    output wire                                     tmem_wr_en,
+    output wire                                     tmem_wr_valid,
     output wire [TCU_TMEM_LANE_BITS-1:0]            tmem_wr_lane_base,
     output wire [TCU_TMEM_COL_BITS-1:0]             tmem_wr_col_base,
     output wire [TCU_TC_M-1:0][TCU_TC_N-1:0][31:0]  tmem_wr_data,
+    input wire                                      tmem_wr_grant,
 `endif
 
     // External metadata write port from the shared VX_tcu_agu.
@@ -296,8 +299,15 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     end
 
     assign fedp_done        = fedp_delay_pipe[0];
-    assign result_if.valid  = setup_valid_r || fedp_done;
-    assign fedp_enable      = ~fedp_done || fedp_result_fire;
+`ifdef TCU_TMEM_ENABLE
+    // A retiring UMMA op must not be reported as done until its TMEM write
+    // has actually won a bank's write port
+    wire tmem_wr_ok = ~tmem_addr_pipe[0].valid || tmem_wr_grant;
+`else
+    wire tmem_wr_ok = 1'b1;
+`endif
+    assign result_if.valid  = setup_valid_r || (fedp_done && tmem_wr_ok);
+    assign fedp_enable      = (~fedp_done || fedp_result_fire) && tmem_wr_ok;
 
 `ifdef TCU_TMEM_ENABLE
     // Tile-origin address for the incoming uop (pre +i/+j offset)
@@ -307,7 +317,18 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                                                   + TCU_TMEM_COL_BITS'(step_n) * TCU_TMEM_COL_BITS'(TCU_TC_N);
 
     // Read request to VX_tcu_tmem: this op's tile origin, valid whenever a
-    // new UMMA op is admitted
+    // new UMMA op is admitted. tmem_rd_valid marks whether there's a
+    // pending request this cycle. 
+    // Gated on ~umma_hazard: with registered read the fetch and admission
+    // are different cycles. Submitting the request while a hazard is live
+    // would still win bank arbitration and latch stale data that cycle,
+    // which could get captured once the hazard clears one cycle later
+    // without refetching.
+    // Also gated on ~tmem_rd_grant: with registered read same request
+    // would resubmit and could win bank arbitration a second time while
+    // its first grant is still being consumed, producing stale extra
+    // grant
+    assign tmem_rd_valid     = is_umma && execute_if.valid && ~umma_hazard && ~tmem_rd_grant;
     assign tmem_rd_lane_base = umma_lane_base;
     assign tmem_rd_col_base  = umma_col_base;
 
@@ -354,15 +375,21 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     end
     wire umma_hazard = is_umma && (|umma_hazard_match);
 
+    // Bank-port stall: this op's TMEM read lost arbitration to another
+    // block targeting the same bank this cycle. Retries next cycle.
+    wire umma_rd_stall = is_umma && ~tmem_rd_grant;
+
     // TMEM write fires the same cycle fedp_done does, for whichever uop is
     // now at position 0. tmem_addr_pipe[0].valid is 0 for non-UMMA uops.
-    assign tmem_wr_en        = fedp_done && tmem_addr_pipe[0].valid;
+    // This is a request. VX_tcu_tmem only actually writes if it grants
+    // the bank's write port (tmem_wr_grant)
+    assign tmem_wr_valid     = fedp_done && tmem_addr_pipe[0].valid;
     assign tmem_wr_lane_base = tmem_addr_pipe[0].lane_base;
     assign tmem_wr_col_base  = tmem_addr_pipe[0].col_base;
 
     assign execute_if.ready = is_wgmma_setup
                             ? ((~setup_valid_r || result_if.ready) && exe_ready_extra)
-                            : (~mdata_queue_full && fedp_enable && exe_ready_extra && ~umma_hazard);
+                            : (~mdata_queue_full && fedp_enable && exe_ready_extra && ~umma_hazard && ~umma_rd_stall);
 `else
     assign execute_if.ready = is_wgmma_setup
                             ? ((~setup_valid_r || result_if.ready) && exe_ready_extra)
