@@ -925,7 +925,7 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
         instr->set_src_reg(0, rs1, RegType::Integer);
       } break;
     #endif // TCU_META_ENABLE
-    #ifdef TCU_TMEM_ENABLE
+    #ifdef VX_CFG_TCU_TMEM_ENABLE
       case 3: { // TMEM_ALLOC — rd receives the handle, rs1 carries ncols
         instr->set_op_type(TcuType::TMEM_ALLOC);
         instr->set_args(IntrTcuArgs{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
@@ -959,7 +959,7 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
         instr->set_macro_op();
         instr->set_wstall(true);
       } break;
-    #endif // TCU_TMEM_ENABLE
+    #endif // VX_CFG_TCU_TMEM_ENABLE
       default:
         std::abort();
       }

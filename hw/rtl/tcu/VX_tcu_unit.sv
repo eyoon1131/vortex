@@ -35,7 +35,7 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     VX_lsu_sched_if.master  tcu_mem_if,
 `endif
 
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
     input wire [`VX_CFG_NUM_WARPS-1:0][NW_WIDTH-1:0] cta_rank_table,
 `endif
 
@@ -95,7 +95,7 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     wire [BLOCK_SIZE-1:0]    agu_result_ready;
 `endif
 
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
     // TMEM_ALLOC/DEALLOC/ST/LD bypass tcu_core entirely (no FEDP compute)
     VX_execute_if #(
         .data_t (tcu_execute_t)
@@ -103,7 +103,7 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 `endif
 
     for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_split
-    `ifdef TCU_TMEM_ENABLE
+    `ifdef VX_CFG_TCU_TMEM_ENABLE
         wire is_tmem_mgmt = (per_block_execute_if[bi].data.op_type == INST_TCU_TMEM_ALLOC)
                          || (per_block_execute_if[bi].data.op_type == INST_TCU_TMEM_DEALLOC)
                          || (per_block_execute_if[bi].data.op_type == INST_TCU_TMEM_ST)
@@ -120,7 +120,7 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
         // To tcu_core when NOT TCU_LD (and not TMEM management, if enabled)
         assign core_execute_if[bi].valid = per_block_execute_if[bi].valid && !is_tcu_ld
-        `ifdef TCU_TMEM_ENABLE
+        `ifdef VX_CFG_TCU_TMEM_ENABLE
             && !is_tmem_mgmt
         `endif
             ;
@@ -130,7 +130,7 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         // management, otherwise tcu_core
         assign per_block_execute_if[bi].ready = is_tcu_ld
             ? agu_ld_ready[bi]
-        `ifdef TCU_TMEM_ENABLE
+        `ifdef VX_CFG_TCU_TMEM_ENABLE
             : is_tmem_mgmt
             ? tmem_execute_if[bi].ready
         `endif
@@ -138,20 +138,20 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     `else
         // No sparse: pass-through to tcu_core (or TMEM bypass, if enabled)
         assign core_execute_if[bi].valid = per_block_execute_if[bi].valid
-        `ifdef TCU_TMEM_ENABLE
+        `ifdef VX_CFG_TCU_TMEM_ENABLE
             && !is_tmem_mgmt
         `endif
             ;
         assign core_execute_if[bi].data  = per_block_execute_if[bi].data;
         assign per_block_execute_if[bi].ready =
-        `ifdef TCU_TMEM_ENABLE
+        `ifdef VX_CFG_TCU_TMEM_ENABLE
             is_tmem_mgmt ? tmem_execute_if[bi].ready :
         `endif
             core_execute_if[bi].ready;
     `endif
     end
 
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
     VX_result_if #(
         .data_t (tcu_result_t)
     ) tmem_result_if[BLOCK_SIZE]();
@@ -166,7 +166,7 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 `ifdef TCU_META_ENABLE
     // AGU wins same-cycle conflicts; tcu_core stalls (ready=0) and retries next cycle.
     for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_result_merge
-    `ifdef TCU_TMEM_ENABLE
+    `ifdef VX_CFG_TCU_TMEM_ENABLE
         assign per_block_result_if[bi].valid = agu_result_valid[bi] || tmem_result_if[bi].valid || core_result_if[bi].valid;
         assign per_block_result_if[bi].data  = agu_result_valid[bi]  ? agu_result_data[bi]
                                               : tmem_result_if[bi].valid ? tmem_result_if[bi].data
@@ -185,7 +185,7 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     end
 `else
     for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_result_passthru
-    `ifdef TCU_TMEM_ENABLE
+    `ifdef VX_CFG_TCU_TMEM_ENABLE
         assign per_block_result_if[bi].valid = tmem_result_if[bi].valid || core_result_if[bi].valid;
         assign per_block_result_if[bi].data  = tmem_result_if[bi].valid ? tmem_result_if[bi].data : core_result_if[bi].data;
         assign tmem_result_if[bi].ready = per_block_result_if[bi].ready;
@@ -278,7 +278,7 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     );
 `endif
 
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
     // -----------------------------------------------------------------------
     // TMEM storage/management (VX_tcu_tmem) + its wiring to the per-block
     // tcu_core instances
@@ -341,14 +341,14 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         .wr_data       (tmem_wr_data),
         .wr_grant      (tmem_wr_grant)
     );
-`endif // TCU_TMEM_ENABLE
+`endif // VX_CFG_TCU_TMEM_ENABLE
 
     // -----------------------------------------------------------------------
     // TCU core instances
     // -----------------------------------------------------------------------
 
     for (genvar block_idx = 0; block_idx < BLOCK_SIZE; ++block_idx) begin : g_blocks
-    `ifdef TCU_TMEM_ENABLE
+    `ifdef VX_CFG_TCU_TMEM_ENABLE
         // This block's currently-executing warp's CTA-local rank
         wire [NW_WIDTH-1:0] block_cta_rank =
             cta_rank_table[core_execute_if[block_idx].data.header.wid];
@@ -364,7 +364,7 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             .tbuf_rs2_data (tbuf_rs2_data[block_idx]),
             .tbuf_ready    (tbuf_ready_eff[block_idx]),
         `endif
-        `ifdef TCU_TMEM_ENABLE
+        `ifdef VX_CFG_TCU_TMEM_ENABLE
             .cta_rank         (block_cta_rank),
             .tmem_rd_valid    (tmem_rd_valid[block_idx]),
             .tmem_rd_lane_base(tmem_rd_lane_base[block_idx]),

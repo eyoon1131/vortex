@@ -63,7 +63,7 @@ public:
 		uint64_t tbuf_stalls = 0;      // cycles stalled on TcuTbufA/TcuSharedB readiness
 		uint64_t tbuf_cache_hits = 0;  // WGMMA entries with all lines already resident (cross-WGMMA reuse)
 		uint64_t lmem_reads = 0;       // sum of TcuTbufA + TcuSharedB LmemReqs issued
-#ifdef TCU_TMEM_ENABLE
+#ifdef VX_CFG_TCU_TMEM_ENABLE
 		uint64_t umma_instrs = 0;      // UMMA micro-ops executed
 		uint64_t tmem_reads = 0;       // TMEM elements read (UMMA C + tmem_ld)
 		uint64_t tmem_writes = 0;      // TMEM elements written (UMMA D + tmem_st)
@@ -74,7 +74,7 @@ public:
 			this->tbuf_stalls      += rhs.tbuf_stalls;
 			this->tbuf_cache_hits  += rhs.tbuf_cache_hits;
 			this->lmem_reads       += rhs.lmem_reads;
-#ifdef TCU_TMEM_ENABLE
+#ifdef VX_CFG_TCU_TMEM_ENABLE
 			this->umma_instrs      += rhs.umma_instrs;
 			this->tmem_reads       += rhs.tmem_reads;
 			this->tmem_writes      += rhs.tmem_writes;
@@ -123,7 +123,7 @@ public:
 	           uint32_t is_a_smem,
 	           uint32_t is_setup_uop);
 
-#ifdef TCU_TMEM_ENABLE
+#ifdef VX_CFG_TCU_TMEM_ENABLE
 	// Allocate ncols columns of TMEM; returns a handle (base column).
 	uint32_t tmem_alloc(uint32_t ncols, int32_t cta_id);
 

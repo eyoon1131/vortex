@@ -649,7 +649,7 @@ module VX_decode import
                             `USED_IREG (rs1);
                         end else
                     `endif
-                    `ifdef TCU_TMEM_ENABLE
+                    `ifdef VX_CFG_TCU_TMEM_ENABLE
                         if (funct3 >= 3'h3) begin
                             op_args.tcu.cd_nregs     = '0;
                             op_args.tcu.a_from_smem  = 1'b0;

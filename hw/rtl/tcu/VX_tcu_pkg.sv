@@ -92,7 +92,7 @@ package VX_tcu_pkg;
     localparam TCU_WG_TILE_M = 2 * TCU_TC_M;
     localparam TCU_WG_TILE_K = 2 * TCU_TC_K;
 
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
     // TMEM parameters
     //
     // TCU_TMEM_LANES is sized to ONE warpgroup's width, shared/reused
@@ -102,7 +102,7 @@ package VX_tcu_pkg;
     // this RTL enforces on its own: nothing here stops software from
     // launching a CTA with more warps than NUM_TCU_BLOCKS.
     localparam TCU_TMEM_LANES = `VX_CFG_NUM_TCU_BLOCKS * TCU_WG_TILE_M;
-    localparam TCU_TMEM_COLS  = 256;
+    localparam TCU_TMEM_COLS  = `VX_CFG_TCU_TMEM_COLS;
     localparam TCU_TMEM_LANE_BITS = $clog2(TCU_TMEM_LANES);
     localparam TCU_TMEM_COL_BITS  = $clog2(TCU_TMEM_COLS);
 `endif
@@ -114,7 +114,7 @@ package VX_tcu_pkg;
 `endif
     localparam TCU_WG_TILE_N = (TCU_WG_NR * TCU_NT) / TCU_WG_TILE_M;
 
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
     // UMMA geometry: same xtileM as WGMMA, but its own NRC ceiling (128)
     localparam TCU_UMMA_NR      = 128;
     localparam TCU_UMMA_TILE_N  = (TCU_UMMA_NR * TCU_NT) / TCU_WG_TILE_M;
@@ -431,7 +431,7 @@ package VX_tcu_pkg;
             end
           `endif
         `endif
-        `ifdef TCU_TMEM_ENABLE
+        `ifdef VX_CFG_TCU_TMEM_ENABLE
             INST_TCU_TMEM_ALLOC:   `TRACE(level, ("TMEM_ALLOC"))
             INST_TCU_TMEM_DEALLOC: `TRACE(level, ("TMEM_DEALLOC"))
             INST_TCU_TMEM_ST:      `TRACE(level, ("TMEM_ST"))

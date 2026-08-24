@@ -114,8 +114,15 @@ module VX_cp_axil_regfile
   localparam int GPU_BANK_ADDR_W  = `VX_CFG_PLATFORM_MEMORY_ADDR_WIDTH
                                   - `CLOG2(`VX_CFG_PLATFORM_MEMORY_NUM_BANKS);
 
+`ifdef VX_CFG_TCU_TMEM_ENABLE
+  localparam int GPU_TCU_TMEM_COLS = `VX_CFG_TCU_TMEM_COLS;
+`else
+  localparam int GPU_TCU_TMEM_COLS = 0;
+`endif
+
   wire [63:0] gpu_dev_caps = {
-    22'b0,
+    17'b0,
+    5'(GPU_TCU_TMEM_COLS == 0 ? 0 : $clog2(GPU_TCU_TMEM_COLS)),
     5'(GPU_BANK_ADDR_W - 20),
     3'($clog2(`VX_CFG_PLATFORM_MEMORY_NUM_BANKS)),
     8'(`VX_CFG_LMEM_ENABLED ? `VX_CFG_LMEM_LOG_SIZE : 0),

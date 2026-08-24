@@ -269,7 +269,7 @@ module VX_core import VX_gpu_pkg::*; #(
 `endif
 
     wire sched_busy;
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
     // Per-warp CTA-local rank table
     // VX_execute's TCU unit is the only consumer
     wire [`VX_CFG_NUM_WARPS-1:0][NW_WIDTH-1:0] cta_rank_table;
@@ -306,7 +306,7 @@ module VX_core import VX_gpu_pkg::*; #(
         .sched_csr_if   (sched_csr_if),
         .gbar_bus_if    (gbar_bus_if),
 
-    `ifdef TCU_TMEM_ENABLE
+    `ifdef VX_CFG_TCU_TMEM_ENABLE
         .cta_rank_table (cta_rank_table),
     `endif
 
@@ -394,7 +394,7 @@ module VX_core import VX_gpu_pkg::*; #(
     `ifdef TCU_META_ENABLE
         .tcu_mem_if     (tcu_mem_if),
     `endif
-    `ifdef TCU_TMEM_ENABLE
+    `ifdef VX_CFG_TCU_TMEM_ENABLE
         .cta_rank_table (cta_rank_table),
     `endif
 

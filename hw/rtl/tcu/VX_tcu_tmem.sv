@@ -13,7 +13,7 @@
 
 `include "VX_define.vh"
 
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
 
 // TMEM (Tensor Memory) storage and management
 //
@@ -410,20 +410,45 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     end
     wire [BLOCK_SIZE-1:0] is_alloc_or_dealloc_req = is_alloc_req | is_dealloc_req;
 
-    wire [BLOCK_SIZE-1:0]          alloc_grant_onehot;
-    wire [`LOG2UP(BLOCK_SIZE)-1:0] alloc_grant_idx;
-    wire                           alloc_grant_valid;
+    // Exclude a block from winning arbitration this cycle unless its own
+    // retirement (result_ready) can also fire. Masked into the arbiter's
+    // input so an unready winner is excluded and the arbiter picks another
+    // ready requesting block.
+    wire [BLOCK_SIZE-1:0] is_dealloc_req_ready = is_dealloc_req & result_ready;
+    wire [BLOCK_SIZE-1:0] is_alloc_req_ready   = is_alloc_req & result_ready;
+
+    // DEALLOC is always arbitrated ahead of ALLOC. An ALLOC that can't be
+    // satisfied yet stalls and keeps re-requesting every cycle.
+    wire [BLOCK_SIZE-1:0]          dealloc_grant_onehot;
+    wire [`LOG2UP(BLOCK_SIZE)-1:0] dealloc_grant_idx;
+    wire                           dealloc_grant_valid;
     VX_priority_encoder #(
         .N (BLOCK_SIZE)
-    ) alloc_arb (
-        .data_in    (is_alloc_or_dealloc_req),
-        .onehot_out (alloc_grant_onehot),
-        .index_out  (alloc_grant_idx),
-        .valid_out  (alloc_grant_valid)
+    ) dealloc_arb (
+        .data_in    (is_dealloc_req_ready),
+        .onehot_out (dealloc_grant_onehot),
+        .index_out  (dealloc_grant_idx),
+        .valid_out  (dealloc_grant_valid)
     );
 
+    wire [BLOCK_SIZE-1:0]          alloc_only_grant_onehot;
+    wire [`LOG2UP(BLOCK_SIZE)-1:0] alloc_only_grant_idx;
+    wire                           alloc_only_grant_valid;
+    VX_priority_encoder #(
+        .N (BLOCK_SIZE)
+    ) alloc_only_arb (
+        .data_in    (is_alloc_req_ready),
+        .onehot_out (alloc_only_grant_onehot),
+        .index_out  (alloc_only_grant_idx),
+        .valid_out  (alloc_only_grant_valid)
+    );
+
+    wire                           alloc_grant_valid  = dealloc_grant_valid || alloc_only_grant_valid;
+    wire [BLOCK_SIZE-1:0]          alloc_grant_onehot = dealloc_grant_valid ? dealloc_grant_onehot : alloc_only_grant_onehot;
+    wire [`LOG2UP(BLOCK_SIZE)-1:0] alloc_grant_idx    = dealloc_grant_valid ? dealloc_grant_idx : alloc_only_grant_idx;
+
     // Granted request's fields, extracted once from the winning block.
-    // req_ncols is meaningful only for ALLOC, req_handle only for DEALLOC
+    // req_ncols is meaningful only for ALLOC, req_handle only for DEALLOC.
     wire                          alloc_req_valid      = alloc_grant_valid;
     wire                          alloc_req_is_dealloc = is_dealloc_req[alloc_grant_idx];
     wire [NCTA_WIDTH-1:0]         alloc_req_cta_id     = mgmt_data[alloc_grant_idx].header.cta_id;
@@ -522,4 +547,4 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
 endmodule
 
-`endif // TCU_TMEM_ENABLE
+`endif // VX_CFG_TCU_TMEM_ENABLE

@@ -247,6 +247,21 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
+  // Up to (num_warps / warps) CTAs can be concurrently resident
+  uint64_t tmem_cols;
+  RT_CHECK(vx_device_query(device, VX_CAPS_TCU_TMEM_COLS, &tmem_cols));
+  uint64_t max_concurrent_ctas = num_warps / warps;
+  uint64_t max_concurrent_cols = uint64_t(UMMA_NRC) * max_concurrent_ctas;
+  if (max_concurrent_cols > tmem_cols) {
+    std::cout << "Error: UMMA_NRC (" << UMMA_NRC << ") x max concurrent CTAs ("
+              << max_concurrent_ctas << " = " << num_warps << " warps / " << warps
+              << " per CTA) = " << max_concurrent_cols
+              << " columns, which exceeds the device's TMEM capacity ("
+              << tmem_cols << " columns). Reduce UMMA_NRC, VX_CFG_NUM_WARPS,"
+                 " or run with fewer concurrently-resident CTAs." << std::endl;
+    return -1;
+  }
+
   uint32_t M = xm;
   uint32_t N = xn;
   uint32_t K = xk;

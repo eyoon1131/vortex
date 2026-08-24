@@ -71,7 +71,7 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
 `endif
     // UMMA's own NRC ceiling (128) exceeds WGMMA's (32), so its worst-case
     // uop count (128 * TCU_WG_K_STEPS, up to 256) needs its own entry
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
     localparam MAX_UMMA_UOPS = 128 * TCU_WG_K_STEPS;
     localparam CTR_W_UMMA = $clog2(MAX_UMMA_UOPS);
     localparam CTR_W_BASE = (CTR_W_BASE0 > CTR_W_UMMA) ? CTR_W_BASE0 : CTR_W_UMMA;
@@ -220,7 +220,7 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
     end
 `endif
 
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
     // UMMA: A/B from SMEM via descriptors (fixed regs x10/x11, same as
     // WGMMA's smem-A convention), C/D accumulator in TMEM addressed via a
     // handle carried in a fixed reg (x12)
@@ -295,7 +295,7 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
     // Dense FEDP2K RS adds one descriptor setup uop. Other WGMMA modes fuse
     // descriptor transport into their first compute uop.
     assign uop_count =
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
         is_umma ? umma_uop_cnt :
 `endif
 `ifdef VX_CFG_TCU_WGMMA_ENABLE
@@ -422,7 +422,7 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
         n_sp_s = '0;
         m_sp_s = '0;
     `endif
-    `ifdef TCU_TMEM_ENABLE
+    `ifdef VX_CFG_TCU_TMEM_ENABLE
         if (is_umma) begin
             ibuf_r.op_args.tcu.step_m = 3'(umma_m_index);
             ibuf_r.op_args.tcu.step_n = 6'(umma_n_index);
@@ -508,7 +508,7 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
         ibuf_r.used_rs[2] = 1'b1;
     `endif
         end
-    `ifdef TCU_TMEM_ENABLE
+    `ifdef VX_CFG_TCU_TMEM_ENABLE
         if (is_umma) begin
             ibuf_r.fu_lock   = (uop_idx == '0);
             ibuf_r.fu_unlock = (uop_idx == (uop_count - UOP_CTR_W'(1)));

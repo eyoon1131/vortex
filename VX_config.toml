@@ -254,6 +254,8 @@ VX_CFG_TCU_SPARSE_ENABLE = false
 VX_CFG_TCU_DSM_ENABLE = false
 VX_CFG_TCU_WGMMA_ENABLE = false
 VX_CFG_TCU_FEDP2K = false
+VX_CFG_TCU_TMEM_ENABLE = false
+VX_CFG_TCU_TMEM_COLS = 256
 
 [dxa]
 # Cluster-level DXA engine count, decoupled from cores/socket size.

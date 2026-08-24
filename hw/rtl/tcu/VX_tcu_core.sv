@@ -29,7 +29,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
     // TMEM read/write ports. Read is request/response, tile-origin in,
     // whole TC_M x TC_N tile back
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
     input wire [NW_WIDTH-1:0]                       cta_rank,
     output wire                                     tmem_rd_valid,
     output wire [TCU_TMEM_LANE_BITS-1:0]            tmem_rd_lane_base,
@@ -145,7 +145,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
               `endif
                  ;
     wire wg_a_smem = execute_if.data.op_args.tcu.a_from_smem;
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
     wire is_umma = (execute_if.data.op_type == INST_TCU_UMMA);
     wire wg_or_umma = is_wgmma || is_umma;
     wire wg_or_umma_a_smem = is_umma || wg_a_smem;
@@ -159,7 +159,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     localparam WG_RS2_BITS = TCU_WG_RS2_WIDTH * `VX_CFG_XLEN;
     wire [WG_RS1_BITS-1:0] rs1_data_rf = WG_RS1_BITS'(execute_if.data.rs1_data);
     wire [WG_RS2_BITS-1:0] rs2_data_rf = WG_RS2_BITS'(execute_if.data.rs2_data);
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
     assign rs1_data = ((is_wgmma && wg_a_smem) || is_umma) ? tbuf_rs1_data : rs1_data_rf;
     assign rs2_data = (is_wgmma || is_umma) ? tbuf_rs2_data : rs2_data_rf;
 `else
@@ -172,7 +172,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     wire [TCU_MAX_META_BLOCK_WIDTH-1:0] vld_meta_block = wmma_sp_meta;
   `endif
 
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
     assign exe_ready_extra = ~(is_wgmma || is_umma) || tbuf_ready;
 `else
     assign exe_ready_extra = ~is_wgmma || tbuf_ready;
@@ -197,7 +197,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     wire [4:0] fmt_s = execute_if.data.op_args.tcu.fmt_s;
     wire [4:0] fmt_d = execute_if.data.op_args.tcu.fmt_d;
 
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
     // TMEM addressing for UMMA. cta_rank/handle are warp-uniform (handle is
     // the base column returned by a prior TMEM_ALLOC), lane/col additionally
     // depend on the grid cell (i,j), computed per-cell alongside c_val.
@@ -268,7 +268,9 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     tcu_header_t mdata_queue_out;
 
     wire setup_result_fire = setup_valid_r && result_if.ready;
-    wire fedp_result_fire  = fedp_done && result_if.ready && !setup_valid_r;
+    // Prevent from firing (and popping mdata_queue) on a cycle where the
+    // TMEM write lost bank arbitration
+    wire fedp_result_fire  = fedp_done && tmem_wr_ok && result_if.ready && !setup_valid_r;
 
     always @(posedge clk) begin
         if (reset) begin
@@ -299,7 +301,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     end
 
     assign fedp_done        = fedp_delay_pipe[0];
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
     // A retiring UMMA op must not be reported as done until its TMEM write
     // has actually won a bank's write port
     wire tmem_wr_ok = ~tmem_addr_pipe[0].valid || tmem_wr_grant;
@@ -309,7 +311,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     assign result_if.valid  = setup_valid_r || (fedp_done && tmem_wr_ok);
     assign fedp_enable      = (~fedp_done || fedp_result_fire) && tmem_wr_ok;
 
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
     // Tile-origin address for the incoming uop (pre +i/+j offset)
     wire [TCU_TMEM_LANE_BITS-1:0] umma_lane_base = TCU_TMEM_LANE_BITS'(cta_rank) * TCU_TMEM_LANE_BITS'(TCU_WG_TILE_M)
                                                   + TCU_TMEM_LANE_BITS'(step_m) * TCU_TMEM_LANE_BITS'(TCU_TC_M);
@@ -338,6 +340,19 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     assign tmem_rd_valid     = is_umma && execute_if.valid && ~umma_hazard && ~umma_rd_won;
     assign tmem_rd_lane_base = umma_lane_base;
     assign tmem_rd_col_base  = umma_col_base;
+
+    // tmem_rd_data is valid only on the grant cycle. umma_rd_won_r lets
+    // admission (execute_fire) land on a later cycle. Latch the tile at
+    // grant and consume the latched copy so the accumuland is immune to
+    // whatever else touches the bank.
+    reg [TCU_TC_M-1:0][TCU_TC_N-1:0][31:0] umma_rd_data_r;
+    always @(posedge clk) begin
+        if (tmem_rd_grant) begin
+            umma_rd_data_r <= tmem_rd_data;
+        end
+    end
+    wire [TCU_TC_M-1:0][TCU_TC_N-1:0][31:0] umma_rd_data = tmem_rd_grant ? tmem_rd_data
+                                                                         : umma_rd_data_r;
 
     // TMEM lanes are sized to one warpgroup's width (TCU_TMEM_LANES =
     // NUM_TCU_BLOCKS * NUM_THREADS, see VX_tcu_pkg.sv), so this design
@@ -570,7 +585,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                 `ifdef VX_CFG_TCU_WGMMA_ENABLE
                     wire [31:0] a_wgmma_smem = 32'(rs1_data[i * TCU_WG_FEDP_K + k_idx]);
                     wire [31:0] a_wgmma_reg  = 32'(execute_if.data.rs1_data[i * TCU_TC_K + k_idx]);
-                `ifdef TCU_TMEM_ENABLE
+                `ifdef VX_CFG_TCU_TMEM_ENABLE
                     assign a_row[k_idx] = wg_or_umma
                         ? (wg_or_umma_a_smem ? a_wgmma_smem : a_wgmma_reg)
                         : 32'(execute_if.data.rs1_data[a_off + i * TCU_TC_K + k_idx]);
@@ -585,7 +600,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                 `ifdef VX_CFG_TCU_SPARSE_ENABLE
                     assign b_col_dense[k_idx] =
                     `ifdef VX_CFG_TCU_WGMMA_ENABLE
-                      `ifdef TCU_TMEM_ENABLE
+                      `ifdef VX_CFG_TCU_TMEM_ENABLE
                         wg_or_umma ? 32'(rs2_data[int'(b_off_wg) + WG_B_IDX]) :
                       `else
                         is_wgmma ? 32'(rs2_data[int'(b_off_wg) + WG_B_IDX]) :
@@ -595,7 +610,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                 `else
                     assign b_col[k_idx] =
                     `ifdef VX_CFG_TCU_WGMMA_ENABLE
-                      `ifdef TCU_TMEM_ENABLE
+                      `ifdef VX_CFG_TCU_TMEM_ENABLE
                         wg_or_umma ? 32'(rs2_data[int'(b_off_wg) + WG_B_IDX]) :
                       `else
                         is_wgmma ? 32'(rs2_data[int'(b_off_wg) + WG_B_IDX]) :
@@ -615,7 +630,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                     `else
                         32'b0;
                     `endif
-                `ifdef TCU_TMEM_ENABLE
+                `ifdef VX_CFG_TCU_TMEM_ENABLE
                     assign a_row[k_idx] = (is_umma || (is_wgmma
                         `ifdef VX_CFG_TCU_SPARSE_ENABLE
                             && !is_sparse
@@ -634,7 +649,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                 `ifdef VX_CFG_TCU_SPARSE_ENABLE
                     assign b_col_dense[k_idx] =
                     `ifdef VX_CFG_TCU_WGMMA_ENABLE
-                      `ifdef TCU_TMEM_ENABLE
+                      `ifdef VX_CFG_TCU_TMEM_ENABLE
                         (is_umma || (is_wgmma && !is_sparse)) ? 32'(rs2_data[int'(b_off_wg) + WG_B_IDX]) :
                       `else
                         (is_wgmma && !is_sparse) ? 32'(rs2_data[int'(b_off_wg) + WG_B_IDX]) :
@@ -644,7 +659,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                 `else
                     assign b_col[k_idx] =
                     `ifdef VX_CFG_TCU_WGMMA_ENABLE
-                      `ifdef TCU_TMEM_ENABLE
+                      `ifdef VX_CFG_TCU_TMEM_ENABLE
                         wg_or_umma ? 32'(rs2_data[int'(b_off_wg) + WG_B_IDX]) :
                       `else
                         is_wgmma ? 32'(rs2_data[int'(b_off_wg) + WG_B_IDX]) :
@@ -678,10 +693,11 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             end
         `endif
 
-        `ifdef TCU_TMEM_ENABLE
-            // tmem_rd_data[i][j] is VX_tcu_tmem's response tile for this
-            // op's (tmem_rd_lane_base, tmem_rd_col_base) request
-            wire [31:0] c_val = is_umma ? tmem_rd_data[i][j]
+        `ifdef VX_CFG_TCU_TMEM_ENABLE
+            // umma_rd_data[i][j] is VX_tcu_tmem's response tile for this
+            // op's (tmem_rd_lane_base, tmem_rd_col_base) request, held stable
+            // from its grant cycle through to admission
+            wire [31:0] c_val = is_umma ? umma_rd_data[i][j]
                                         : 32'(execute_if.data.rs3_data[i * TCU_TC_N + j]);
         `else
             wire [31:0] c_val = 32'(execute_if.data.rs3_data[i * TCU_TC_N + j]);
@@ -878,7 +894,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                 assign result_if.data.data[i * TCU_TC_N + j] = d_val[i][j];
             end
 
-        `ifdef TCU_TMEM_ENABLE
+        `ifdef VX_CFG_TCU_TMEM_ENABLE
             // UMMA's real destination — result_if.data.data[i*TCU_TC_N+j]
             // above is harmless but unused for UMMA
             assign tmem_wr_data[i][j] = d_val[i][j];

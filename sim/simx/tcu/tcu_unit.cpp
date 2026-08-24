@@ -57,7 +57,7 @@ static constexpr uint32_t kFedpLatency = 1 + 1 + 1 + 1;
 static constexpr uint32_t kMmaLatency = 1 + kFedpLatency;
 
 // UMMA's 3-bit umma_nrc field selects the per-warp N-tile width (NRC).
-// Not gated behind TCU_TMEM_ENABLE: plan_wgmma_lines() references it via
+// Not gated behind VX_CFG_TCU_TMEM_ENABLE: plan_wgmma_lines() references it via
 // its is_umma branch whenever WGMMA is enabled, independent of TMEM.
 static constexpr uint32_t kNrcTable[5] = {8, 16, 32, 64, 128};
 
@@ -399,7 +399,7 @@ public:
     agu_.fill(agu_state_t{});
     agu_issue_rr_ = 0;
   #endif
-  #ifdef TCU_TMEM_ENABLE
+  #ifdef VX_CFG_TCU_TMEM_ENABLE
     for (auto& row : tmem_data_) row.fill(0);
     tmem_free_.assign(1, {0, kTmemCols});
     tmem_allocs_.clear();
@@ -736,7 +736,7 @@ public:
           this->agu_start(b, wid, tpuArgs.fmt_d, base_addr, trace);
         } break;
       #endif
-      #ifdef TCU_TMEM_ENABLE
+      #ifdef VX_CFG_TCU_TMEM_ENABLE
         case TcuType::UMMA: {
           uint32_t a_desc = rs1_data.empty() ? 0 : rs1_data.at(0).u32;
           uint32_t b_desc = rs2_data.empty() ? 0 : rs2_data.at(0).u32;
@@ -805,7 +805,7 @@ public:
         delay = 3;
         break;
     #endif
-    #ifdef TCU_TMEM_ENABLE
+    #ifdef VX_CFG_TCU_TMEM_ENABLE
       case TcuType::UMMA:
         delay = kMmaLatency;
         break;
@@ -1163,7 +1163,7 @@ public:
     __unused(b_desc);
   }
 
-#ifdef TCU_TMEM_ENABLE
+#ifdef VX_CFG_TCU_TMEM_ENABLE
   // Unique per-launched-CTA identifier, linearized from block_idx against
   // grid_dim. NOT the same thing as cta_csrs.cta_id: that field is
   // the LMEM co-residency slot index, a value that gets 
@@ -1389,7 +1389,7 @@ public:
     perf_stats_.tmem_reads  += cfg::tcM * cfg::tcN;
     perf_stats_.tmem_writes += cfg::tcM * cfg::tcN;
   }
-#endif // TCU_TMEM_ENABLE
+#endif // VX_CFG_TCU_TMEM_ENABLE
 
   const PerfStats& perf_stats() const {
     // lmem_reads: total MemReq traffic from TcuTbuf (abuf + bbuf).
@@ -1678,7 +1678,7 @@ private:
   std::array<int32_t, VX_CFG_NUM_TCU_BLOCKS> cta_owner_a_{};
   int32_t cta_owner_b_ = -1;
 
-#ifdef TCU_TMEM_ENABLE
+#ifdef VX_CFG_TCU_TMEM_ENABLE
   // TMEM is architecturally per-SM on Blackwell GPUs, not per-tensor-core. 
   // Living inside TcuUnit::Impl here is correct because Vortex currently
   // instantiates exactly one TcuUnit per Core. If Vortex ever allows
@@ -1686,7 +1686,7 @@ private:
   // allocator need to move up to Core so it becomes correctly
   // SM-scoped instead of per-TC (which would also break the
   // CTA-scoped handle cache in tmem_alloc()/tmem_dealloc()).
-  static constexpr uint32_t kTmemCols  = 256;
+  static constexpr uint32_t kTmemCols  = VX_CFG_TCU_TMEM_COLS;
   // Lanes are sized to one warpgroup's width (VX_CFG_NUM_TCU_BLOCKS) and
   // shared/reused across concurrent warpgroups, addressed by each warp's
   // CTA-local rank
@@ -1729,7 +1729,7 @@ op_string_t TcuUnit::op_string(TcuType tcu_type, IntrTcuArgs args) {
   case TcuType::TCU_LD:
     return {"TCU_LD." + std::string((args.fmt_d & 0x10) ? "MX." : "SP.")
              + std::string(vt::fmt_string(args.fmt_s)) + ".slot" + std::to_string(args.fmt_d & 0xf), ""};
-#ifdef TCU_TMEM_ENABLE
+#ifdef VX_CFG_TCU_TMEM_ENABLE
   case TcuType::UMMA: {
     return {"UMMA." + std::string(vt::fmt_string(args.fmt_s)) + "." + std::string(vt::fmt_string(args.fmt_d))
              + "." + std::to_string(kNrcTable[args.umma_nrc])
@@ -1777,7 +1777,7 @@ uint32_t TcuUopGen::uop_count(const Instr& instr) {
     uint32_t mma_uops = k_count * nrc;
     return mma_uops + needs_setup;
   }
-#ifdef TCU_TMEM_ENABLE
+#ifdef VX_CFG_TCU_TMEM_ENABLE
   if (tcu_type == TcuType::UMMA) {
     uint32_t nrc = kNrcTable[args.umma_nrc];
     return wg_cfg::k_steps * nrc;
@@ -1967,7 +1967,7 @@ Instr::Ptr TcuUopGen::get(const Instr& macro_instr, uint32_t uop_index) {
     uop_instr->set_fu_lock(uop_index == 0);
     uop_instr->set_fu_unlock(uop_index == (total - 1));
   }
-#ifdef TCU_TMEM_ENABLE
+#ifdef VX_CFG_TCU_TMEM_ENABLE
   else if (tcu_type == TcuType::UMMA) {
     constexpr uint32_t m_steps = wg_cfg::m_steps;
     constexpr uint32_t a0 = 10, a1 = 11, a2 = 12; // desc_a, desc_b, tmem handle
@@ -2080,7 +2080,7 @@ void TcuUnit::wgmma(uint32_t wid,
                is_sparse, cd_nregs, is_a_smem, is_setup_uop);
 }
 
-#ifdef TCU_TMEM_ENABLE
+#ifdef VX_CFG_TCU_TMEM_ENABLE
 uint32_t TcuUnit::tmem_alloc(uint32_t ncols, int32_t cta_id) {
   return impl_->tmem_alloc(ncols, cta_id);
 }

@@ -81,6 +81,11 @@ inline bool decode_caps(uint64_t dev_caps, uint64_t isa_caps,
   case VX_CAPS_MEM_BANK_SIZE:
     *out = 1ull << (20 + ((dev_caps >> 37) & 0x1f));
     return true;
+  case VX_CAPS_TCU_TMEM_COLS: {
+    uint32_t log2_cols = (dev_caps >> 42) & 0x1f;
+    *out = log2_cols == 0 ? 0 : (1ull << log2_cols);
+    return true;
+  }
   default:
     return false;
   }

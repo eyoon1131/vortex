@@ -74,6 +74,7 @@ typedef struct vx_kernel* vx_kernel_h;
 #define VX_CAPS_VM_SUPPORT          0xF   // 1 if the device has an MMU (VM), else 0
 #define VX_CAPS_VM_PINNED_SIZE      0x10  // pinned-region total size (bytes); 0 if disabled
 #define VX_CAPS_VM_PINNED_FREE      0x11  // pinned-region free  size (bytes); 0 if disabled
+#define VX_CAPS_TCU_TMEM_COLS       0x12  // TCU tensor-memory column count; 0 if VX_CFG_TCU_TMEM_ENABLE is off
 
 // ============================================================================
 // Device ISA flags  (decode a VX_CAPS_ISA_FLAGS query result)

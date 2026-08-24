@@ -28,6 +28,11 @@ uint64_t gpu_dev_caps() {
     const unsigned cluster_size = VX_CFG_NUM_CORES / VX_CFG_SOCKET_SIZE;
     const unsigned bank_addr_w  = VX_CFG_PLATFORM_MEMORY_ADDR_WIDTH
                                 - cp_clog2(VX_CFG_PLATFORM_MEMORY_NUM_BANKS);
+#ifdef VX_CFG_TCU_TMEM_ENABLE
+    constexpr unsigned kTcuTmemCols = VX_CFG_TCU_TMEM_COLS;
+#else
+    constexpr unsigned kTcuTmemCols = 0;
+#endif
     return  (uint64_t(VX_ISA_IMPL_ID) & 0xFF)
          | ((uint64_t(cp_clog2(VX_CFG_NUM_THREADS))  & 0x7)  << 8)
          | ((uint64_t(cp_clog2(VX_CFG_NUM_WARPS))    & 0x7)  << 11)
@@ -37,7 +42,8 @@ uint64_t gpu_dev_caps() {
          | ((uint64_t(cp_clog2(VX_CFG_ISSUE_WIDTH))  & 0x7)  << 23)
          | ((uint64_t(VX_CFG_LMEM_ENABLED ? VX_CFG_LMEM_LOG_SIZE : 0) & 0xFF) << 26)
          | ((uint64_t(cp_clog2(VX_CFG_PLATFORM_MEMORY_NUM_BANKS)) & 0x7) << 34)
-         | ((uint64_t(bank_addr_w - 20) & 0x1F) << 37);
+         | ((uint64_t(bank_addr_w - 20) & 0x1F) << 37)
+         | ((uint64_t(kTcuTmemCols == 0 ? 0 : cp_clog2(kTcuTmemCols)) & 0x1F) << 42);
 }
 uint64_t gpu_isa_caps() {
     return  (uint64_t(VX_CFG_MISA_EXT) << 32)

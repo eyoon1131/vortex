@@ -1171,7 +1171,7 @@ public:
   }
 };
 
-#ifdef TCU_TMEM_ENABLE
+#ifdef VX_CFG_TCU_TMEM_ENABLE
 
 // =============================================================================
 // UMMA / TMEM: A/B from SMEM via descriptors (same as WGMMA's SS mode), C/D
@@ -1362,7 +1362,7 @@ public:
   }
 };
 
-#endif // TCU_TMEM_ENABLE
+#endif // VX_CFG_TCU_TMEM_ENABLE
 
 } // namespace tensor
 } // namespace vortex

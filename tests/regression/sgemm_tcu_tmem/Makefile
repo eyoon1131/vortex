@@ -14,7 +14,7 @@ VX_SRCS := $(SRC_DIR)/kernel.cpp
 CONFIGS := $(if $(findstring -DVX_CFG_NUM_WARPS=,$(CONFIGS)),$(CONFIGS),$(CONFIGS) -DVX_CFG_NUM_WARPS=4)
 CONFIGS := $(if $(findstring -DVX_CFG_ISSUE_WIDTH=,$(CONFIGS)),$(CONFIGS),$(CONFIGS) -DVX_CFG_ISSUE_WIDTH=4)
 CONFIGS += -DVX_CFG_TCU_WGMMA_ENABLE
-CONFIGS += -DTCU_TMEM_ENABLE
+CONFIGS += -DVX_CFG_TCU_TMEM_ENABLE
 
 OPTS := $(OPTS) $(if $(findstring -m,$(OPTS)),,-m 16)
 OPTS := $(OPTS) $(if $(findstring -n,$(OPTS)),,-n 16)

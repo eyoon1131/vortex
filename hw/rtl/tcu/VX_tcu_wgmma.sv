@@ -74,7 +74,7 @@ module VX_tcu_wgmma import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                        || (exec_data[bi].op_type == INST_TCU_WGMMA_SP)
                     `endif
                        ;
-    `ifdef TCU_TMEM_ENABLE
+    `ifdef VX_CFG_TCU_TMEM_ENABLE
         // UMMA shares the same tbuf/lockstep path but is NOT interchangeable
         // with is_wgmma_op everywhere: UMMA has wb=0 on every uop (not just a
         // setup one, since C/D lives in TMEM), so it must never participate
@@ -111,7 +111,7 @@ module VX_tcu_wgmma import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                 if (exec_valid[bi] && exec_ready[bi]
                  && (is_setup_uop_b_w[bi]
                   || (is_first_uop_b_w[bi] && !needs_setup_b_w[bi]))) begin
-                `ifdef TCU_TMEM_ENABLE
+                `ifdef VX_CFG_TCU_TMEM_ENABLE
                     if ((exec_data[bi].op_type == INST_TCU_UMMA) || exec_data[bi].op_args.tcu.a_from_smem)
                         desc_a_r[bi] <= exec_data[bi].rs1_data[0];
                 `else
@@ -151,7 +151,7 @@ module VX_tcu_wgmma import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                        || (exec_data[bi].op_type == INST_TCU_WGMMA_SP)
                     `endif
                        ;
-    `ifdef TCU_TMEM_ENABLE
+    `ifdef VX_CFG_TCU_TMEM_ENABLE
         wire is_umma_b = (exec_data[bi].op_type == INST_TCU_UMMA);
         wire is_mma_b  = is_wgmma_b || is_umma_b;
     `else
@@ -166,7 +166,7 @@ module VX_tcu_wgmma import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         assign req[bi].step_m       = exec_data[bi].op_args.tcu.step_m;
         assign req[bi].step_k       = exec_data[bi].op_args.tcu.step_k;
         assign req[bi].step_n       = exec_data[bi].op_args.tcu.step_n;
-    `ifdef TCU_TMEM_ENABLE
+    `ifdef VX_CFG_TCU_TMEM_ENABLE
         // UMMA's NRC code is repurposed onto {a_from_smem,cd_nregs}
         assign req[bi].cd_nregs     = is_umma_b
             ? {exec_data[bi].op_args.tcu.a_from_smem, exec_data[bi].op_args.tcu.cd_nregs}
@@ -178,7 +178,7 @@ module VX_tcu_wgmma import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                           && !needs_setup_b_w[bi];
         assign req[bi].desc_a       = use_live_desc ? exec_data[bi].rs1_data[0] : desc_a_r[bi];
         assign req[bi].desc_b       = use_live_desc ? exec_data[bi].rs2_data[0] : desc_b_r[bi];
-    `ifdef TCU_TMEM_ENABLE
+    `ifdef VX_CFG_TCU_TMEM_ENABLE
         assign req[bi].a_is_smem    = is_umma_b || exec_data[bi].op_args.tcu.a_from_smem;
     `else
         assign req[bi].a_is_smem    = exec_data[bi].op_args.tcu.a_from_smem;

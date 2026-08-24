@@ -604,7 +604,7 @@ package VX_gpu_pkg;
     // TCU_LD — warp-level load into a metadata SRAM namespace.
     localparam INST_TCU_LD         = 4'h5;
 `endif
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
     // UMMA: A/B from SMEM via descriptors, C/D accumulator in TMEM
     localparam INST_TCU_TMEM_ALLOC   = 4'h6;
     localparam INST_TCU_TMEM_DEALLOC = 4'h7;
@@ -1093,7 +1093,7 @@ package VX_gpu_pkg;
         logic [PERF_CTR_BITS-1:0] wgmma_stalls;      // cycles: WGMMA valid but stalled (tbuf or mdata)
         logic [PERF_CTR_BITS-1:0] wgmma_instrs;      // WGMMA µops executed
         logic [PERF_CTR_BITS-1:0] tbuf_stalls;         // cycles: WGMMA valid but stalled (uop cannot enter TCU core because tbuf data not ready)
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
         logic [PERF_CTR_BITS-1:0] umma_instrs;       // UMMA µops executed
         logic [PERF_CTR_BITS-1:0] tmem_reads;        // TMEM elements read (UMMA C + tmem_ld)
         logic [PERF_CTR_BITS-1:0] tmem_writes;       // TMEM elements written (UMMA D + tmem_st)

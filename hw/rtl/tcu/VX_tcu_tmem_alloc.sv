@@ -13,7 +13,7 @@
 
 `include "VX_define.vh"
 
-`ifdef TCU_TMEM_ENABLE
+`ifdef VX_CFG_TCU_TMEM_ENABLE
 
 // Per-CTA TMEM allocator: a first-fit free list + a live-allocation CAM
 // over the column dimension
@@ -188,25 +188,27 @@ module VX_tcu_tmem_alloc import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     wire dealloc_completes = req_dealloc && handle_match_found
         && ((live_dealloc_count[handle_match_idx] + 8'd1) >= 8'(WARPGROUP_SIZE));
 
-    assign resp_valid  = req_valid;
+    // A fresh ALLOC this cycle can't be satisfied yet — either no free range
+    // is large enough or there's no free CAM slot. Stall by withholding
+    // resp_valid so caller doesn't fire this cycle.
+    wire alloc_would_stall = alloc_is_fresh && (!free_fit_found || !cam_slot_found);
+
+    assign resp_valid  = req_valid && !alloc_would_stall;
     assign resp_handle = alloc_is_repeat ? live_handle[cta_match_idx]
                         : alloc_is_fresh ? free_start[free_fit_idx]
                         : '0;
 
     // -----------------------------------------------------------------------
-    // Diagnostics — kernel bugs, not recoverable conditions 
+    // Diagnostics — kernel bugs, not recoverable conditions
     // -----------------------------------------------------------------------
     `RUNTIME_ASSERT (~alloc_is_repeat || (live_ncols[cta_match_idx] == req_ncols),
         ("%s: TMEM_ALLOC ncols mismatch for cta_id %0d (existing=%0d, requested=%0d) — one CTA can only hold one live allocation",
          INSTANCE_ID, req_cta_id, live_ncols[cta_match_idx], req_ncols))
 
-    `RUNTIME_ASSERT (~alloc_is_fresh || free_fit_found,
-        ("%s: TMEM allocation failed for cta_id %0d (ncols=%0d) — no free range large enough",
-         INSTANCE_ID, req_cta_id, req_ncols))
-
-    `RUNTIME_ASSERT (~alloc_is_fresh || !free_fit_found || cam_slot_found,
-        ("%s: TMEM allocation failed for cta_id %0d — no free CAM slot (allocator undersized)",
-         INSTANCE_ID, req_cta_id))
+    // A request wider than TMEM could ever satisfy
+    `RUNTIME_ASSERT (~req_alloc || (SIZEW'(req_ncols) <= SIZEW'(TCU_TMEM_COLS)),
+        ("%s: TMEM_ALLOC request for cta_id %0d (ncols=%0d) exceeds TCU_TMEM_COLS (%0d) — unsatisfiable",
+         INSTANCE_ID, req_cta_id, req_ncols, TCU_TMEM_COLS))
 
     `RUNTIME_ASSERT (~req_dealloc || handle_match_found,
         ("%s: TMEM_DEALLOC unknown handle %0d", INSTANCE_ID, req_handle))
@@ -273,4 +275,4 @@ module VX_tcu_tmem_alloc import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
 endmodule
 
-`endif // TCU_TMEM_ENABLE
+`endif // VX_CFG_TCU_TMEM_ENABLE
