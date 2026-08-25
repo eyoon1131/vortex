@@ -141,15 +141,15 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
     reg [UOP_CTR_W-1:0] wg_compute_uop_cnt;
     always_comb begin
         case (ibuf_in.op_args.tcu.cd_nregs)
-            2'd0: wg_compute_uop_cnt = UOP_CTR_W'(WG_UOPS_NR8);
-            2'd1: wg_compute_uop_cnt = UOP_CTR_W'(WG_UOPS_NR16);
+            3'd0: wg_compute_uop_cnt = UOP_CTR_W'(WG_UOPS_NR8);
+            3'd1: wg_compute_uop_cnt = UOP_CTR_W'(WG_UOPS_NR16);
             default: wg_compute_uop_cnt = UOP_CTR_W'(WG_UOPS_NR32);
         endcase
     `ifdef VX_CFG_TCU_SPARSE_ENABLE
         if (wg_is_sparse) begin
             case (ibuf_in.op_args.tcu.cd_nregs)
-                2'd0: wg_compute_uop_cnt = UOP_CTR_W'(WG_UOPS_SP_NR8);
-                2'd1: wg_compute_uop_cnt = UOP_CTR_W'(WG_UOPS_SP_NR16);
+                3'd0: wg_compute_uop_cnt = UOP_CTR_W'(WG_UOPS_SP_NR8);
+                3'd1: wg_compute_uop_cnt = UOP_CTR_W'(WG_UOPS_SP_NR16);
                 default: wg_compute_uop_cnt = UOP_CTR_W'(WG_UOPS_SP_NR32);
             endcase
             wg_uop_cnt = wg_compute_uop_cnt;
@@ -183,11 +183,11 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
             // Dense K-outer: m (inner) → n (middle) → k (outer)
             // n width varies by cd_nregs; k bit shifts accordingly.
             case (ibuf_in.op_args.tcu.cd_nregs)
-                2'd0: begin // nrc=8, n_steps=4, LG_N=2
+                3'd0: begin // nrc=8, n_steps=4, LG_N=2
                     wg_n_index = `UP(LG_N_WG_MAX)'(wg_idx_ctr[LG_M_WG +: 2]);
                     wg_k_index = `UP(LG_K_WG)'(wg_idx_ctr[LG_M_WG + 2 +: `UP(LG_K_WG)]);
                 end
-                2'd1: begin // nrc=16, n_steps=8, LG_N=3
+                3'd1: begin // nrc=16, n_steps=8, LG_N=3
                     wg_n_index = `UP(LG_N_WG_MAX)'(wg_idx_ctr[LG_M_WG +: 3]);
                     wg_k_index = `UP(LG_K_WG)'(wg_idx_ctr[LG_M_WG + 3 +: `UP(LG_K_WG)]);
                 end
@@ -227,9 +227,8 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
     wire is_umma = (ibuf_in.op_type == INST_TCU_UMMA);
     wire is_first_uop_umma = (ctr == '0);
 
-    // NRC encoding (0..4 -> 8/16/32/64/128) repurposed onto {a_from_smem,
-    // cd_nregs}
-    wire [2:0] umma_nrc_enc = {ibuf_in.op_args.tcu.a_from_smem, ibuf_in.op_args.tcu.cd_nregs};
+    // NRC encoding (0..4 -> 8/16/32/64/128), decoded from cd_nregs
+    wire [2:0] umma_nrc_enc = ibuf_in.op_args.tcu.cd_nregs;
 
     localparam LG_N_UMMA_MAX = $clog2(TCU_UMMA_N_STEPS); // 6 (NRC=128)
 
@@ -424,9 +423,9 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
     `endif
     `ifdef VX_CFG_TCU_TMEM_ENABLE
         if (is_umma) begin
-            ibuf_r.op_args.tcu.step_m = 3'(umma_m_index);
-            ibuf_r.op_args.tcu.step_n = 6'(umma_n_index);
-            ibuf_r.op_args.tcu.step_k = 3'(umma_k_index);
+            ibuf_r.op_args.tcu.step_m = 2'(umma_m_index);
+            ibuf_r.op_args.tcu.step_n = 7'(umma_n_index);
+            ibuf_r.op_args.tcu.step_k = 2'(umma_k_index);
             // No register writeback
             ibuf_r.wb = 1'b0;
             // A descriptor (x10), B descriptor (x11), TMEM handle (x12)
@@ -441,9 +440,9 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
     `endif
     `ifdef VX_CFG_TCU_WGMMA_ENABLE
         if (is_wgmma) begin
-            ibuf_r.op_args.tcu.step_m = is_wg_setup_uop ? 3'd0 : 3'(wg_m_index);
-            ibuf_r.op_args.tcu.step_n = is_wg_setup_uop ? 6'd0 : 6'(wg_n_index);
-            ibuf_r.op_args.tcu.step_k = is_wg_setup_uop ? 3'd0 : 3'(wg_k_index);
+            ibuf_r.op_args.tcu.step_m = is_wg_setup_uop ? 2'd0 : 2'(wg_m_index);
+            ibuf_r.op_args.tcu.step_n = is_wg_setup_uop ? 7'd0 : 7'(wg_n_index);
+            ibuf_r.op_args.tcu.step_k = is_wg_setup_uop ? 2'd0 : 2'(wg_k_index);
             ibuf_r.wb  = !is_wg_setup_uop;
             ibuf_r.rd  = make_reg_num(REG_TYPE_F, TCU_WG_RC + wg_rs3_off);
             ibuf_r.rs3 = make_reg_num(REG_TYPE_F, TCU_WG_RC + wg_rs3_off);
@@ -483,9 +482,9 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
             m_sp_s = 4'(eff_ctr[(LG_N + LG_K) +: LG_M]);
         end
 
-        ibuf_r.op_args.tcu.step_m = SYM_SPARSE && is_sparse ? 3'(m_sp_s) : 3'(m_index);
-        ibuf_r.op_args.tcu.step_n = SYM_SPARSE && is_sparse ? 6'(n_sp_s >> LG_K) : 6'(n_index);
-        ibuf_r.op_args.tcu.step_k = SYM_SPARSE && is_sparse ? 3'(0)      : 3'(k_index);
+        ibuf_r.op_args.tcu.step_m = SYM_SPARSE && is_sparse ? 2'(m_sp_s) : 2'(m_index);
+        ibuf_r.op_args.tcu.step_n = SYM_SPARSE && is_sparse ? 7'(n_sp_s >> LG_K) : 7'(n_index);
+        ibuf_r.op_args.tcu.step_k = SYM_SPARSE && is_sparse ? 2'(0)      : 2'(k_index);
         ibuf_r.wb = 1'b1;
         ibuf_r.rd = make_reg_num(REG_TYPE_F, rs3);
         ibuf_r.rs1 = make_reg_num(REG_TYPE_F, rs1);
@@ -495,9 +494,9 @@ module VX_tcu_uops import VX_tcu_pkg::*, VX_gpu_pkg::*; (
         ibuf_r.used_rs[1] = 1'b1;
         ibuf_r.used_rs[2] = 1'b1;
     `else
-        ibuf_r.op_args.tcu.step_m = 3'(m_index);
-        ibuf_r.op_args.tcu.step_n = 6'(n_index);
-        ibuf_r.op_args.tcu.step_k = 3'(k_index);
+        ibuf_r.op_args.tcu.step_m = 2'(m_index);
+        ibuf_r.op_args.tcu.step_n = 7'(n_index);
+        ibuf_r.op_args.tcu.step_k = 2'(k_index);
         ibuf_r.wb  = 1'b1;
         ibuf_r.rd  = make_reg_num(REG_TYPE_F, rs3);
         ibuf_r.rs1 = make_reg_num(REG_TYPE_F, rs1);

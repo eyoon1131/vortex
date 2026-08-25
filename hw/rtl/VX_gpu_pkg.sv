@@ -720,7 +720,7 @@ package VX_gpu_pkg;
 
     //////////////////////// instruction arguments ////////////////////////////
 
-    // tcu_args_t at 27 bits = 1+1+1+2+5+5+4+4+4. Sparse variants are distinct opcodes.
+    // tcu_args_t at 27 bits = 1+1+1+3+5+5+2+7+2. Sparse variants are distinct opcodes.
     localparam INST_ARGS_BITS = 3 + ALU_TYPE_BITS + 20 + 2;
 
     typedef struct packed {
@@ -798,12 +798,13 @@ package VX_gpu_pkg;
         logic is_last_uop;    // WGMMA/UMMA: set on last sub-uop of an expansion
         logic is_first_uop;   // WGMMA/UMMA: set on first sub-uop of an expansion
         logic a_from_smem;    // 0=register, 1=shared memory (B is always smem)
-        logic [1:0] cd_nregs; // 0=8, 1=16, 2=32 C/D registers
+        logic [2:0] cd_nregs; // WGMMA: 0=8, 1=16, 2=32 C/D registers
+                              // UMMA:  0..4 -> NRC 8/16/32/64/128
         logic [4:0] fmt_d;
         logic [4:0] fmt_s;
-        logic [2:0] step_k;   // step_k only ever hold 0 or 1 (k_steps <= 2)
-        logic [5:0] step_n;   // UMMA n_steps can reach 64 at NRC=128
-        logic [2:0] step_m;   // step_m only ever hold 0 or 1 (m_steps = 2)
+        logic [1:0] step_k;   // step_k only ever hold 0 or 1 (k_steps <= 2)
+        logic [6:0] step_n;   // UMMA n_steps can reach 64 at NRC=128
+        logic [1:0] step_m;   // step_m only ever hold 0 or 1 (m_steps = 2)
     } tcu_args_t;
     `PACKAGE_ASSERT($bits(tcu_args_t) == INST_ARGS_BITS)
 `endif

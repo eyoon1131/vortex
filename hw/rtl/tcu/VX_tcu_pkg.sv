@@ -398,7 +398,7 @@ package VX_tcu_pkg;
                 `TRACE(level, ("."));
                 trace_fmt(level, op_args.tcu.fmt_d);
                 `TRACE(level, (".%0d.%sS.%0d.%0d",
-                    (op_args.tcu.cd_nregs == 2'd0) ? 8 : (op_args.tcu.cd_nregs == 2'd1) ? 16 : 32,
+                    (op_args.tcu.cd_nregs == 3'd0) ? 8 : (op_args.tcu.cd_nregs == 3'd1) ? 16 : 32,
                     op_args.tcu.a_from_smem ? "S" : "R",
                     op_args.tcu.step_m, op_args.tcu.step_n));
             end
@@ -425,7 +425,7 @@ package VX_tcu_pkg;
                 `TRACE(level, ("."));
                 trace_fmt(level, op_args.tcu.fmt_d);
                 `TRACE(level, (".%0d.%sS.%0d.%0d",
-                    (op_args.tcu.cd_nregs == 2'd0) ? 8 : (op_args.tcu.cd_nregs == 2'd1) ? 16 : 32,
+                    (op_args.tcu.cd_nregs == 3'd0) ? 8 : (op_args.tcu.cd_nregs == 3'd1) ? 16 : 32,
                     op_args.tcu.a_from_smem ? "S" : "R",
                     op_args.tcu.step_m, op_args.tcu.step_n));
             end
@@ -458,9 +458,9 @@ package VX_tcu_pkg;
         logic [UUID_WIDTH-1:0]      uuid;   // originating WGMMA instruction uuid
         logic [NW_WIDTH-1:0]        wid;
         logic [NCTA_WIDTH-1:0]      cta_id;
-        logic [2:0]                 step_m;
-        logic [5:0]                 step_n;
-        logic [2:0]                 step_k;
+        logic [1:0]                 step_m;
+        logic [6:0]                 step_n;
+        logic [1:0]                 step_k;
         logic [2:0]                 cd_nregs;
         logic [`VX_CFG_XLEN-1:0]    desc_a;
         logic [`VX_CFG_XLEN-1:0]    desc_b;

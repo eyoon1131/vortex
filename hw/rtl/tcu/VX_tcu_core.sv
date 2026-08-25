@@ -187,12 +187,12 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 `endif
 
     // Widths match tcu_args_t: step_m/step_k only ever hold 0 or 1
-    // (m_steps fixed at 2, k_steps at most 2) but are kept wider for 
-    // headroom; step_n needs up to 6 bits for UMMA's NRC=128 case
-    // (n_steps=64)
-    wire [2:0] step_m = execute_if.data.op_args.tcu.step_m;
-    wire [5:0] step_n = execute_if.data.op_args.tcu.step_n;
-    wire [2:0] step_k = execute_if.data.op_args.tcu.step_k;
+    // (m_steps fixed at 2, k_steps at most 2); step_n needs up to 6
+    // bits for UMMA's NRC=128 case (n_steps=64), all fields kept
+    // one bit wider for headroom
+    wire [1:0] step_m = execute_if.data.op_args.tcu.step_m;
+    wire [6:0] step_n = execute_if.data.op_args.tcu.step_n;
+    wire [1:0] step_k = execute_if.data.op_args.tcu.step_k;
 
     wire [4:0] fmt_s = execute_if.data.op_args.tcu.fmt_s;
     wire [4:0] fmt_d = execute_if.data.op_args.tcu.fmt_d;

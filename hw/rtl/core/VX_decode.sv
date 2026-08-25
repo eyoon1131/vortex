@@ -687,13 +687,13 @@ module VX_decode import
                             default: begin // 3'h7: UMMA
                                 // A/B from SMEM via descriptors (shares WGMMA's
                                 // tbuf/lockstep path), C/D accumulator in TMEM.
-                                // rs2[3:1] carries the NRC encoding (0..4 -> 8/16/32/
-                                // 64/128); repurposed onto {a_from_smem,
-                                // cd_nregs} since UMMA has no dedicated NRC
-                                // field in the packed tcu_args_t
+                                // rs2[3:1] carries the NRC encoding (0..4 ->
+                                // 8/16/32/64/128), decoded directly into
+                                // cd_nregs.
                                 op_type = INST_OP_BITS'(INST_TCU_UMMA);
-                                op_args.tcu.cd_nregs    = rs2[2:1];
-                                op_args.tcu.a_from_smem = rs2[3];
+                                op_args.tcu.cd_nregs    = rs2[3:1];
+                                // UMMA's A operand always from shared memory
+                                op_args.tcu.a_from_smem = 1'b1;
                                 op_args.tcu.fmt_s       = rs1[4:0];
                                 op_args.tcu.fmt_d       = rd[4:0];
                             end
@@ -725,7 +725,7 @@ module VX_decode import
                                 op_type = INST_OP_BITS'(INST_TCU_WMMA);
                         `endif
                             end
-                            op_args.tcu.cd_nregs    = rs2[2:1];
+                            op_args.tcu.cd_nregs    = 3'(rs2[2:1]);
                             op_args.tcu.a_from_smem = rs2[3];
                             op_args.tcu.fmt_s  = rs1[4:0];
                             op_args.tcu.fmt_d  = rd[4:0];

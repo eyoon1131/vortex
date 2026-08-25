@@ -30,6 +30,8 @@ uint64_t gpu_dev_caps() {
                                 - cp_clog2(VX_CFG_PLATFORM_MEMORY_NUM_BANKS);
 #ifdef VX_CFG_TCU_TMEM_ENABLE
     constexpr unsigned kTcuTmemCols = VX_CFG_TCU_TMEM_COLS;
+    static_assert((kTcuTmemCols & (kTcuTmemCols - 1)) == 0,
+                  "VX_CFG_TCU_TMEM_COLS must be a power of 2");
 #else
     constexpr unsigned kTcuTmemCols = 0;
 #endif

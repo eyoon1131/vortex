@@ -91,6 +91,8 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     localparam ARB_W       = 2 * BLOCK_SIZE;
     localparam ARB_IDX_W   = `LOG2UP(ARB_W);
 
+    `STATIC_ASSERT ((TCU_TMEM_COLS & (TCU_TMEM_COLS - 1)) == 0, ("VX_CFG_TCU_TMEM_COLS must be a power of 2"))
+
     // Per-bank storage
 
     // OUT_REG=1, RDW_MODE="R" makes bank
@@ -154,6 +156,23 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         end else begin : g_col_real
             assign ldst_col[bi] = COL_IDX_W'(ldst_addr_col[COL_SEL_W-1:0]);
         end
+
+        // Bounds check: lane must be physically valid
+        logic ldst_col_live;
+        always_comb begin
+            ldst_col_live = 1'b0;
+            for (int e = 0; e < ALLOC_NUM_ENTRIES; ++e) begin
+                if (alloc_live_valid[e]
+                    && ({1'b0, ldst_addr_col} >= {1'b0, alloc_live_handle[e]})
+                    && ({1'b0, ldst_addr_col} < ({1'b0, alloc_live_handle[e]} + {1'b0, alloc_live_ncols[e]}))) begin
+                    ldst_col_live = 1'b1;
+                end
+            end
+        end
+        `RUNTIME_ASSERT (~(is_tmem_ld[bi] || is_tmem_st[bi]) || (32'(ldst_lane) < 32'(TCU_TMEM_LANES)),
+            ("%s: TMEM_LD/ST lane %0d exceeds TCU_TMEM_LANES (%0d)", INSTANCE_ID, ldst_lane, TCU_TMEM_LANES))
+        `RUNTIME_ASSERT (~(is_tmem_ld[bi] || is_tmem_st[bi]) || ldst_col_live,
+            ("%s: TMEM_LD/ST column %0d not within any active allocation", INSTANCE_ID, ldst_addr_col))
     end
 
     // -----------------------------------------------------------------------
@@ -458,18 +477,26 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     wire                          alloc_resp_valid;
     wire [TCU_TMEM_COL_BITS-1:0]  alloc_resp_handle;
 
+    localparam ALLOC_NUM_ENTRIES = (`VX_CFG_NUM_WARPS / `VX_CFG_NUM_TCU_BLOCKS) + 1;
+    wire                         alloc_live_valid  [ALLOC_NUM_ENTRIES];
+    wire [TCU_TMEM_COL_BITS-1:0] alloc_live_handle [ALLOC_NUM_ENTRIES];
+    wire [7:0]                   alloc_live_ncols  [ALLOC_NUM_ENTRIES];
+
     VX_tcu_tmem_alloc #(
         .INSTANCE_ID (`SFORMATF(("%s-alloc", INSTANCE_ID)))
     ) alloc (
-        .clk            (clk),
-        .reset          (reset),
-        .req_valid      (alloc_req_valid),
-        .req_is_dealloc (alloc_req_is_dealloc),
-        .req_cta_id     (alloc_req_cta_id),
-        .req_ncols      (alloc_req_ncols),
-        .req_handle     (alloc_req_handle),
-        .resp_valid     (alloc_resp_valid),
-        .resp_handle    (alloc_resp_handle)
+        .clk             (clk),
+        .reset           (reset),
+        .req_valid       (alloc_req_valid),
+        .req_is_dealloc  (alloc_req_is_dealloc),
+        .req_cta_id      (alloc_req_cta_id),
+        .req_ncols       (alloc_req_ncols),
+        .req_handle      (alloc_req_handle),
+        .resp_valid      (alloc_resp_valid),
+        .resp_handle     (alloc_resp_handle),
+        .live_valid_out  (alloc_live_valid),
+        .live_handle_out (alloc_live_handle),
+        .live_ncols_out  (alloc_live_ncols)
     );
 
     // Bypass execute<->result handshake: same-cycle response, no queueing.

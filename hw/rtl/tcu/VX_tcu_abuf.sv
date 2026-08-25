@@ -63,9 +63,9 @@ module VX_tcu_abuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     input  wire [NW_WIDTH-1:0]      req_wid,
     input  wire                     req_valid,
     input  wire                     req_setup,
-    input  wire [2:0]               req_step_m,
-    input  wire [5:0]               req_step_n,
-    input  wire [2:0]               req_step_k,
+    input  wire [1:0]               req_step_m,
+    input  wire [6:0]               req_step_n,
+    input  wire [1:0]               req_step_k,
     input  wire [`VX_CFG_XLEN-1:0]  req_desc_a,
     input  wire                     req_a_is_smem,
     input  wire                     req_is_sparse,
@@ -133,8 +133,8 @@ module VX_tcu_abuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     logic                       slot_is_sparse_r;
 
     wire [`UP(K_STEPS_W)-1:0]   req_step_k_trunc = `UP(K_STEPS_W)'(req_step_k);
-    if (3 > K_STEPS_W) begin : g_step_k_upper_unused
-        `UNUSED_VAR (req_step_k[2:`UP(K_STEPS_W)])
+    if (2 > K_STEPS_W) begin : g_step_k_upper_unused
+        `UNUSED_VAR (req_step_k[1:`UP(K_STEPS_W)])
     end
 
     // The WGMMA wrapper supplies the setup-latched descriptor on compute uops.

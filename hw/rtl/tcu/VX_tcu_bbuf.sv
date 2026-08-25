@@ -56,9 +56,9 @@ module VX_tcu_bbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     input  wire                     req_setup,
     input  wire                     req_is_first_uop,
     input  wire                     req_is_sparse,
-    input  wire [2:0]               req_step_m,
-    input  wire [2:0]               req_step_k,
-    input  wire [5:0]               req_step_n,
+    input  wire [1:0]               req_step_m,
+    input  wire [1:0]               req_step_k,
+    input  wire [6:0]               req_step_n,
     input  wire [2:0]               req_cd_nregs,
     input  wire [NCTA_WIDTH-1:0]    req_cta_id,
     input  wire [`VX_CFG_XLEN-1:0]  req_desc_b,
@@ -120,8 +120,7 @@ module VX_tcu_bbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // -----------------------------------------------------------------------
     // Block-index compute (variable N_STEPS via cd_nregs).
     // K_STEPS=2 always; N_STEPS=4/8/16/32/64 for cd_nregs=0/1/2/3/4
-    // (WGMMA NRC=8/16/32; UMMA additionally 64/128 via its repurposed
-    // {a_from_smem,cd_nregs} 3-bit code)
+    // (WGMMA NRC=8/16/32; UMMA additionally 64/128)
     // -----------------------------------------------------------------------
 
     logic [6:0] block_index;
@@ -134,8 +133,8 @@ module VX_tcu_bbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             default: block_index = {      req_step_k[0], req_step_n[5:0]};   // N_STEPS=64 (NRC=128)
         endcase
     end
-    if (3 > 1) begin : g_step_k_upper_unused
-        `UNUSED_VAR (req_step_k[2:1])
+    if (2 > 1) begin : g_step_k_upper_unused
+        `UNUSED_VAR (req_step_k[1:1])
     end
 
     // LMEM bank-row offset.
@@ -208,8 +207,8 @@ module VX_tcu_bbuf import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // on setup; per-compute step fields are latched when a fetch is allocated.
     logic                       slot_row_major_r;
     logic [LDM_W-1:0]           slot_ldm_words_r;
-    logic [2:0]                 slot_step_k_r;
-    logic [5:0]                 slot_step_n_r;
+    logic [1:0]                 slot_step_k_r;
+    logic [6:0]                 slot_step_n_r;
     logic [NCTA_WIDTH-1:0]      slot_cta_id_r;
     // K-major descriptors can point to storage rewritten between WGMMA instructions.
     logic                       refetched_for_first_uop_r;

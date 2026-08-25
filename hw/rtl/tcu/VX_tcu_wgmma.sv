@@ -166,14 +166,7 @@ module VX_tcu_wgmma import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         assign req[bi].step_m       = exec_data[bi].op_args.tcu.step_m;
         assign req[bi].step_k       = exec_data[bi].op_args.tcu.step_k;
         assign req[bi].step_n       = exec_data[bi].op_args.tcu.step_n;
-    `ifdef VX_CFG_TCU_TMEM_ENABLE
-        // UMMA's NRC code is repurposed onto {a_from_smem,cd_nregs}
-        assign req[bi].cd_nregs     = is_umma_b
-            ? {exec_data[bi].op_args.tcu.a_from_smem, exec_data[bi].op_args.tcu.cd_nregs}
-            : {1'b0, exec_data[bi].op_args.tcu.cd_nregs};
-    `else
         assign req[bi].cd_nregs     = exec_data[bi].op_args.tcu.cd_nregs;
-    `endif
         wire use_live_desc = is_first_uop_b_w[bi]
                           && !needs_setup_b_w[bi];
         assign req[bi].desc_a       = use_live_desc ? exec_data[bi].rs1_data[0] : desc_a_r[bi];

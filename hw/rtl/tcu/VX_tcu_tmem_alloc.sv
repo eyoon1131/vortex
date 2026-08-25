@@ -36,7 +36,9 @@
 
 module VX_tcu_tmem_alloc import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     parameter `STRING INSTANCE_ID  = "",
-    parameter         WARPGROUP_SIZE = `VX_CFG_NUM_TCU_BLOCKS
+    parameter         WARPGROUP_SIZE = `VX_CFG_NUM_TCU_BLOCKS,
+    localparam        MAX_CONCURRENT_CTAS = `VX_CFG_NUM_WARPS / WARPGROUP_SIZE,
+    localparam        NUM_ENTRIES         = MAX_CONCURRENT_CTAS + 1
 ) (
     input wire clk,
     input wire reset,
@@ -48,13 +50,16 @@ module VX_tcu_tmem_alloc import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     input  wire [TCU_TMEM_COL_BITS-1:0] req_handle,
 
     output wire                         resp_valid,
-    output wire [TCU_TMEM_COL_BITS-1:0] resp_handle
+    output wire [TCU_TMEM_COL_BITS-1:0] resp_handle,
+
+    // Live-allocation table, exposed read-only so callers can bounds-check
+    // TMEM_LD/TMEM_ST addresses against live ranges
+    output wire                         live_valid_out  [NUM_ENTRIES],
+    output wire [TCU_TMEM_COL_BITS-1:0] live_handle_out [NUM_ENTRIES],
+    output wire [7:0]                   live_ncols_out  [NUM_ENTRIES]
 );
     `UNUSED_SPARAM (INSTANCE_ID)
 
-    // Both arrays sized to (max concurrent CTAs + 1)
-    localparam MAX_CONCURRENT_CTAS = `VX_CFG_NUM_WARPS / WARPGROUP_SIZE;
-    localparam NUM_ENTRIES         = MAX_CONCURRENT_CTAS + 1;
     localparam ENTRY_BITS           = `CLOG2(NUM_ENTRIES);
     localparam COLW                 = TCU_TMEM_COL_BITS;
     localparam SIZEW                = TCU_TMEM_COL_BITS + 1;
@@ -71,6 +76,12 @@ module VX_tcu_tmem_alloc import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     logic [COLW-1:0]       live_handle        [NUM_ENTRIES];
     logic [7:0]            live_ncols         [NUM_ENTRIES];
     logic [7:0]            live_dealloc_count [NUM_ENTRIES];
+
+    for (genvar i = 0; i < NUM_ENTRIES; ++i) begin : g_live_export
+        assign live_valid_out[i]  = live_valid[i];
+        assign live_handle_out[i] = live_handle[i];
+        assign live_ncols_out[i]  = live_ncols[i];
+    end
 
     // -----------------------------------------------------------------------
     // Combinational searches
