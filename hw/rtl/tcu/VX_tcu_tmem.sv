@@ -125,11 +125,16 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         // TCU_WG_TILE_M and TCU_TC_N are always powers of 2 so
         // lane_base/col_base are bit-sliced. Word uses COL_SEL_W (the true
         // bit count), not COL_IDX_W
-        assign rd_bank[bi] = BANK_IDX_W'(rd_lane_base[bi][TCU_TMEM_LANE_BITS-1:ROW_IDX_W]);
+        if (BLOCK_SIZE == 1) begin : g_bank_trivial
+            assign rd_bank[bi]  = '0;
+            assign wrb_bank[bi] = '0;
+        end else begin : g_bank_real
+            assign rd_bank[bi]  = BANK_IDX_W'(rd_lane_base[bi][TCU_TMEM_LANE_BITS-1:ROW_IDX_W]);
+            assign wrb_bank[bi] = BANK_IDX_W'(wr_lane_base[bi][TCU_TMEM_LANE_BITS-1:ROW_IDX_W]);
+        end
         assign rd_row0[bi] = ROW_IDX_W'(rd_lane_base[bi][ROW_IDX_W-1:0]);
         assign rd_word[bi] = BANK_ADDR_W'(rd_col_base[bi][TCU_TMEM_COL_BITS-1:COL_SEL_W]);
 
-        assign wrb_bank[bi] = BANK_IDX_W'(wr_lane_base[bi][TCU_TMEM_LANE_BITS-1:ROW_IDX_W]);
         assign wrb_row0[bi] = ROW_IDX_W'(wr_lane_base[bi][ROW_IDX_W-1:0]);
         assign wrb_word[bi] = BANK_ADDR_W'(wr_col_base[bi][TCU_TMEM_COL_BITS-1:COL_SEL_W]);
     end
@@ -148,7 +153,11 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         wire [TCU_TMEM_LANE_BITS-1:0] ldst_lane     = TCU_TMEM_LANE_BITS'(mgmt_data[bi].rs1_data[0][31:16]);
         wire [TCU_TMEM_COL_BITS-1:0]  ldst_addr_col = TCU_TMEM_COL_BITS'(mgmt_data[bi].rs1_data[0][15:0]);
 
-        assign ldst_bank[bi] = BANK_IDX_W'(ldst_lane[TCU_TMEM_LANE_BITS-1:ROW_IDX_W]);
+        if (BLOCK_SIZE == 1) begin : g_ldst_bank_trivial
+            assign ldst_bank[bi] = '0;
+        end else begin : g_ldst_bank_real
+            assign ldst_bank[bi] = BANK_IDX_W'(ldst_lane[TCU_TMEM_LANE_BITS-1:ROW_IDX_W]);
+        end
         assign ldst_row0[bi] = ROW_IDX_W'(ldst_lane[ROW_IDX_W-1:0]);
         assign ldst_word[bi] = BANK_ADDR_W'(ldst_addr_col[TCU_TMEM_COL_BITS-1:COL_SEL_W]);
         if (COL_SEL_W == 0) begin : g_col_trivial
