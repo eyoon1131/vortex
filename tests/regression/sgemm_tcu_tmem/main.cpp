@@ -39,10 +39,137 @@ struct data_accessor_t {
   }
 };
 
+template <>
+struct data_accessor_t<vt::int4> {
+  static uint8_t read(const uint8_t *ptr, uint32_t offset) {
+    uint32_t row_off = offset / 2;
+    bool odd = offset & 0x1;
+    uint8_t value8 = ptr[row_off];
+    return odd ? (value8 >> 4) : (value8 & 0x0f);
+  }
+  static void write(uint8_t *ptr, uint32_t offset, int32_t value) {
+    uint32_t row_off = offset / 2;
+    bool odd = offset & 0x1;
+    uint8_t old_value = ptr[row_off];
+    uint8_t new_value = odd ? ((old_value & 0x0f) | (value << 4))
+                            : ((old_value & 0xf0) | (value & 0x0f));
+    ptr[offset / 2] = new_value;
+  }
+};
+
+template <>
+struct data_accessor_t<vt::uint4> {
+  static uint8_t read(const uint8_t *ptr, uint32_t offset) {
+    uint32_t row_off = offset / 2;
+    bool odd = offset & 0x1;
+    uint8_t value8 = ptr[row_off];
+    return odd ? (value8 >> 4) : (value8 & 0x0f);
+  }
+  static void write(uint8_t *ptr, uint32_t offset, int32_t value) {
+    uint32_t row_off = offset / 2;
+    bool odd = offset & 0x1;
+    uint8_t old_value = ptr[row_off];
+    uint8_t new_value = odd ? ((old_value & 0x0f) | (value << 4))
+                            : ((old_value & 0xf0) | (value & 0x0f));
+    ptr[offset / 2] = new_value;
+  }
+};
+
 ///////////////////////////////////////////////////////////////////////////////
 
 template <typename Type>
 class Comparator {};
+
+// Input-only formats below (int8/uint8/int4/uint4/bf16/fp8/bf8/tf32): TMEM's
+// accumulate type (Ot) is restricted to fp32/int32/tf32 (32-bit-wide, so
+// these only ever need generate() for A/B; their compare() is copied
+// alongside for parity with sgemm_tcu_wg/main.cpp but is not currently
+// exercised as an Ot.
+
+template <>
+class Comparator<vt::int8> {
+public:
+  static int8_t generate() {
+    return (int8_t)rand();
+  }
+  static bool compare(int8_t a, int8_t b, int index, int errors) {
+    if (a != b) {
+      if (errors < MAX_ERRORS) {
+        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
+      }
+      return false;
+    }
+    return true;
+  }
+};
+
+template <>
+class Comparator<vt::uint8> {
+public:
+  static uint8_t generate() {
+    return (uint8_t)rand();
+  }
+  static bool compare(uint8_t a, uint8_t b, int index, int errors) {
+    if (a != b) {
+      if (errors < MAX_ERRORS) {
+        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
+      }
+      return false;
+    }
+    return true;
+  }
+};
+
+template <>
+class Comparator<vt::int4> {
+public:
+  static uint8_t generate() {
+    return (uint8_t)rand(); // store 2 nibbles in a byte
+  }
+  static bool compare(uint8_t a, uint8_t b, int index, int errors) {
+    if (a != b) {
+      if (errors < MAX_ERRORS) {
+        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
+      }
+      return false;
+    }
+    return true;
+  }
+};
+
+template <>
+class Comparator<vt::uint4> {
+public:
+  static uint8_t generate() {
+    return (uint8_t)rand(); // store 2 nibbles in a byte
+  }
+  static bool compare(uint8_t a, uint8_t b, int index, int errors) {
+    if (a != b) {
+      if (errors < MAX_ERRORS) {
+        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
+      }
+      return false;
+    }
+    return true;
+  }
+};
+
+template <>
+class Comparator<vt::int32> {
+public:
+  static int32_t generate() {
+    return (int32_t)rand();
+  }
+  static bool compare(int32_t a, int32_t b, int index, int errors) {
+    if (a != b) {
+      if (errors < MAX_ERRORS) {
+        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
+      }
+      return false;
+    }
+    return true;
+  }
+};
 
 template <>
 class Comparator<vt::fp16> {
@@ -63,27 +190,114 @@ public:
 };
 
 template <>
+class Comparator<vt::bf16> {
+public:
+  static uint16_t generate() {
+    auto fvalue = float(rand()) / RAND_MAX;
+    return rv_ftob_s(bit_cast<uint32_t>(fvalue), 0, nullptr);
+  }
+  static bool compare(uint16_t a, uint16_t b, int index, int errors) {
+    if (a != b) {
+      if (errors < MAX_ERRORS) {
+        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
+      }
+      return false;
+    }
+    return true;
+  }
+};
+
+template <>
+class Comparator<vt::fp8> {
+public:
+  static uint8_t generate() {
+    auto fvalue = float(rand()) / RAND_MAX;
+    return rv_ftoe4m3_s(bit_cast<uint32_t>(fvalue), 0, nullptr);
+  }
+  static bool compare(uint8_t a, uint8_t b, int index, int errors) {
+    if (a != b) {
+      if (errors < MAX_ERRORS) {
+        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
+      }
+      return false;
+    }
+    return true;
+  }
+};
+
+template <>
+class Comparator<vt::bf8> {
+public:
+  static uint8_t generate() {
+    auto fvalue = float(rand()) / RAND_MAX;
+    return rv_ftoe5m2_s(bit_cast<uint32_t>(fvalue), 0, nullptr);
+  }
+  static bool compare(uint8_t a, uint8_t b, int index, int errors) {
+    if (a != b) {
+      if (errors < MAX_ERRORS) {
+        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
+      }
+      return false;
+    }
+    return true;
+  }
+};
+
+template <>
+class Comparator<vt::tf32> {
+public:
+  static uint32_t generate() {
+    auto fvalue = float(rand()) / RAND_MAX;
+    return rv_ftotf32_s(bit_cast<uint32_t>(fvalue), 0, nullptr);
+  }
+  static bool compare(uint32_t a, uint32_t b, int index, int errors) {
+    if (a != b) {
+      if (errors < MAX_ERRORS) {
+        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
+      }
+      return false;
+    }
+    return true;
+  }
+};
+
+template <>
 class Comparator<vt::fp32> {
 public:
   static float generate() {
     return static_cast<float>(rand()) / RAND_MAX;
   }
   static bool compare(float a, float b, int index, int errors) {
-    union fi_t {
-      float f;
-      int32_t i;
-    };
-    fi_t fa, fb;
-    fa.f = a;
-    fb.f = b;
-    auto d = std::abs(fa.i - fb.i);
-    if (d > FLOAT_ULP) {
+    if constexpr (std::is_same<vt::ITYPE, vt::fp8>::value || std::is_same<vt::ITYPE, vt::bf8>::value) {
+      if (a == 0.0f && b == 0.0f) {
+        return true;
+      }
+      //relative error tolerance
+      auto diff = std::abs((a - b)/b);
+      if (diff < 0.01f) {
+        return true;
+      }
       if (errors < MAX_ERRORS) {
-        printf("*** error: [%d] expected=%f, actual=%f\n", index, fb.f, fa.f);
+        printf("*** error: [%d] expected=%f, actual=%f\n", index, b, a);
       }
       return false;
+    } else {
+      union fi_t {
+        float f;
+        int32_t i;
+      };
+      fi_t fa, fb;
+      fa.f = a;
+      fb.f = b;
+      auto d = std::abs(fa.i - fb.i);
+      if (d > FLOAT_ULP) {
+        if (errors < MAX_ERRORS) {
+          printf("*** error: [%d] expected=%f, actual=%f\n", index, fb.f, fa.f);
+        }
+        return false;
+      }
+      return true;
     }
-    return true;
   }
 };
 
@@ -104,6 +318,66 @@ struct muladd_t<vt::fp16, vt::fp32> {
     auto fa = bit_cast<float>(rv_htof_s(a, 0, nullptr));
     auto fb = bit_cast<float>(rv_htof_s(b, 0, nullptr));
     return fa * fb + c;
+  }
+};
+
+template <>
+struct muladd_t<vt::bf16, vt::fp32> {
+  static float eval(uint16_t a, uint16_t b, float c) {
+    auto fa = bit_cast<float>(rv_btof_s(a, 0, nullptr));
+    auto fb = bit_cast<float>(rv_btof_s(b, 0, nullptr));
+    return fa * fb + c;
+  }
+};
+
+template <>
+struct muladd_t<vt::fp8, vt::fp32> {
+  static float eval(uint8_t a, uint8_t b, float c) {
+    auto fa = bit_cast<float>(rv_e4m3tof_s(a, 0, nullptr));
+    auto fb = bit_cast<float>(rv_e4m3tof_s(b, 0, nullptr));
+    return fa * fb + c;
+  }
+};
+
+template <>
+struct muladd_t<vt::bf8, vt::fp32> {
+  static float eval(uint8_t a, uint8_t b, float c) {
+    auto fa = bit_cast<float>(rv_e5m2tof_s(a, 0, nullptr));
+    auto fb = bit_cast<float>(rv_e5m2tof_s(b, 0, nullptr));
+    return fa * fb + c;
+  }
+};
+
+template <>
+struct muladd_t<vt::tf32, vt::fp32> {
+  static float eval(uint32_t a, uint32_t b, float c) {
+    auto fa = bit_cast<float>(rv_tf32tof_s(a, 0, nullptr));
+    auto fb = bit_cast<float>(rv_tf32tof_s(b, 0, nullptr));
+    return fa * fb + c;
+  }
+};
+
+template <>
+struct muladd_t<vt::int4, vt::int32> {
+  static int32_t eval(uint8_t a, uint8_t b, int32_t c) {
+    int32_t a_val = a & 0xF;
+    if (a & 0x8) {
+      a_val |= 0xFFFFFFF0; // sign extend
+    }
+    int32_t b_val = b & 0xF;
+    if (b & 0x8) {
+      b_val |= 0xFFFFFFF0; // sign extend
+    }
+    return a_val * b_val + c;
+  }
+};
+
+template <>
+struct muladd_t<vt::uint4, vt::int32> {
+  static int32_t eval(uint8_t a, uint8_t b, int32_t c) {
+    int32_t a_val = a & 0xF;
+    int32_t b_val = b & 0xF;
+    return a_val * b_val + c;
   }
 };
 
@@ -128,19 +402,34 @@ using itype_t = typename vt::ITYPE::dtype;
 using otype_t = typename vt::OTYPE::dtype;
 
 static void matmul_cpu(otype_t *C, const itype_t *A, const itype_t *B, uint32_t M, uint32_t N, uint32_t K) {
+  uint32_t subbytes = 8 / vt::ITYPE::bits;
+  uint32_t KS = subbytes ? (K * subbytes) : K;
   for (uint32_t m = 0; m < M; ++m) {
     for (uint32_t n = 0; n < N; ++n) {
-      // fp32 output: the tensor core accumulates the K products in a wide
-      // accumulator and rounds to fp32 once; a per-step-rounded reference
-      // drifts by several ULP over K. Each product is exact in fp32, so a
-      // double accumulation reproduces the single-rounding dot product.
-      double acc = 0.0;
-      for (uint32_t k = 0; k < K; ++k) {
-        auto a = data_accessor_t<vt::ITYPE>::read(A, m * K + k);
-        auto b = data_accessor_t<vt::ITYPE>::read(B, k * N + n);
-        acc += static_cast<double>(muladd_t<vt::ITYPE, vt::OTYPE>::eval(a, b, otype_t(0)));
+      if constexpr (std::is_same<vt::OTYPE, vt::fp32>::value) {
+        // fp32 output: the tensor core accumulates the K products in a wide
+        // accumulator and rounds to fp32 once; a per-step-rounded reference
+        // drifts by several ULP over K. Each product is exact in fp32, so a
+        // double accumulation reproduces the single-rounding dot product.
+        double acc = 0.0;
+        for (uint32_t k = 0; k < KS; ++k) {
+          auto a = data_accessor_t<vt::ITYPE>::read(A, m * KS + k);
+          auto b = data_accessor_t<vt::ITYPE>::read(B, k * N + n);
+          acc += static_cast<double>(muladd_t<vt::ITYPE, vt::OTYPE>::eval(a, b, otype_t(0)));
+        }
+        data_accessor_t<vt::OTYPE>::write(C, m * N + n, static_cast<otype_t>(acc));
+      } else {
+        // int32/tf32 output: exact per-step accumulation (int32 has no
+        // rounding loss; tf32 as an accumulate type is unexercised today
+        // but this path is here for parity).
+        otype_t sum(0);
+        for (uint32_t k = 0; k < KS; ++k) {
+          auto a = data_accessor_t<vt::ITYPE>::read(A, m * KS + k);
+          auto b = data_accessor_t<vt::ITYPE>::read(B, k * N + n);
+          sum = muladd_t<vt::ITYPE, vt::OTYPE>::eval(a, b, sum);
+        }
+        data_accessor_t<vt::OTYPE>::write(C, m * N + n, sum);
       }
-      data_accessor_t<vt::OTYPE>::write(C, m * N + n, static_cast<otype_t>(acc));
     }
   }
 }

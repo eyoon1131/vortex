@@ -1199,6 +1199,18 @@ static __attribute__((always_inline)) uint32_t vx_make_tmem_addr(uint32_t lane_b
   return ((lane_base & 0xFFFF) << 16) | (col & 0xFFFF);
 }
 
+namespace detail {
+  // Freestanding-safe bit-reinterpret (no value conversion) — moves a raw
+  // 32-bit word between vx_tmem_st/vx_tmem_ld's float-typed register and
+  // whatever TMEM's actual accumulate domain is (fp32 or int32, selected by
+  // the TCU's input format).
+  template <typename To, typename From>
+  static __attribute__((always_inline)) To bit_cast(From src) {
+    union { From from; To to; } u{src};
+    return u.to;
+  }
+}
+
 // Allocate ncols columns of TMEM; returns a handle (base column) to add to
 // every subsequent local column index against this allocation.
 static __attribute__((always_inline)) uint32_t vx_tmem_alloc(uint32_t ncols) {
@@ -1230,10 +1242,11 @@ static __attribute__((always_inline)) void vx_tmem_dealloc(uint32_t handle) {
   );
 }
 
-// Store a float value from this thread's register into TMEM at [lane][col].
-static __attribute__((always_inline)) void vx_tmem_st(uint32_t tmem_addr, float value) {
+// Store a raw 32-bit TMEM word from this thread's register into TMEM at
+// [lane][col].
+static __attribute__((always_inline)) void vx_tmem_st(uint32_t tmem_addr, uint32_t value) {
   register uint32_t r_addr  __asm__("a0") = tmem_addr;
-  register float    r_value __asm__("f0") = value;
+  register float    r_value __asm__("f0") = detail::bit_cast<float>(value);
   __asm__ volatile (
     ".insn r %[insn], %[f3], %[f7], x0, %[addr], %[val]\n\t"
     :
@@ -1246,8 +1259,9 @@ static __attribute__((always_inline)) void vx_tmem_st(uint32_t tmem_addr, float 
   );
 }
 
-// Load a float value from TMEM at [lane][col] into this thread's register.
-static __attribute__((always_inline)) float vx_tmem_ld(uint32_t tmem_addr) {
+// Load a raw 32-bit TMEM word from TMEM at [lane][col] into this thread's
+// register.
+static __attribute__((always_inline)) uint32_t vx_tmem_ld(uint32_t tmem_addr) {
   register uint32_t r_addr   __asm__("a0") = tmem_addr;
   register float    r_result __asm__("f0");
   __asm__ volatile (
@@ -1259,7 +1273,7 @@ static __attribute__((always_inline)) float vx_tmem_ld(uint32_t tmem_addr) {
       [addr]"r"(r_addr)
     : "memory"
   );
-  return r_result;
+  return detail::bit_cast<uint32_t>(r_result);
 }
 
 template <uint32_t NT,
@@ -1302,12 +1316,15 @@ public:
 
   // Initialize this warp's accumulator tile in TMEM to `value`.
   static __attribute__((always_inline)) void fill_tmem(uint32_t handle, output_t value) {
+    static_assert(sizeof(output_t) == sizeof(uint32_t),
+                  "TMEM accumulate is only valid for 32-bit-wide Ot (fp32/int32/tf32) "
+                  "— narrower Ot is not supported");
     uint32_t rank = vx_cta_rank();
     constexpr uint32_t rows_per_thread = xtileM / NT;
     for (uint32_t r = 0; r < rows_per_thread; ++r) {
       uint32_t lane_base = rank * xtileM + r * NT;
       for (uint32_t col = 0; col < xtileN; ++col) {
-        vx_tmem_st(vx_make_tmem_addr(lane_base, handle + col), static_cast<float>(value));
+        vx_tmem_st(vx_make_tmem_addr(lane_base, handle + col), detail::bit_cast<uint32_t>(value));
       }
     }
   }
@@ -1346,6 +1363,9 @@ public:
                                                           uint32_t  tile_row,
                                                           uint32_t  tile_col,
                                                           uint32_t  N) {
+    static_assert(sizeof(output_t) == sizeof(uint32_t),
+                  "TMEM accumulate is only valid for 32-bit-wide Ot (fp32/int32/tf32) "
+                  "— narrower Ot is not supported");
     uint32_t tid = vx_thread_id();
     uint32_t rank = vx_cta_rank();
     uint32_t tid_in_warp = tid % NT;
@@ -1356,7 +1376,7 @@ public:
       uint32_t out_row  = tile_row + base + tid_in_warp;
       output_t* row_ptr = C_global + out_row * N + tile_col;
       for (uint32_t col = 0; col < xtileN; ++col) {
-        row_ptr[col] = static_cast<output_t>(vx_tmem_ld(vx_make_tmem_addr(base, handle + col)));
+        row_ptr[col] = detail::bit_cast<output_t>(vx_tmem_ld(vx_make_tmem_addr(base, handle + col)));
       }
     }
   }

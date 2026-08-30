@@ -62,10 +62,15 @@ instructions or implicitly by the UMMA compute op itself.
 
 ## 2. ISA, data types, and configuration
 
-**Formats:** UMMA supports dense WGMMA's plain operand formats — fp32,
-fp16, bf16, fp8, bf8, tf32, integer — see the WGMMA doc §2 for the full
-list. **Block-scaled MX formats are not yet functionally supported for
-UMMA**, even though nothing in decode stops a kernel from encoding one:
+**Formats:** as A/B inputs (`It`), UMMA supports dense WGMMA's plain
+operand formats — fp32, fp16, bf16, fp8, bf8, tf32, integer — see the
+WGMMA doc §2 for the full list. As the C/D accumulate type (`Ot`), only
+`fp32`/`int32`/`tf32` are correct — the three 32-bit TCU formats,
+matching TMEM's fixed-32-bit-per-cell storage; narrower `Ot` is
+unsupported (a project-wide gap affecting WGMMA/WMMA too, not
+UMMA-specific). 
+**Block-scaled MX formats are not yet functionally supported for UMMA**,
+even though nothing in decode stops a kernel from encoding one:
 `fmt_s`/`fmt_d` accept any 5-bit format ID including the MX ones, but
 `VX_tcu_core.sv`'s MX scale-factor indexing branches only on
 `is_wgmma`. Wiring `is_umma` into that
@@ -80,8 +85,8 @@ path is a future work.
 |---|---|---|---|
 | 3 | TMEM_ALLOC | `4'h6` | `rd = handle`, `rs1 = ncols` |
 | 4 | TMEM_DEALLOC | `4'h7` | `rs1 = handle` |
-| 5 | TMEM_ST | `4'h8` | `rs1 = addr`, `rs2(f) = value` — direct float store into TMEM |
-| 6 | TMEM_LD | `4'h9` | `rd(f) = value`, `rs1 = addr` — direct float load from TMEM |
+| 5 | TMEM_ST | `4'h8` | `rs1 = addr`, `rs2(f) = value` — direct raw 32-bit word store into TMEM |
+| 6 | TMEM_LD | `4'h9` | `rd(f) = value`, `rs1 = addr` — direct raw 32-bit word load from TMEM |
 | 7 | UMMA | `4'hA` | Warpgroup MMA with TMEM-resident C/result |
 
 Decode is in [`VX_decode.sv:652`](../../hw/rtl/core/VX_decode.sv#L652).
@@ -267,8 +272,11 @@ under `#ifdef VX_CFG_TCU_TMEM_ENABLE`:
 - `vx_tmem_alloc(ncols) -> handle`, `vx_tmem_dealloc(handle)` —
   CTA-scoped and idempotent; every warp of a CTA calls it directly and
   all get the same handle back.
-- `vx_tmem_st(addr, value)` / `vx_tmem_ld(addr) -> value` — direct
-  float store/load into TMEM by address (§2).
+- `vx_tmem_st(addr, uint32_t value)` / `vx_tmem_ld(addr) -> uint32_t` —
+  direct raw 32-bit word store/load into TMEM by address (§2). Moves the
+  value's bits as-is through the float regfile at the ISA level; `Ot`'s
+  accumulate domain (fp32 vs. int32) is determined by the TCU's input
+  format, not by this function.
 - `umma_context<NT, It, Ot, NRC_>` — reuses `wgmma_context`'s tile
   geometry (`tcM`, `tcN`, `xtileM`, `xtileN`, `tileK`, `n_steps`, etc.).
   - `umma_sync(desc_a, desc_b, handle)` issues the macro-op.
@@ -332,3 +340,8 @@ Swap `rtlsim` for `simx` to use the SimX driver. `<NRC>` ∈
   just that it isn't dead space.
 - **CTA size must equal warpgroup size (`NUM_TCU_BLOCKS`)** — enforced
   by a runtime assertion in simulation.
+- **Accumulate type (`Ot`) restricted to `fp32`/`int32`/`tf32`** — the
+  three 32-bit TCU formats, matching TMEM's fixed-32-bit cell storage.
+  Narrower `Ot` (`bf16`, `bf8`, etc.) remains unsupported — not a
+  TMEM-specific gap: WGMMA/WMMA's own narrow-`Ot` path is unverified
+  against RTL.
