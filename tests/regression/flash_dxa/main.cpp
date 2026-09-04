@@ -157,56 +157,67 @@ int main(int argc, char *argv[]) {
     uint32_t num_threads = static_cast<uint32_t>(num_threads_q);
     uint32_t num_warps   = static_cast<uint32_t>(num_warps_q);
 
-    // block_size_r: rows (= warps) per CTA
-    uint32_t block_size_r = r_override ? r_override
-                          : std::max(1u, std::min(num_warps / 2, N));
-    if (block_size_r > num_warps) {
-        printf("Error: block_size_r %u exceeds NUM_WARPS %u\n", block_size_r, num_warps);
+    // block_size_r: rows (= warps) per CTA. Starts at num_warps/2 (or the
+    // user override); if that can't fit even d_tile=1 given the LMEM
+    // budget, falls back to progressively smaller block_size_r
+    uint32_t r_start = r_override ? r_override
+                     : std::max(1u, std::min(num_warps / 2, N));
+    if (r_start > num_warps) {
+        printf("Error: block_size_r %u exceeds NUM_WARPS %u\n", r_start, num_warps);
         return -1;
     }
 
-    // block_size_c: KV columns processed per lane-parallel step
-    uint32_t block_size_c = c_override ? c_override
-                          : std::max(block_size_r, num_threads);
-    if (block_size_c / num_threads > SP_BUF_MAX) { 
-        printf("Error: block_size_c %u / NUM_THREADS %u exceeds cap %u\n", block_size_c, num_threads, SP_BUF_MAX);
-        return -1;
-    }
-
-    // d_tile: K/V staging chunk width along d
-    uint32_t d_tile = 0;
+    uint32_t block_size_r = 0, block_size_c = 0, d_tile = 0, occupancy = 0;
     uint64_t local_mem = 0;
-    uint32_t occupancy = 0;
 
-    if (d_override) {
-        d_tile = std::min(d_override, d);
-        local_mem = sizeof(TYPE) * (2 * static_cast<uint64_t>(d) * block_size_r +
-                                    4 * static_cast<uint64_t>(d_tile) * block_size_c +
-                                    static_cast<uint64_t>(block_size_r) * block_size_c);
-        occupancy = static_cast<uint32_t>(std::max<uint64_t>(1, lmem_size / std::max<uint64_t>(1, local_mem)));
-        occupancy = std::min(occupancy, num_warps / block_size_r);
-    } else {
-        uint64_t fixed = sizeof(TYPE) * (2 * static_cast<uint64_t>(d) * block_size_r +
-                                         static_cast<uint64_t>(block_size_r) * block_size_c);
-        for (uint32_t target = std::max(1u, num_warps / block_size_r); target >= 1; --target) {
-            uint64_t budget = lmem_size / target;
-            if (fixed >= budget) {
-                if (target == 1) break;
-                continue;
+    for (uint32_t r = r_start; r >= 1; r /= 2) {
+        uint32_t c = c_override ? c_override : std::max(r, num_threads);
+        uint32_t dt = 0, occ = 0;
+        uint64_t lmem = 0;
+
+        if (c / num_threads <= SP_BUF_MAX) {
+            uint64_t fixed = sizeof(TYPE) * (2 * static_cast<uint64_t>(d) * r +
+                                             static_cast<uint64_t>(r) * c);
+            if (d_override) {
+                uint64_t cand_lmem = fixed + sizeof(TYPE) * 4 *
+                                     static_cast<uint64_t>(std::min(d_override, d)) * c;
+                if (cand_lmem <= lmem_size) {
+                    dt = std::min(d_override, d);
+                    lmem = cand_lmem;
+                    occ = static_cast<uint32_t>(std::max<uint64_t>(1, lmem_size / std::max<uint64_t>(1, lmem)));
+                    occ = std::min(occ, num_warps / r);
+                }
+            } else {
+                for (uint32_t target = std::max(1u, num_warps / r); target >= 1; --target) {
+                    uint64_t budget = lmem_size / target;
+                    if (fixed >= budget) {
+                        if (target == 1) break;
+                        continue;
+                    }
+                    uint64_t per_col = sizeof(TYPE) * 4 * static_cast<uint64_t>(c);
+                    uint64_t max_tile = (budget - fixed) / per_col;
+                    dt = static_cast<uint32_t>(std::min<uint64_t>(d, std::max<uint64_t>(1, max_tile)));
+                    lmem = fixed + per_col * dt;
+                    occ = target;
+                    break;
+                }
             }
-            uint64_t per_col = sizeof(TYPE) * 4 * block_size_c;
-            uint64_t max_tile = (budget - fixed) / per_col;
-            d_tile = static_cast<uint32_t>(std::min<uint64_t>(d, std::max<uint64_t>(1, max_tile)));
-            local_mem = fixed + per_col * d_tile;
-            occupancy = target;
+        }
+
+        if (dt > 0) {
+            block_size_r = r;
+            block_size_c = c;
+            d_tile       = dt;
+            local_mem    = lmem;
+            occupancy    = occ;
             break;
         }
+        if (r_override || r == 1) break;
     }
 
     if (d_tile == 0) {
-        printf("Error: block_size_r=%u, block_size_c=%u need more LMEM than the "
-               "device provides (%llu bytes) even at d_tile=1\n",
-               block_size_r, block_size_c, (unsigned long long)lmem_size);
+        printf("Error: no block_size_r from %u down to 1 fits the LMEM budget "
+               "(%llu bytes)\n", r_start, (unsigned long long)lmem_size);
         return -1;
     }
 
