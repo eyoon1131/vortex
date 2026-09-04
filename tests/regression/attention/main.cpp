@@ -50,41 +50,61 @@ static void parse_args(int argc, char **argv) {
 	}
 }
 
-bool float_eq(float a, float b) {
-    union fi { float f; int32_t i; };
-    fi fa{a}, fb{b};
-    return std::abs(fa.i - fb.i) <= 6;
-}
+template <typename Type>
+class Comparator {};
+
+template <>
+class Comparator<float> {
+public:
+  static const char* type_str() {
+    return "float";
+  }
+  static float generate() {
+    return static_cast<float>(rand()) / RAND_MAX;
+  }
+  static bool compare(float a, float b, int index, int errors) {
+    union fi_t { float f; int32_t i; };
+    fi_t fa, fb;
+    fa.f = a;
+    fb.f = b;
+    auto d = std::abs(fa.i - fb.i);
+    if (d > FLOAT_ULP) {
+      if (errors < 100) {
+        printf("*** error: [%d] expected=%f, actual=%f\n", index, a, b);
+      }
+      return false;
+    }
+    return true;
+  }
+};
 
 static void matmul_cpu(TYPE* out, const TYPE* A, const TYPE* B, uint32_t M, uint32_t N, uint32_t K) {
-  for (uint32_t row = 0; row < M; ++row) {
-    for (uint32_t col = 0; col < N; ++col) {
-      TYPE sum(0);
-      for (uint32_t e = 0; e < K; ++e) {
-          sum += A[row * K + e] * B[e * N + col];
-      }
-      out[row * N + col] = sum;
-    }
-  }
+	for (uint32_t row = 0; row < M; ++row) {
+		for (uint32_t col = 0; col < N; ++col) {
+			TYPE sum(0);
+			for (uint32_t e = 0; e < K; ++e) {
+				sum += A[row * K + e] * B[e * N + col];
+			}
+			out[row * N + col] = sum;
+		}
+	}
 }
 
 static void softmax_cpu(TYPE* out, const TYPE* A, uint32_t M, uint32_t N) {
-  for (uint32_t row = 0; row < M; ++row) {
-    TYPE max_val = A[row * N];
-    for (uint32_t col = 1; col < N; ++col) {
-      max_val = std::max(max_val, A[row * N + col]);
-    }
-
-    TYPE exp_sum = 0;
-    for (uint32_t col = 0; col < N; ++col) {
-      out[row * N + col] = std::exp(A[row * N + col] - max_val);
-      exp_sum += out[row * N + col];
-    }
-
-    for (uint32_t col = 0; col < N; ++col) {
-      out[row * N + col] /= exp_sum;
-    }
-  }
+	for (uint32_t row = 0; row < M; ++row) {
+		TYPE max_val = A[row * N];
+		for (uint32_t col = 1; col < N; ++col) {
+			max_val = std::max(max_val, A[row * N + col]);
+		}
+		TYPE exp_sum = 0;
+		for (uint32_t col = 0; col < N; ++col) {
+			out[row * N + col] = std::exp(A[row * N + col] - max_val);
+			exp_sum += out[row * N + col];
+		}
+		for (uint32_t col = 0; col < N; ++col) {
+			out[row * N + col] /= exp_sum;
+		}
+	}
 }
 } // namespace
 
@@ -151,9 +171,9 @@ int main(int argc, char *argv[]) {
 
     std::vector<TYPE> h_Q(nd_size), h_K(nd_size), h_S(nn_size), h_P(nn_size), h_V(nd_size), h_O(nd_size);
     for (uint32_t i = 0; i < nd_size; ++i) {
-        h_Q[i] = static_cast<TYPE>(std::rand()) / RAND_MAX;
-        h_K[i] = static_cast<TYPE>(std::rand()) / RAND_MAX;
-		h_V[i] = static_cast<TYPE>(std::rand()) / RAND_MAX;
+        h_Q[i] = Comparator<TYPE>::generate();
+        h_K[i] = Comparator<TYPE>::generate();
+		h_V[i] = Comparator<TYPE>::generate();
     }
 
 	// -------------------------------------------------------------------------------------------------
@@ -188,9 +208,7 @@ int main(int argc, char *argv[]) {
     std::vector<TYPE> h_ref0(nn_size);
 	matmul_cpu(h_ref0.data(), h_Q.data(), h_K.data(), N, N, d);
     for (uint32_t i = 0; i < nn_size; ++i) {
-        if (!float_eq(h_S[i], h_ref0[i])) {
-            if (errors < 16)
-                std::printf("*** [%u] expected=%f actual=%f\n", i, h_ref0[i], h_S[i]);
+        if (!Comparator<TYPE>::compare(h_ref0[i], h_S[i], i, errors)) {
             ++errors;
         }
     }
@@ -239,9 +257,7 @@ int main(int argc, char *argv[]) {
     std::vector<TYPE> h_ref1(nn_size);
     softmax_cpu(h_ref1.data(), h_S.data(), N, N);
     for (uint32_t i = 0; i < nn_size; ++i) {
-        if (!float_eq(h_P[i], h_ref1[i])) {
-            if (errors < 16)
-                std::printf("*** [%u] expected=%f actual=%f\n", i, h_ref1[i], h_P[i]);
+        if (!Comparator<TYPE>::compare(h_ref1[i], h_P[i], i, errors)) {
             ++errors;
         }
     }
@@ -290,9 +306,7 @@ int main(int argc, char *argv[]) {
     std::vector<TYPE> h_ref2(nd_size);
 	matmul_cpu(h_ref2.data(), h_P.data(), h_V.data(), N, d, N);
     for (uint32_t i = 0; i < nd_size; ++i) {
-        if (!float_eq(h_O[i], h_ref2[i])) {
-            if (errors < 16)
-                std::printf("*** [%u] expected=%f actual=%f\n", i, h_ref2[i], h_O[i]);
+        if (!Comparator<TYPE>::compare(h_ref2[i], h_O[i], i, errors)) {
             ++errors;
         }
     }

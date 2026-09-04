@@ -31,7 +31,7 @@ __kernel void kernel_softmax(kernel_arg_t* __UNIFORM__ arg) {
 
     TYPE max_val = S[row * N];
     for (uint32_t col = 1; col < N; ++col) {
-      max_val = std::max(max_val, S[row * N + col]);
+        max_val = std::max(max_val, S[row * N + col]);
     }
 
     TYPE exp_sum = 0;
@@ -42,7 +42,7 @@ __kernel void kernel_softmax(kernel_arg_t* __UNIFORM__ arg) {
     }
 
     for (uint32_t col = 0; col < N; ++col) {
-      P[row * N + col] /= exp_sum;
+        P[row * N + col] /= exp_sum;
     }
 }
 
