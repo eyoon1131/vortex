@@ -151,9 +151,7 @@ int main(int argc, char *argv[]) {
 
     // block_size_r: rows (= warps) per CTA. Starts at num_warps/2 (or the
     // user override); if that can't fit even d_tile=1 given the LMEM
-    // budget, falls back to progressively smaller block_size_r instead of
-    // failing outright (see flash_dxa's identical sizing logic and
-    // vortex-notes/user/flash_dxa_sizing_analysis.md for why).
+    // budget, falls back to progressively smaller block_size_r
     uint32_t r_start = r_override ? r_override
                      : std::max(1u, std::min(num_warps / 2, N));
     if (r_start > num_warps) {
