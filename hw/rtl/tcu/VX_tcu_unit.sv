@@ -319,6 +319,9 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     wire [TCU_TMEM_COL_BITS-1:0]            tmem_wr_col_base  [BLOCK_SIZE];
     wire [TCU_TC_M-1:0][TCU_TC_N-1:0][31:0] tmem_wr_data      [BLOCK_SIZE];
     wire [BLOCK_SIZE-1:0]                   tmem_wr_grant;
+`ifdef PERF_ENABLE
+    wire [BLOCK_SIZE-1:0]                   perf_umma_hazard_stall;
+`endif
 
     VX_tcu_tmem #(
         .INSTANCE_ID (`SFORMATF(("%s-tmem", INSTANCE_ID))),
@@ -381,6 +384,9 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             .tmem_wr_col_base (tmem_wr_col_base[block_idx]),
             .tmem_wr_data     (tmem_wr_data[block_idx]),
             .tmem_wr_grant    (tmem_wr_grant[block_idx]),
+        `ifdef PERF_ENABLE
+            .perf_umma_hazard_stall (perf_umma_hazard_stall[block_idx]),
+        `endif
         `endif
         `ifdef TCU_META_ENABLE
             .ext_meta_wr_en   (agu_meta_wr_en),
@@ -392,6 +398,22 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             .result_if  (core_result_if[block_idx])
         );
     end
+
+`ifdef VX_CFG_TCU_TMEM_ENABLE
+`ifdef PERF_ENABLE
+    // RAW-interlock stalls, summed across blocks
+    logic [PERF_CTR_BITS-1:0] tmem_hazard_stalls_r;
+    always @(posedge clk) begin
+        if (reset) begin
+            tmem_hazard_stalls_r <= '0;
+        end else begin
+            tmem_hazard_stalls_r <= tmem_hazard_stalls_r
+                + PERF_CTR_BITS'($countones(perf_umma_hazard_stall));
+        end
+    end
+    assign tcu_perf.tmem_hazard_stalls = tmem_hazard_stalls_r;
+`endif
+`endif
 
     // -----------------------------------------------------------------------
     // Lane gather

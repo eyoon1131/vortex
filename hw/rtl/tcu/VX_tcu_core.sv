@@ -41,6 +41,11 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     output wire [TCU_TMEM_COL_BITS-1:0]             tmem_wr_col_base,
     output wire [TCU_TC_M-1:0][TCU_TC_N-1:0][31:0]  tmem_wr_data,
     input wire                                      tmem_wr_grant,
+`ifdef PERF_ENABLE
+    // A UMMA uop is present but held off by the RAW interlock. Distinct from
+    // losing bank arbitration (tmem_bank_stalls)
+    output wire                                     perf_umma_hazard_stall,
+`endif
 `endif
 
     // External metadata write port from the shared VX_tcu_agu.
@@ -347,24 +352,13 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
     // RAW-hazard interlock, tracking in-flight TMEM writes explicitly.
     //
-    // The FEDP array free-runs and its results are buffered in the landing
-    // queue, so a UMMA uop's TMEM write no longer lands a fixed PIPE_LATENCY
-    // after admission: it lands when the result retires AND wins a bank write
-    // port. A fixed-latency mirror of fedp_delay_pipe cannot model that, so
-    // in-flight writes are tracked explicitly instead.
-    //
     // Every non-setup uop takes an entry at admission and gives it up at
     // retirement, so the head always describes the result being retired now;
     // its is_umma bit says whether that retirement owes TMEM a write.
-    // Allocation and release are both in order (in-order array, FIFO landing
-    // queue), so this is a circular buffer with parallel-visible entries --
-    // content-addressable lookup without content-addressable allocation.
     //
     // Depth: the credit bound above already caps admitted-but-unretired uops
     // at LANDQ_SIZE, and a UMMA result does not retire until its write is
-    // granted, so LANDQ_SIZE entries is a hard bound. Note the hazard window
-    // is now up to LANDQ_SIZE deep rather than PIPE_LATENCY, so the ordering
-    // bound that avoids interlock stalls is n_steps*m_steps >= LANDQ_SIZE+1.
+    // granted, so LANDQ_SIZE entries is a hard bound.
     typedef struct packed {
         logic                          valid;
         logic                          is_umma;
@@ -406,6 +400,9 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                                     && (wr_track[t].col_base  == umma_col_base);
     end
     wire umma_hazard = is_umma && (|umma_hazard_match);
+`ifdef PERF_ENABLE
+    assign perf_umma_hazard_stall = execute_if.valid && umma_hazard;
+`endif
 
     // Bank-port stall: this op's TMEM read hasn't won its bank yet (or is
     // won and waiting on other admission conditions). Retries next cycle.
@@ -937,10 +934,8 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
 `ifdef VX_CFG_TCU_TMEM_ENABLE
     // A retiring UMMA result owes TMEM a write. Address comes from the
-    // tracker head (the entry describing this retirement), data from the same
-    // mux that feeds result_if -- so UMMA rides the shared result path rather
-    // than needing a buffer of its own. Retirement is held until the bank
-    // write port is granted.
+    // tracker head (the entry describing this retirement). Retirement is
+    // held until the bank write port is granted.
     wire umma_wr_pending = (fedp_done || ~landq_empty) && ~setup_valid_r
                         && wr_track[track_head].valid && wr_track[track_head].is_umma;
 

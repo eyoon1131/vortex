@@ -1261,6 +1261,7 @@ package VX_gpu_pkg;
         logic [PERF_CTR_BITS-1:0] tmem_reads;        // TMEM elements read (UMMA C + tmem_ld)
         logic [PERF_CTR_BITS-1:0] tmem_writes;       // TMEM elements written (UMMA D + tmem_st)
         logic [PERF_CTR_BITS-1:0] tmem_bank_stalls;  // cycles: a TMEM bank request (compute or tmem_ld/st) lost arbitration and retried
+        logic [PERF_CTR_BITS-1:0] tmem_hazard_stalls; // cycles: a UMMA uop was blocked at admission by the TMEM RAW interlock (distinct from losing bank arbitration)
 `endif
     } tcu_perf_t;
 `endif
