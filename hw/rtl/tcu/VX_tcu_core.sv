@@ -936,15 +936,27 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // A retiring UMMA result owes TMEM a write. Address comes from the
     // tracker head (the entry describing this retirement). Retirement is
     // held until the bank write port is granted.
-    wire umma_wr_pending = (fedp_done || ~landq_empty) && ~setup_valid_r
-                        && wr_track[track_head].valid && wr_track[track_head].is_umma;
+    wire umma_wr_owed = (fedp_done || ~landq_empty) && ~setup_valid_r
+                     && wr_track[track_head].valid && wr_track[track_head].is_umma;
 
-    assign tmem_wr_valid     = umma_wr_pending;
+    // Drop the request once it has won its bank, until the result actually
+    // retires. A grant on a cycle where result_if.ready is low would otherwise
+    // leave the request asserted, and the arbiter can grant the same write a
+    // second time.
+    reg umma_wr_won_r;
+    always @(posedge clk) begin
+        if (reset)                 umma_wr_won_r <= 1'b0;
+        else if (fedp_result_fire) umma_wr_won_r <= 1'b0;
+        else if (tmem_wr_grant)    umma_wr_won_r <= 1'b1;
+    end
+
+    assign tmem_wr_valid     = umma_wr_owed && ~umma_wr_won_r;
     assign tmem_wr_lane_base = wr_track[track_head].lane_base;
     assign tmem_wr_col_base  = wr_track[track_head].col_base;
     assign tmem_wr_data      = result_data;
 
-    wire tmem_wr_ok = ~umma_wr_pending || tmem_wr_grant;
+    // Retirement is unblocked by a grant this cycle or one already latched.
+    wire tmem_wr_ok = ~umma_wr_owed || tmem_wr_grant || umma_wr_won_r;
 `else
     wire tmem_wr_ok = 1'b1;
 `endif

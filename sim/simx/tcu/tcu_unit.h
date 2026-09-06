@@ -67,6 +67,11 @@ public:
 		uint64_t umma_instrs = 0;      // UMMA micro-ops executed
 		uint64_t tmem_reads = 0;       // TMEM elements read (UMMA C + tmem_ld)
 		uint64_t tmem_writes = 0;      // TMEM elements written (UMMA D + tmem_st)
+		// The two below are microarchitectural and RTL-only: SimX doesn't
+		// model bank arbitration or the RAW interlock, so it reports 0
+		// for both.
+		uint64_t tmem_bank_stalls = 0;
+		uint64_t tmem_hazard_stalls = 0;
 #endif
 
 		PerfStats& operator+=(const PerfStats& rhs) {
@@ -78,6 +83,8 @@ public:
 			this->umma_instrs      += rhs.umma_instrs;
 			this->tmem_reads       += rhs.tmem_reads;
 			this->tmem_writes      += rhs.tmem_writes;
+			this->tmem_bank_stalls += rhs.tmem_bank_stalls;
+			this->tmem_hazard_stalls += rhs.tmem_hazard_stalls;
 #endif
 			return *this;
 		}

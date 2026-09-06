@@ -292,12 +292,31 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     wire [ARB_W-1:0] bank_wr_grant_onehot [BLOCK_SIZE];
     wire [BLOCK_SIZE-1:0] bank_wr_conflict;
 
+    wire [BLOCK_SIZE-1:0] ldst_wr_won;
+
+    // A granted TMEM_ST whose result cannot retire this cycle (result_ready
+    // low) keeps mgmt_valid and is_tmem_st asserted, so the arbiter would
+    // regrant. Latch the win and drop the request until the op retires.
+
+    reg [BLOCK_SIZE-1:0] ldst_wr_won_r;
+    always @(posedge clk) begin
+        if (reset) begin
+            ldst_wr_won_r <= '0;
+        end else begin
+            for (int b = 0; b < BLOCK_SIZE; ++b) begin
+                if (mgmt_ready[b])       ldst_wr_won_r[b] <= 1'b0;
+                else if (ldst_wr_won[b]) ldst_wr_won_r[b] <= 1'b1;
+            end
+        end
+    end
+
     for (genvar r = 0; r < BLOCK_SIZE; ++r) begin : g_wr_arb
         wire [BLOCK_SIZE-1:0] cmp_req;
         wire [BLOCK_SIZE-1:0] ldst_req;
         for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_req
             assign cmp_req[bi]  = wr_valid[bi] && (wrb_bank[bi] == BANK_IDX_W'(r));
-            assign ldst_req[bi] = is_tmem_st[bi] && (ldst_bank[bi] == BANK_IDX_W'(r));
+            assign ldst_req[bi] = is_tmem_st[bi] && (ldst_bank[bi] == BANK_IDX_W'(r))
+                               && ~ldst_wr_won_r[bi];
         end
         wire [ARB_W-1:0] req_vec = {ldst_req, cmp_req};
 
@@ -325,7 +344,6 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_wr_route
         assign wr_grant[bi] = wr_valid[bi] && bank_wr_grant_onehot[wrb_bank[bi]][bi];
     end
-    wire [BLOCK_SIZE-1:0] ldst_wr_won;
     for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_st_route
         assign ldst_wr_won[bi] = is_tmem_st[bi] && bank_wr_grant_onehot[ldst_bank[bi]][BLOCK_SIZE + bi];
     end
@@ -516,7 +534,7 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_tmem_result
         wire mgmt_fire = is_alloc_or_dealloc_req[bi] ? (alloc_grant_onehot[bi] && alloc_resp_valid)
                         : is_tmem_ld[bi]             ? ldst_rd_won[bi]
-                        : is_tmem_st[bi]             ? ldst_wr_won[bi]
+                        : is_tmem_st[bi]             ? (ldst_wr_won[bi] || ldst_wr_won_r[bi])
                         : mgmt_valid[bi];
 
         assign mgmt_ready[bi]         = mgmt_fire && result_ready[bi];

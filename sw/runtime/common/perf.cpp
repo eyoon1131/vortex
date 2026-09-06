@@ -652,6 +652,32 @@ extern "C" vx_result_t vx_device_dump_perf(vx_device_h hdevice, FILE *stream) {
     perf_print(stream,
       "tcu: total_tbuf_stalls=%" PRIu64 ", total_tbuf_cache_hits=%" PRIu64 ", total_lmem_reads=%" PRIu64,
       tot_tbuf_stalls, tot_tbuf_cache_hits, tot_lmem_reads);
+    // UMMA/TMEM counters
+    uint64_t tot_umma_instrs = 0, tot_tmem_reads = 0, tot_tmem_writes = 0;
+    uint64_t tot_tmem_bank_stalls = 0, tot_tmem_hazard_stalls = 0;
+    for (uint32_t core_id = 0; core_id < num_cores; ++core_id) {
+      uint64_t umma_instrs = 0, tmem_reads = 0, tmem_writes = 0;
+      uint64_t tmem_bank_stalls = 0, tmem_hazard_stalls = 0;
+      CHECK_ERR(vx_device_mpm_query(hdevice, mpm_class, VX_CSR_MPM_TCU_UMMA_INSTRS,        core_id, &umma_instrs),        { return err; });
+      CHECK_ERR(vx_device_mpm_query(hdevice, mpm_class, VX_CSR_MPM_TCU_TMEM_READS,         core_id, &tmem_reads),         { return err; });
+      CHECK_ERR(vx_device_mpm_query(hdevice, mpm_class, VX_CSR_MPM_TCU_TMEM_WRITES,        core_id, &tmem_writes),        { return err; });
+      CHECK_ERR(vx_device_mpm_query(hdevice, mpm_class, VX_CSR_MPM_TCU_TMEM_BANK_STALLS,   core_id, &tmem_bank_stalls),   { return err; });
+      CHECK_ERR(vx_device_mpm_query(hdevice, mpm_class, VX_CSR_MPM_TCU_TMEM_HAZARD_STALLS, core_id, &tmem_hazard_stalls), { return err; });
+      perf_print_core(stream, core_id,
+        "tmem: umma_instrs=%" PRIu64 ", reads=%" PRIu64 ", writes=%" PRIu64
+        ", bank_stalls=%" PRIu64 ", hazard_stalls=%" PRIu64,
+        umma_instrs, tmem_reads, tmem_writes, tmem_bank_stalls, tmem_hazard_stalls);
+      tot_umma_instrs        += umma_instrs;
+      tot_tmem_reads         += tmem_reads;
+      tot_tmem_writes        += tmem_writes;
+      tot_tmem_bank_stalls   += tmem_bank_stalls;
+      tot_tmem_hazard_stalls += tmem_hazard_stalls;
+    }
+    perf_print(stream,
+      "tmem: total_umma_instrs=%" PRIu64 ", total_reads=%" PRIu64 ", total_writes=%" PRIu64
+      ", total_bank_stalls=%" PRIu64 ", total_hazard_stalls=%" PRIu64,
+      tot_umma_instrs, tot_tmem_reads, tot_tmem_writes,
+      tot_tmem_bank_stalls, tot_tmem_hazard_stalls);
   } break;
 
   case VX_DCR_MPM_CLASS_TEX: {

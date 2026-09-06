@@ -246,6 +246,14 @@ Word CsrUnit::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
         CSR_READ_64(VX_CSR_MPM_TCU_TBUF_STALLS,     tcu_perf.tbuf_stalls);
         CSR_READ_64(VX_CSR_MPM_TCU_TBUF_CACHE_HITS, tcu_perf.tbuf_cache_hits);
         CSR_READ_64(VX_CSR_MPM_TCU_LMEM_READS,    tcu_perf.lmem_reads);
+      #ifdef VX_CFG_TCU_TMEM_ENABLE
+        CSR_READ_64(VX_CSR_MPM_TCU_UMMA_INSTRS,        tcu_perf.umma_instrs);
+        CSR_READ_64(VX_CSR_MPM_TCU_TMEM_READS,         tcu_perf.tmem_reads);
+        CSR_READ_64(VX_CSR_MPM_TCU_TMEM_WRITES,        tcu_perf.tmem_writes);
+        // Always 0 in SimX: no bank-arbitration or interlock model
+        CSR_READ_64(VX_CSR_MPM_TCU_TMEM_BANK_STALLS,   tcu_perf.tmem_bank_stalls);
+        CSR_READ_64(VX_CSR_MPM_TCU_TMEM_HAZARD_STALLS, tcu_perf.tmem_hazard_stalls);
+      #endif
         }
       } break;
     #endif

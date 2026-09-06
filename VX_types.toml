@@ -773,6 +773,19 @@ VX_CSR_MPM_TCU_TBUF_CACHE_HITS= 0xB04  # B tile reuse hits from tile buffer cach
 VX_CSR_MPM_TCU_TBUF_CACHE_HITS_H = 0xB84
 VX_CSR_MPM_TCU_LMEM_READS     = 0xB05  # tile buffer local memory reads
 VX_CSR_MPM_TCU_LMEM_READS_H   = 0xB85
+# PERF: UMMA/TMEM (per-core; summed across blocks)
+VX_CSR_MPM_TCU_UMMA_INSTRS    = 0xB06  # UMMA micro-ops executed
+VX_CSR_MPM_TCU_UMMA_INSTRS_H  = 0xB86
+VX_CSR_MPM_TCU_TMEM_READS     = 0xB07  # TMEM elements read (UMMA C + tmem_ld)
+VX_CSR_MPM_TCU_TMEM_READS_H   = 0xB87
+VX_CSR_MPM_TCU_TMEM_WRITES    = 0xB08  # TMEM elements written (UMMA D + tmem_st)
+VX_CSR_MPM_TCU_TMEM_WRITES_H  = 0xB88
+# The two below are microarchitectural and RTL-only: SimX doesn't model bank
+# arbitration or the RAW interlock, so it reports 0 for both.
+VX_CSR_MPM_TCU_TMEM_BANK_STALLS   = 0xB09  # cycles: a TMEM bank request lost arbitration and retried
+VX_CSR_MPM_TCU_TMEM_BANK_STALLS_H = 0xB89
+VX_CSR_MPM_TCU_TMEM_HAZARD_STALLS = 0xB0A  # cycles: a UMMA uop held at admission by the TMEM RAW interlock
+VX_CSR_MPM_TCU_TMEM_HAZARD_STALLS_H = 0xB8A
 
 [csr_mpm_tex]
 # PERF: texture unit (per-core; summed across blocks)
