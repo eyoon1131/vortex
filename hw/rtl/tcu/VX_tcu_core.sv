@@ -59,37 +59,12 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 );
     `UNUSED_SPARAM (INSTANCE_ID);
 
+    // FEDP dot-product width in 32-bit words (doubles under FEDP2K).
     localparam FEDP_K = TCU_WG_FEDP_K;
 
-`ifdef VX_CFG_TCU_TYPE_DSP
-    localparam FCVT_LATENCY = 1;
-    localparam FMUL_LATENCY = 8;
-    localparam FADD_LATENCY = 11;
-    localparam FACC_LATENCY = $clog2(2 * FEDP_K) * FADD_LATENCY;
-    localparam FEDP_LATENCY = FCVT_LATENCY + FMUL_LATENCY + FACC_LATENCY + FADD_LATENCY;
-`elsif VX_CFG_TCU_TYPE_BHF
-    localparam FMUL_LATENCY = 2;
-    localparam FADD_LATENCY = 2;
-    localparam FRND_LATENCY = 1;
-    localparam FACC_LATENCY  = $clog2(2 * FEDP_K) * (FADD_LATENCY + FRND_LATENCY);
-    localparam FEDP_LATENCY = (FMUL_LATENCY + FRND_LATENCY) + 1 + FACC_LATENCY + (FADD_LATENCY + FRND_LATENCY);
-`elsif VX_CFG_TCU_TYPE_FPNEW
-    localparam FMUL_LATENCY = 6;
-    localparam FMUX_LATENCY = 1;
-    localparam FADD_LATENCY = 7;
-    localparam FACC_LATENCY = $clog2(2 * FEDP_K) * FADD_LATENCY;
-    localparam FEDP_LATENCY = FMUL_LATENCY + FMUX_LATENCY + FACC_LATENCY + FADD_LATENCY;
-`elsif VX_CFG_TCU_TYPE_DPI
-    localparam FMUL_LATENCY = 2;
-    localparam FACC_LATENCY = 2;
-    localparam FEDP_LATENCY = FMUL_LATENCY + FACC_LATENCY;
-`else // VX_CFG_TCU_TYPE_TFR
-    localparam FMUL_LATENCY = 1;
-    localparam FALN_LATENCY = 1;
-    localparam FACC_LATENCY = 1;
-    localparam FRND_LATENCY = 1;
-    localparam FEDP_LATENCY = FMUL_LATENCY + FALN_LATENCY + FACC_LATENCY + FRND_LATENCY;
-`endif
+    // Total FEDP latency of the configured TCU type; each FEDP variant
+    // asserts it against its internal stage structure.
+    localparam FEDP_LATENCY = `VX_CFG_TCU_LATENCY;
 
     localparam PIPE_LATENCY = FEDP_LATENCY + 1;
     localparam MDATA_QUEUE_DEPTH = 1 << $clog2(PIPE_LATENCY);
@@ -258,19 +233,27 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     // -----------------------------------------------------------------------
     // Pipeline control
     // -----------------------------------------------------------------------
+    // The FEDP array free-runs (no freeze enable): admission reserves a slot
+    // in the result landing queue, so a completing result always has a place
+    // to land and no per-register enable network spans the grid.
+
+    // Landing capacity matches the header FIFO: credits bound the results
+    // outstanding, so both queues share one occupancy invariant.
+    localparam LANDQ_SIZE = MDATA_QUEUE_DEPTH;
 
     wire mdata_queue_full;
 
-    wire fedp_enable, fedp_done;
+    wire result_fire = result_if.valid && result_if.ready;
 
     reg setup_valid_r;
     tcu_header_t setup_header_r;
     tcu_header_t mdata_queue_out;
 
     wire setup_result_fire = setup_valid_r && result_if.ready;
-    // Prevent from firing (and popping mdata_queue) on a cycle where the
-    // TMEM write lost bank arbitration
-    wire fedp_result_fire  = fedp_done && tmem_wr_ok && result_if.ready && !setup_valid_r;
+    // A non-setup result retires whenever the consumer takes one, whether it
+    // comes straight off the array (fedp_done) or from the landing queue —
+    // the header queue must pop in lockstep with either source.
+    wire fedp_result_fire  = result_fire && !setup_valid_r;
 
     always @(posedge clk) begin
         if (reset) begin
@@ -291,25 +274,26 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         if (reset) begin
             fedp_delay_pipe <= '0;
         end else begin
-            if (fedp_enable) begin
-                fedp_delay_pipe <= fedp_delay_pipe >> 1;
-            end
-            if (fedp_enqueue) begin
-                fedp_delay_pipe[PIPE_LATENCY-1] <= 1;
-            end
+            fedp_delay_pipe <= {fedp_enqueue, fedp_delay_pipe[PIPE_LATENCY-1:1]};
         end
     end
 
-    assign fedp_done        = fedp_delay_pipe[0];
-`ifdef VX_CFG_TCU_TMEM_ENABLE
-    // A retiring UMMA op must not be reported as done until its TMEM write
-    // has actually won a bank's write port
-    wire tmem_wr_ok = ~tmem_addr_pipe[0].valid || tmem_wr_grant;
-`else
-    wire tmem_wr_ok = 1'b1;
-`endif
-    assign result_if.valid  = setup_valid_r || (fedp_done && tmem_wr_ok);
-    assign fedp_enable      = (~fedp_done || fedp_result_fire) && tmem_wr_ok;
+    wire fedp_done = fedp_delay_pipe[0];
+
+    wire landq_credits_full;
+    VX_pending_size #(
+        .SIZE (LANDQ_SIZE)
+    ) landq_credits (
+        .clk   (clk),
+        .reset (reset),
+        .incr  (execute_fire),
+        .decr  (result_fire),
+        `UNUSED_PIN (empty),
+        `UNUSED_PIN (alm_empty),
+        .full  (landq_credits_full),
+        `UNUSED_PIN (alm_full),
+        `UNUSED_PIN (size)
+    );
 
 `ifdef VX_CFG_TCU_TMEM_ENABLE
     // Tile-origin address for the incoming uop (pre +i/+j offset)
@@ -361,62 +345,87 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         ("%s: cta_rank %0d exceeds NUM_TCU_BLOCKS (%0d) — CTA is larger than one warpgroup, violating TMEM's CTA-size==warpgroup-size assumption",
          INSTANCE_ID, cta_rank, `VX_CFG_NUM_TCU_BLOCKS))
 
-    // RAW-hazard interlock. k-outer UMMA loop order only avoids revisiting
-    // the same TMEM tile before its prior write retires when
-    // n_steps*m_steps >= FEDP_LATENCY+1. This tracks every in-flight
-    // write's address explicitly and stalls admission of a colliding new
-    // uop so correctness doesn't depend on that bound holding. Shifted
-    // in lockstep with fedp_delay_pipe, so position 0 always corresponds
-    // to the same uop fedp_done reports on.
+    // RAW-hazard interlock, tracking in-flight TMEM writes explicitly.
+    //
+    // The FEDP array free-runs and its results are buffered in the landing
+    // queue, so a UMMA uop's TMEM write no longer lands a fixed PIPE_LATENCY
+    // after admission: it lands when the result retires AND wins a bank write
+    // port. A fixed-latency mirror of fedp_delay_pipe cannot model that, so
+    // in-flight writes are tracked explicitly instead.
+    //
+    // Every non-setup uop takes an entry at admission and gives it up at
+    // retirement, so the head always describes the result being retired now;
+    // its is_umma bit says whether that retirement owes TMEM a write.
+    // Allocation and release are both in order (in-order array, FIFO landing
+    // queue), so this is a circular buffer with parallel-visible entries --
+    // content-addressable lookup without content-addressable allocation.
+    //
+    // Depth: the credit bound above already caps admitted-but-unretired uops
+    // at LANDQ_SIZE, and a UMMA result does not retire until its write is
+    // granted, so LANDQ_SIZE entries is a hard bound. Note the hazard window
+    // is now up to LANDQ_SIZE deep rather than PIPE_LATENCY, so the ordering
+    // bound that avoids interlock stalls is n_steps*m_steps >= LANDQ_SIZE+1.
     typedef struct packed {
         logic                          valid;
+        logic                          is_umma;
         logic [TCU_TMEM_LANE_BITS-1:0] lane_base;
         logic [TCU_TMEM_COL_BITS-1:0]  col_base;
-    } tmem_addr_t;
+    } tmem_wr_track_t;
 
-    tmem_addr_t tmem_addr_pipe [PIPE_LATENCY];
+    localparam TRACK_PTR_W = $clog2(LANDQ_SIZE);
+
+    tmem_wr_track_t wr_track [LANDQ_SIZE];
+    logic [TRACK_PTR_W-1:0] track_head, track_tail;
 
     always @(posedge clk) begin
         if (reset) begin
-            for (int p = 0; p < PIPE_LATENCY; ++p)
-                tmem_addr_pipe[p] <= '0;
-        end else if (fedp_enable) begin
-            for (int p = 0; p < PIPE_LATENCY-1; ++p)
-                tmem_addr_pipe[p] <= tmem_addr_pipe[p+1];
-            tmem_addr_pipe[PIPE_LATENCY-1].valid     <= fedp_enqueue && is_umma;
-            tmem_addr_pipe[PIPE_LATENCY-1].lane_base <= umma_lane_base;
-            tmem_addr_pipe[PIPE_LATENCY-1].col_base  <= umma_col_base;
+            for (int t = 0; t < LANDQ_SIZE; ++t) begin
+                wr_track[t] <= '0;
+            end
+            track_head <= '0;
+            track_tail <= '0;
+        end else begin
+            if (fedp_enqueue) begin
+                wr_track[track_tail].valid     <= 1'b1;
+                wr_track[track_tail].is_umma   <= is_umma;
+                wr_track[track_tail].lane_base <= umma_lane_base;
+                wr_track[track_tail].col_base  <= umma_col_base;
+                track_tail <= track_tail + TRACK_PTR_W'(1);
+            end
+            if (fedp_result_fire) begin
+                wr_track[track_head].valid <= 1'b0;
+                track_head <= track_head + TRACK_PTR_W'(1);
+            end
         end
     end
 
-    logic [PIPE_LATENCY-1:0] umma_hazard_match;
-    for (genvar p = 0; p < PIPE_LATENCY; ++p) begin : g_umma_hazard
-        assign umma_hazard_match[p] = tmem_addr_pipe[p].valid
-                                    && (tmem_addr_pipe[p].lane_base == umma_lane_base)
-                                    && (tmem_addr_pipe[p].col_base  == umma_col_base);
+    logic [LANDQ_SIZE-1:0] umma_hazard_match;
+    for (genvar t = 0; t < LANDQ_SIZE; ++t) begin : g_umma_hazard
+        assign umma_hazard_match[t] = wr_track[t].valid && wr_track[t].is_umma
+                                    && (wr_track[t].lane_base == umma_lane_base)
+                                    && (wr_track[t].col_base  == umma_col_base);
     end
     wire umma_hazard = is_umma && (|umma_hazard_match);
 
     // Bank-port stall: this op's TMEM read hasn't won its bank yet (or is
     // won and waiting on other admission conditions). Retries next cycle.
     wire umma_rd_stall = is_umma && ~umma_rd_won;
-
-    // TMEM write fires the same cycle fedp_done does, for whichever uop is
-    // now at position 0. tmem_addr_pipe[0].valid is 0 for non-UMMA uops.
-    // This is a request. VX_tcu_tmem only actually writes if it grants
-    // the bank's write port (tmem_wr_grant)
-    assign tmem_wr_valid     = fedp_done && tmem_addr_pipe[0].valid;
-    assign tmem_wr_lane_base = tmem_addr_pipe[0].lane_base;
-    assign tmem_wr_col_base  = tmem_addr_pipe[0].col_base;
-
-    assign execute_if.ready = is_wgmma_setup
-                            ? ((~setup_valid_r || result_if.ready) && exe_ready_extra)
-                            : (~mdata_queue_full && fedp_enable && exe_ready_extra && ~umma_hazard && ~umma_rd_stall);
 `else
-    assign execute_if.ready = is_wgmma_setup
-                            ? ((~setup_valid_r || result_if.ready) && exe_ready_extra)
-                            : (~mdata_queue_full && fedp_enable && exe_ready_extra);
+    wire umma_hazard   = 1'b0;
+    wire umma_rd_stall = 1'b0;
 `endif
+
+    // Admission stalls while a completed result waits on the consumer: this
+    // keeps the landing queue shallow so a chained MMA never sees queueing
+    // delay behind other warps' results. The credit bound stays as the hard
+    // overflow guarantee for the free-running array.
+    // A setup uop needs no FEDP slot but must not overwrite a setup result
+    // still waiting on the consumer.
+    assign execute_if.ready = ~mdata_queue_full && ~landq_credits_full
+                           && (~fedp_done || result_if.ready)
+                           && (~is_wgmma_setup || ~setup_valid_r || result_if.ready)
+                           && exe_ready_extra
+                           && ~umma_hazard && ~umma_rd_stall;
 
     wire mdata_push = fedp_enqueue;
 
@@ -746,6 +755,9 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             VX_tcu_dsm #(
                 .N (TCU_TC_K)
             ) dual_sparse_mask (
+                .clk      (clk),
+                .reset    (reset),
+                .enable   (1'b1),
                 .fmt_s    (fmt_s),
                 .a_row    (a_row),
                 .b_col    (b_col),
@@ -756,7 +768,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             ) pipe_vld_mask (
                 .clk      (clk),
                 .reset    (reset),
-                .enable   (fedp_enable),
+                .enable   (1'b1),
                 .data_in  (vld_mask),
                 .data_out (vld_mask_r)
             );
@@ -778,7 +790,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             ) pipe_fedp (
                 .clk      (clk),
                 .reset    (reset),
-                .enable   (fedp_enable),
+                .enable   (1'b1),
                 .data_in  ({c_val,   sf_b,   sf_a,   fmt_s,   fmt_d,   b_col,   a_row}),
                 .data_out ({c_val_r, sf_b_r, sf_a_r, fmt_s_r, fmt_d_r, b_col_r, a_row_r})
             );
@@ -788,7 +800,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             ) pipe_fedp (
                 .clk      (clk),
                 .reset    (reset),
-                .enable   (fedp_enable),
+                .enable   (1'b1),
                 .data_in  ({c_val,   fmt_s,   fmt_d,   b_col,   a_row}),
                 .data_out ({c_val_r, fmt_s_r, fmt_d_r, b_col_r, a_row_r})
             );
@@ -803,7 +815,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             ) fedp (
                 .clk   (clk),
                 .reset (reset),
-                .enable(fedp_enable),
+                .enable(1'b1),
                 .fmt_s (fmt_s_r),
                 .fmt_d (fmt_d_r),
                 .a_row(a_row_r),
@@ -823,7 +835,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             ) fedp (
                 .clk   (clk),
                 .reset (reset),
-                .enable(fedp_enable),
+                .enable(1'b1),
                 .fmt_s (fmt_s_r),
                 .fmt_d (fmt_d_r),
                 .a_row(a_row_r),
@@ -839,7 +851,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             ) fedp (
                 .clk   (clk),
                 .reset (reset),
-                .enable(fedp_enable),
+                .enable(1'b1),
                 .fmt_s (fmt_s_r),
                 .fmt_d (fmt_d_r),
                 .a_row (a_row_r),
@@ -852,12 +864,13 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                 .INSTANCE_ID (INSTANCE_ID),
                 .LATENCY (FEDP_LATENCY),
                 .N (FEDP_K),
-                .SF (FEDP_SF)
+                .SF (FEDP_SF),
+                .USE_DSP (`VX_CFG_TCU_USE_DSP)
             ) fedp (
                 .clk   (clk),
                 .reset (reset),
+                .enable(1'b1),
                 .vld_mask(vld_mask_r),
-                .enable(fedp_enable),
                 .fmt_s (fmt_s_r),
                 .fmt_d (fmt_d_r),
                 .a_row (a_row_r),
@@ -877,7 +890,7 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             ) fedp (
                 .clk   (clk),
                 .reset (reset),
-                .enable(fedp_enable),
+                .enable(1'b1),
                 .fmt_s (fmt_s_r),
                 .fmt_d (fmt_d_r),
                 .a_row(a_row_r),
@@ -885,19 +898,8 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                 .c_val (c_val_r),
                 .d_val (d_val[i][j])
             );
-        `endif
-
-            // NaN-box the fp32 result for XLEN=64: upper 32 bits must be all-1s per RVF spec.
-            if (`VX_CFG_XLEN > 32) begin : g_result_nanbox
-                assign result_if.data.data[i * TCU_TC_N + j] = {32'hffffffff, d_val[i][j]};
-            end else begin : g_result_passthrough
-                assign result_if.data.data[i * TCU_TC_N + j] = d_val[i][j];
-            end
-
-        `ifdef VX_CFG_TCU_TMEM_ENABLE
-            // UMMA's real destination — result_if.data.data[i*TCU_TC_N+j]
-            // above is harmless but unused for UMMA
-            assign tmem_wr_data[i][j] = d_val[i][j];
+        `else
+            VX_tcu_fedp_no_implementation_selected fedp ();
         `endif
 
         `ifdef DBG_TRACE_TCU
@@ -910,10 +912,85 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                     `TRACE(3, (", c_val=0x%0h (#%0d)\n", c_val, execute_if.data.header.uuid));
                 end
                 if (result_if.valid && result_if.ready) begin
-                    `TRACE(3, ("%t: %s FEDP-deq: wid=%0d, cta_id=%0d, i=%0d, j=%0d, d_val=0x%0h (#%0d)\n", $time, INSTANCE_ID, result_if.data.header.wid, result_if.data.header.cta_id, i, j, d_val[i][j], result_if.data.header.uuid));
+                    `TRACE(3, ("%t: %s FEDP-deq: wid=%0d, cta_id=%0d, i=%0d, j=%0d, d_val=0x%0h (#%0d)\n", $time, INSTANCE_ID, result_if.data.header.wid, result_if.data.header.cta_id, i, j, result_if.data.data[i * TCU_TC_N + j][31:0], result_if.data.header.uuid));
                 end
             end
         `endif // DBG_TRACE_TCU
+        end
+    end
+
+    // -----------------------------------------------------------------------
+    // Result landing queue
+    // -----------------------------------------------------------------------
+    // A stalled consumer parks completing results here (a slot was reserved
+    // at admission), so the FEDP grid never needs a backpressure enable. An
+    // unblocked result bypasses the queue and retires with no added latency.
+
+    localparam RESULT_DATAW = TCU_TC_M * TCU_TC_N * 32;
+
+    wire [RESULT_DATAW-1:0] landq_data;
+    wire landq_empty, landq_full;
+
+    // Payload of whatever non-setup result is retiring now: straight off the
+    // array when the queue is empty, else the queue head.
+    wire [RESULT_DATAW-1:0] result_data = landq_empty ? RESULT_DATAW'(d_val) : landq_data;
+
+`ifdef VX_CFG_TCU_TMEM_ENABLE
+    // A retiring UMMA result owes TMEM a write. Address comes from the
+    // tracker head (the entry describing this retirement), data from the same
+    // mux that feeds result_if -- so UMMA rides the shared result path rather
+    // than needing a buffer of its own. Retirement is held until the bank
+    // write port is granted.
+    wire umma_wr_pending = (fedp_done || ~landq_empty) && ~setup_valid_r
+                        && wr_track[track_head].valid && wr_track[track_head].is_umma;
+
+    assign tmem_wr_valid     = umma_wr_pending;
+    assign tmem_wr_lane_base = wr_track[track_head].lane_base;
+    assign tmem_wr_col_base  = wr_track[track_head].col_base;
+    assign tmem_wr_data      = result_data;
+
+    wire tmem_wr_ok = ~umma_wr_pending || tmem_wr_grant;
+`else
+    wire tmem_wr_ok = 1'b1;
+`endif
+
+    // A setup result occupying the interface must neither bypass into nor
+    // pop the landing queue: its slot carries no FEDP payload. An ungranted
+    // TMEM write must not bypass either -- without tmem_wr_ok here the result
+    // would be neither buffered nor retired, and would be lost.
+    wire landq_bypass = landq_empty && result_if.ready && ~setup_valid_r && tmem_wr_ok;
+    wire landq_push   = fedp_done && ~landq_bypass;
+    wire landq_pop    = result_fire && ~landq_empty && ~setup_valid_r;
+
+    VX_fifo_queue #(
+        .DATAW (RESULT_DATAW),
+        .DEPTH (LANDQ_SIZE),
+        .OUT_REG (1),
+        .LUTRAM (1)
+    ) landing_queue (
+        .clk    (clk),
+        .reset  (reset),
+        .push   (landq_push),
+        .pop    (landq_pop),
+        .data_in(d_val),
+        .data_out(landq_data),
+        .empty  (landq_empty),
+        `UNUSED_PIN(alm_empty),
+        .full   (landq_full),
+        `UNUSED_PIN(alm_full),
+        `UNUSED_PIN(size)
+    );
+
+    assign result_if.valid = setup_valid_r || ((fedp_done || ~landq_empty) && tmem_wr_ok);
+
+    `RUNTIME_ASSERT (~(landq_push && landq_full), ("%t: %s: result landing queue overflow", $time, INSTANCE_ID))
+
+    // NaN-box the fp32 results for XLEN=64: upper 32 bits must be all-1s per RVF spec.
+    for (genvar e = 0; e < TCU_TC_M * TCU_TC_N; ++e) begin : g_result
+        if (`VX_CFG_XLEN > 32) begin : g_nanbox
+            assign result_if.data.data[e] = {32'hffffffff, result_data[e * 32 +: 32]};
+        end else begin : g_passthrough
+            assign result_if.data.data[e] = result_data[e * 32 +: 32];
         end
     end
 
