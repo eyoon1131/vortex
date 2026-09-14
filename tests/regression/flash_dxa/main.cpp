@@ -175,7 +175,9 @@ int main(int argc, char *argv[]) {
         uint32_t dt = 0, occ = 0;
         uint64_t lmem = 0;
 
-        if (c / num_threads <= SP_BUF_MAX) {
+        // The strided cooperative loops over block_size_c assign each lane
+        // c/num_threads columns, so must divide evenly.
+        if ((c % num_threads) == 0) {
             uint64_t fixed = sizeof(TYPE) * (2 * static_cast<uint64_t>(d) * r +
                                              static_cast<uint64_t>(r) * c);
             if (d_override) {

@@ -5,8 +5,6 @@
 #define TYPE float
 #endif
 
-#define SP_BUF_MAX 32
-
 typedef struct {
   uint32_t seq_len;
   uint32_t head_dim;

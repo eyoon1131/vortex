@@ -92,14 +92,15 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
     TYPE m = -INFINITY;
     TYPE l = TYPE(0);
 
-    // Per-lane SP buffer (on stack to support configurability)
+    // This warp's row of the S/P buffer in LMEM. Accumulates S and softmax
+    // rewrites it in place as P.
     uint32_t sp_count = block_size_c / num_threads;
-    TYPE sp_buf[SP_BUF_MAX];
+    TYPE* P_row = local_P + l_row * block_size_c;
 
     // KV-block loop
     for (uint32_t j = 0; j < seq_len; j += block_size_c) {
         for (uint32_t i = 0; i < sp_count; ++i)
-            sp_buf[i] = TYPE(0);
+            P_row[threadIdx.x + i * num_threads] = TYPE(0);
 
         // S = QK^T (K tiles double-buffered via DXA: the next tile's
         // async copy is issued before this tile's compute)
@@ -120,31 +121,32 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
                 bar[cur].arrive_and_wait();
                 for (uint32_t i = 0; i < sp_count; ++i) {
                     uint32_t c = threadIdx.x + i * num_threads;
+                    TYPE acc = P_row[c];
                     for (uint32_t e = 0; e < tile_w; ++e)
-                        sp_buf[i] += Q_row[h + e] * local_K_buf[cur][c * head_dim_tile + e];
+                        acc += Q_row[h + e] * local_K_buf[cur][c * head_dim_tile + e];
+                    P_row[c] = acc;
                 }
                 bar[cur].arrive_and_wait();
                 cur = nxt;
             }
         }
 
-        // Softmax
-        TYPE local_max = sp_buf[0];
-        for (uint32_t i = 1; i < sp_count; ++i)
-            local_max = (sp_buf[i] > local_max) ? sp_buf[i] : local_max;
+        // Softmax: reduce over this warp's row, then rewrite S as P in place.
+        TYPE local_max = P_row[threadIdx.x];
+        for (uint32_t i = 1; i < sp_count; ++i) {
+            TYPE v = P_row[threadIdx.x + i * num_threads];
+            local_max = (v > local_max) ? v : local_max;
+        }
         TYPE rowmax = warp_reduce_max(local_max, num_threads);
 
         TYPE local_sum = TYPE(0);
         for (uint32_t i = 0; i < sp_count; ++i) {
-            sp_buf[i] = expf(sp_buf[i] - rowmax);
-            local_sum += sp_buf[i];
+            uint32_t c = threadIdx.x + i * num_threads;
+            TYPE p = expf(P_row[c] - rowmax);
+            P_row[c] = p;
+            local_sum += p;
         }
         TYPE rowsum = warp_reduce_sum(local_sum, num_threads);
-
-        for (uint32_t i = 0; i < sp_count; ++i) {
-            uint32_t c = threadIdx.x + i * num_threads;
-            local_P[l_row * block_size_c + c] = sp_buf[i];
-        }
         __syncthreads();
 
         // Compute new m and l
@@ -171,7 +173,7 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
                 for (uint32_t k = threadIdx.x; k < tile_w; k += num_threads) {
                     TYPE dot = TYPE(0);
                     for (uint32_t c = 0; c < block_size_c; ++c) {
-                        dot += local_P[l_row * block_size_c + c] * local_V_buf[cur][c * head_dim_tile + k];
+                        dot += P_row[c] * local_V_buf[cur][c * head_dim_tile + k];
                     }
                     auto& o = local_O[l_row * head_dim + h + k];
                     o = old_weight * o + new_weight * dot;
