@@ -1195,7 +1195,7 @@ public:
 
 // TMEM address format: bits[31:16] = lane base, bits[15:0] = column (the
 // column should already include the allocation's handle offset).
-static __attribute__((always_inline)) uint32_t vx_make_tmem_addr(uint32_t lane_base, uint32_t col) {
+static inline __attribute__((always_inline)) uint32_t vx_make_tmem_addr(uint32_t lane_base, uint32_t col) {
   return ((lane_base & 0xFFFF) << 16) | (col & 0xFFFF);
 }
 
@@ -1213,7 +1213,7 @@ namespace detail {
 
 // Allocate ncols columns of TMEM; returns a handle (base column) to add to
 // every subsequent local column index against this allocation.
-static __attribute__((always_inline)) uint32_t vx_tmem_alloc(uint32_t ncols) {
+static inline __attribute__((always_inline)) uint32_t vx_tmem_alloc(uint32_t ncols) {
   register uint32_t r_ncols  __asm__("a0") = ncols;
   register uint32_t r_handle __asm__("a0");
   __asm__ volatile (
@@ -1229,7 +1229,7 @@ static __attribute__((always_inline)) uint32_t vx_tmem_alloc(uint32_t ncols) {
 }
 
 // Free a TMEM allocation identified by its handle.
-static __attribute__((always_inline)) void vx_tmem_dealloc(uint32_t handle) {
+static inline __attribute__((always_inline)) void vx_tmem_dealloc(uint32_t handle) {
   register uint32_t r_handle __asm__("a0") = handle;
   __asm__ volatile (
     ".insn r %[insn], %[f3], %[f7], x0, %[handle], x0\n\t"
@@ -1244,7 +1244,7 @@ static __attribute__((always_inline)) void vx_tmem_dealloc(uint32_t handle) {
 
 // Store a raw 32-bit TMEM word from this thread's register into TMEM at
 // [lane][col].
-static __attribute__((always_inline)) void vx_tmem_st(uint32_t tmem_addr, uint32_t value) {
+static inline __attribute__((always_inline)) void vx_tmem_st(uint32_t tmem_addr, uint32_t value) {
   register uint32_t r_addr  __asm__("a0") = tmem_addr;
   register float    r_value __asm__("f0") = detail::bit_cast<float>(value);
   __asm__ volatile (
@@ -1261,7 +1261,7 @@ static __attribute__((always_inline)) void vx_tmem_st(uint32_t tmem_addr, uint32
 
 // Load a raw 32-bit TMEM word from TMEM at [lane][col] into this thread's
 // register.
-static __attribute__((always_inline)) uint32_t vx_tmem_ld(uint32_t tmem_addr) {
+static inline __attribute__((always_inline)) uint32_t vx_tmem_ld(uint32_t tmem_addr) {
   register uint32_t r_addr   __asm__("a0") = tmem_addr;
   register float    r_result __asm__("f0");
   __asm__ volatile (
