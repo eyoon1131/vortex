@@ -1305,6 +1305,46 @@ public:
   // A/B SMEM layout is identical to WGMMA
   static constexpr uint32_t a_warp_elems = ctx::a_warp_elems;
 
+  // TMEM epilogue lane geometry.
+  //
+  // xtileM = 2 * 2^floor((lg(NT)+1)/2) grows like sqrt(NT) against a linear NT,
+  // so the two cross at NT = 16 (xtileM = 8). Above the crossover one pass
+  // covers the whole tile and the excess lanes are masked off.
+  static constexpr uint32_t tmem_active_lanes    = (xtileM < NT) ? xtileM : NT;
+  static constexpr uint32_t tmem_rows_per_thread = xtileM / tmem_active_lanes;
+  static constexpr size_t   tmem_lane_mask =
+      (size_t(1) << tmem_active_lanes) - 1;
+
+  // Both paths must tile xtileM exactly.
+  static_assert(tmem_rows_per_thread * tmem_active_lanes == xtileM,
+                "TMEM epilogue does not tile xtileM exactly — NUM_THREADS and "
+                "xtileM must be power-of-two related");
+
+  // Narrow the warp to the lanes that own rows of this tile, returning false
+  // if there are none.
+  static __attribute__((always_inline)) bool tmem_lanes_enter(size_t& saved) {
+    if constexpr (tmem_active_lanes >= NT) {
+      saved = 0;
+      return true;
+    } else {
+      saved = vx_vote_ballot(1);
+      size_t narrowed = saved & tmem_lane_mask;
+      // vx_tmc(0) would idle the whole warp, so skip the body instead
+      if (narrowed == 0)
+        return false;
+      vx_tmc(narrowed);
+      return true;
+    }
+  }
+
+  static __attribute__((always_inline)) void tmem_lanes_exit(size_t saved) {
+    if constexpr (tmem_active_lanes < NT) {
+      vx_tmc(saved);
+    } else {
+      (void)saved;
+    }
+  }
+
   static __attribute__((always_inline)) uint32_t a_blockmajor_idx(uint32_t r, uint32_t c) {
     return ctx::a_blockmajor_idx(r, c);
   }
@@ -1320,13 +1360,16 @@ public:
                   "TMEM accumulate is only valid for 32-bit-wide Ot (fp32/int32/tf32) "
                   "— narrower Ot is not supported");
     uint32_t rank = vx_cta_rank();
-    constexpr uint32_t rows_per_thread = xtileM / NT;
-    for (uint32_t r = 0; r < rows_per_thread; ++r) {
-      uint32_t lane_base = rank * xtileM + r * NT;
+    size_t saved_mask;
+    if (!tmem_lanes_enter(saved_mask))
+      return;
+    for (uint32_t r = 0; r < tmem_rows_per_thread; ++r) {
+      uint32_t lane_base = rank * xtileM + r * tmem_active_lanes;
       for (uint32_t col = 0; col < xtileN; ++col) {
         vx_tmem_st(vx_make_tmem_addr(lane_base, handle + col), detail::bit_cast<uint32_t>(value));
       }
     }
+    tmem_lanes_exit(saved_mask);
   }
 
   // Issue a UMMA op: A/B sourced from SMEM via descriptors, C/D implicit in
@@ -1369,16 +1412,19 @@ public:
     uint32_t tid = vx_thread_id();
     uint32_t rank = vx_cta_rank();
     uint32_t tid_in_warp = tid % NT;
-    constexpr uint32_t rows_per_thread = xtileM / NT;
+    size_t saved_mask;
+    if (!tmem_lanes_enter(saved_mask))
+      return;
 
-    for (uint32_t r = 0; r < rows_per_thread; ++r) {
-      uint32_t base = rank * xtileM + r * NT;
+    for (uint32_t r = 0; r < tmem_rows_per_thread; ++r) {
+      uint32_t base = rank * xtileM + r * tmem_active_lanes;
       uint32_t out_row  = tile_row + base + tid_in_warp;
       output_t* row_ptr = C_global + out_row * N + tile_col;
       for (uint32_t col = 0; col < xtileN; ++col) {
         row_ptr[col] = detail::bit_cast<output_t>(vx_tmem_ld(vx_make_tmem_addr(base, handle + col)));
       }
     }
+    tmem_lanes_exit(saved_mask);
   }
 };
 
