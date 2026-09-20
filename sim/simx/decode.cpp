@@ -961,9 +961,12 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
                 // A/B descriptors arrive via fixed regs a0/a1 and the TMEM
                 // handle via a2, all picked up in TcuUopGen.
         uint32_t fmt_d = rd, fmt_s = rs1;
-        uint32_t umma_nrc = (rs2 >> 1) & 0x7; // bits[3:1] of flags = NRC encoding (0..4)
+        // flags: bit[0] reserved for is_sparse, bits[3:1] = NRC encoding,
+        //        bit[4] = A from shared memory (1 = smem, 0 = TMEM)
+        uint32_t is_a_smem = (rs2 >> 4) & 0x1;
+        uint32_t umma_nrc = (rs2 >> 1) & 0x7;
         instr->set_op_type(TcuType::UMMA);
-        instr->set_args(IntrTcuArgs{1, 0, fmt_s, fmt_d, 0, 0, 0, 0, 0, 0, umma_nrc});
+        instr->set_args(IntrTcuArgs{is_a_smem, 0, fmt_s, fmt_d, 0, 0, 0, 0, 0, 0, umma_nrc});
         instr->set_macro_op();
         instr->set_wstall(true);
       } break;

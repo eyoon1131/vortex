@@ -156,6 +156,7 @@ public:
 	          uint32_t step_n,
 	          uint32_t step_k,
 	          uint32_t umma_nrc,
+	          uint32_t a_from_smem,
 	          uint32_t a_desc,
 	          uint32_t b_desc,
 	          uint32_t handle,

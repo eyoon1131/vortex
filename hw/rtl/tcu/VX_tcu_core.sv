@@ -350,6 +350,10 @@ module VX_tcu_core import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         ("%s: cta_rank %0d exceeds NUM_TCU_BLOCKS (%0d) — CTA is larger than one warpgroup, violating TMEM's CTA-size==warpgroup-size assumption",
          INSTANCE_ID, cta_rank, `VX_CFG_NUM_TCU_BLOCKS))
 
+    // A-from-TMEM decodes but not yet implemented
+    `RUNTIME_ASSERT (~execute_fire || !is_umma || wg_a_smem,
+        ("%s: UMMA with A sourced from TMEM is not implemented in RTL yet", INSTANCE_ID))
+
     // RAW-hazard interlock, tracking in-flight TMEM writes explicitly.
     //
     // Every non-setup uop takes an entry at admission and gives it up at

@@ -31,6 +31,16 @@ struct smem_matrix_desc {
   uint32_t value;
 };
 
+// A reference to an A operand held in TMEM (UMMA's A-from-TMEM mode)
+struct tmem_matrix_ref {
+  uint32_t value; // absolute TMEM column where this warpgroup's A tile begins
+};
+
+// Build a TMEM A-operand reference from an absolute TMEM column.
+static inline __attribute__((always_inline)) tmem_matrix_ref vx_make_tmem_ref(uint32_t col) {
+  return {col};
+}
+
 // Build a smem descriptor from a pointer and row stride in bytes.
 static inline __attribute__((always_inline)) smem_matrix_desc vx_make_smem_desc(const void* ptr, uint32_t leading_bytes) {
   size_t lmem_base = csr_read_nv(VX_CSR_LOCAL_MEM_BASE);
@@ -1288,8 +1298,15 @@ private:
   // UMMA flags encoding (rs2 field, same shape as WGMMA's):
   //   bit 0     : is_sparse = 0 (always, for now)
   //   bits [3:1]: NRC encoding — 0=8, 1=16, 2=32, 3=64, 4=128
+  //   bit 4     : a_from_smem — 1 = shared memory, 0 = TMEM
   static constexpr int umma_nrc_code =
       (NRC_ == 128) ? 4 : (NRC_ == 64) ? 3 : (NRC_ == 32) ? 2 : (NRC_ == 16) ? 1 : 0;
+
+  template <bool a_is_smem>
+  static constexpr int umma_flags() {
+    return (umma_nrc_code << 1)
+         | ((a_is_smem ? 1 : 0) << 4);
+  }
 
 public:
   using input_t  = typename ctx::input_t;
@@ -1374,15 +1391,29 @@ public:
 
   // Issue a UMMA op: A/B sourced from SMEM via descriptors, C/D implicit in
   // TMEM at `handle`.
-  static __attribute__((always_inline)) void umma_sync(smem_matrix_desc desc_a,
+  // ---- UMMA sync intrinsic ----
+  // SS: umma_sync(desc_a,   desc_b, handle) — A from shared memory
+  // TS: umma_sync(tmem_ref, desc_b, handle) — A from TMEM
+  //
+  // On the TMEM path op_a.value is an absolute TMEM column. No lane field is
+  // needed since A's rows are the same TMEM lanes the accumulator uses
+  // (cta_rank*xtileM + m), so element (row, k) lives at
+  //   TMEM[cta_rank*xtileM + row][op_a.value + k / elems_per_word]
+  // with the same elems_per_word packing the shared-memory path uses.
+  template <typename OpA>
+  static __attribute__((always_inline)) void umma_sync(const OpA& op_a,
                                                        smem_matrix_desc desc_b,
                                                        uint32_t handle) {
     static_assert(NRC_ == 8 || NRC_ == 16 || NRC_ == 32 || NRC_ == 64 || NRC_ == 128,
                   "umma_sync supports NRC = 8, 16, 32, 64, 128");
 
-    int flags = umma_nrc_code << 1;
+    constexpr bool a_is_smem = std::is_same_v<OpA, smem_matrix_desc>;
+    static_assert(a_is_smem || std::is_same_v<OpA, tmem_matrix_ref>,
+                  "A must be smem_matrix_desc or tmem_matrix_ref");
 
-    register uint32_t ra __asm__("a0") = desc_a.value;
+    constexpr int flags = umma_flags<a_is_smem>();
+
+    register uint32_t ra __asm__("a0") = op_a.value;
     register uint32_t rb __asm__("a1") = desc_b.value;
     register uint32_t rh __asm__("a2") = handle;
 

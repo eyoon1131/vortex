@@ -712,8 +712,9 @@ module VX_decode import
                                 // cd_nregs.
                                 op_type = INST_OP_BITS'(INST_TCU_UMMA);
                                 op_args.tcu.cd_nregs    = rs2[3:1];
-                                // UMMA's A operand always from shared memory
-                                op_args.tcu.a_from_smem = 1'b1;
+                                // rs2[4] selects A's source, 1 = shared
+                                // memory and 0 = TMEM
+                                op_args.tcu.a_from_smem = rs2[4];
                                 op_args.tcu.fmt_s       = rs1[4:0];
                                 op_args.tcu.fmt_d       = rd[4:0];
                             end

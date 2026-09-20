@@ -766,7 +766,9 @@ enum class TcuType {
 };
 
 struct IntrTcuArgs {
-  uint32_t is_a_smem    : 1; // 0=register, 1=shared memory (B is always smem)
+  // WGMMA: 0 = register, 1 = shared memory.
+  // UMMA:  0 = TMEM,     1 = shared memory.
+  uint32_t is_a_smem    : 1;
   uint32_t cd_nregs     : 2; // 0=8, 1=16, 2=32 C/D registers
   uint32_t fmt_s        : 5;
   uint32_t fmt_d        : 5;

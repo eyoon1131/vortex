@@ -748,7 +748,7 @@ public:
           }
           this->umma(wid, tpuArgs.fmt_s, tpuArgs.fmt_d,
                      tpuArgs.step_m, tpuArgs.step_n, tpuArgs.step_k,
-                     tpuArgs.umma_nrc, a_desc, b_desc, handle,
+                     tpuArgs.umma_nrc, tpuArgs.is_a_smem, a_desc, b_desc, handle,
                      rs1_data, rs2_data);
         } break;
         case TcuType::TMEM_ALLOC: {
@@ -1295,6 +1295,7 @@ public:
             uint32_t step_n,
             uint32_t step_k,
             uint32_t umma_nrc,
+            uint32_t a_from_smem,
             uint32_t a_desc,
             uint32_t b_desc,
             uint32_t handle,
@@ -1302,6 +1303,14 @@ public:
             const std::vector<reg_data_t>& rs2_data) {
     __unused(rs1_data);
     __unused(rs2_data);
+
+    // A-from-TMEM decodes and reaches here, but the operand fetch below still
+    // reads shared memory. Placeholder until implemented.
+    if (!a_from_smem) {
+      std::cout << "Error: UMMA with A sourced from TMEM is not implemented in "
+                   "the SimX model yet" << std::endl;
+      std::abort();
+    }
 
     uint32_t nrc = kNrcTable[umma_nrc];
 
@@ -2106,12 +2115,13 @@ void TcuUnit::umma(uint32_t wid,
                     uint32_t step_n,
                     uint32_t step_k,
                     uint32_t umma_nrc,
+                    uint32_t a_from_smem,
                     uint32_t a_desc,
                     uint32_t b_desc,
                     uint32_t handle,
                     const std::vector<reg_data_t>& rs1_data,
                     const std::vector<reg_data_t>& rs2_data) {
   impl_->umma(wid, fmt_s, fmt_d, step_m, step_n, step_k,
-              umma_nrc, a_desc, b_desc, handle, rs1_data, rs2_data);
+              umma_nrc, a_from_smem, a_desc, b_desc, handle, rs1_data, rs2_data);
 }
 #endif

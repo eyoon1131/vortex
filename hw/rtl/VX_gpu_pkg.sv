@@ -959,7 +959,8 @@ package VX_gpu_pkg;
     typedef struct packed {
         logic is_last_uop;    // WGMMA/UMMA: set on last sub-uop of an expansion
         logic is_first_uop;   // WGMMA/UMMA: set on first sub-uop of an expansion
-        logic a_from_smem;    // 0=register, 1=shared memory (B is always smem)
+        logic a_from_smem;    // WGMMA: 0=register, 1=shared memory
+                              // UMMA:  0=TMEM,     1=shared memory
         logic [2:0] cd_nregs; // WGMMA: 0=8, 1=16, 2=32 C/D registers
                               // UMMA:  0..4 -> NRC 8/16/32/64/128
         logic [4:0] fmt_d;
