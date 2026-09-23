@@ -89,7 +89,6 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     localparam COL_IDX_W   = `LOG2UP(TCU_TC_N);
     localparam COL_SEL_W   = $clog2(TCU_TC_N);
     localparam ARB_W       = 2 * BLOCK_SIZE;
-    localparam ARB_IDX_W   = `LOG2UP(ARB_W);
 
     `STATIC_ASSERT ((TCU_TMEM_COLS & (TCU_TMEM_COLS - 1)) == 0, ("VX_CFG_TCU_TMEM_COLS must be a power of 2"))
 
@@ -186,14 +185,8 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
     // -----------------------------------------------------------------------
     // Per-bank READ arbitration: compute-read and TMEM_LD share one
-    // unified, fairly-rotated pool per bank
+    // unified round-robin pool per bank
     // -----------------------------------------------------------------------
-
-    logic [ARB_IDX_W-1:0] rot_ctr;
-    always @(posedge clk) begin
-        if (reset) rot_ctr <= '0;
-        else       rot_ctr <= (rot_ctr == ARB_IDX_W'(ARB_W-1)) ? '0 : (rot_ctr + ARB_IDX_W'(1));
-    end
 
     logic [31:0]            bank_rd_word [BLOCK_SIZE][TCU_WG_TILE_M][TCU_TC_N];
     wire [BANK_ADDR_W-1:0]  bank_raddr [BLOCK_SIZE];
@@ -211,35 +204,38 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         end
         wire [ARB_W-1:0] req_vec = {ldst_req, cmp_req};
 
-        wire [ARB_W-1:0] req_vec_rot;
-        for (genvar k = 0; k < ARB_W; ++k) begin : g_rotate_in
-            assign req_vec_rot[k] = req_vec[(k + rot_ctr) % ARB_W];
-        end
-
-        wire [ARB_W-1:0] grant_onehot_rot;
-        VX_priority_encoder #(
-            .N (ARB_W)
+        // grant_ready is tied high: a win is consumed the cycle it is issued
+        // (the read grant is registered downstream), and each requester drops
+        // its request on winning via its own sticky latch, so the arbiter is
+        // never asked to re-grant an outstanding win.
+        VX_generic_arbiter #(
+            .NUM_REQS (ARB_W),
+            .TYPE     ("R")
         ) rd_arb (
-            .data_in    (req_vec_rot),
-            .onehot_out (grant_onehot_rot),
-            `UNUSED_PIN (index_out),
-            `UNUSED_PIN (valid_out)
+            .clk          (clk),
+            .reset        (reset),
+            .requests     (req_vec),
+            `UNUSED_PIN (grant_index),
+            .grant_onehot (bank_rd_grant_onehot[r]),
+            `UNUSED_PIN (grant_valid),
+            .grant_ready  (1'b1)
         );
-        for (genvar p = 0; p < ARB_W; ++p) begin : g_rotate_out
-            assign bank_rd_grant_onehot[r][p] = grant_onehot_rot[(p + ARB_W - rot_ctr) % ARB_W];
-        end
 
         assign bank_rd_conflict[r] = $countones(req_vec) > 1;
 
-        logic [BANK_ADDR_W-1:0] winner_word;
-        always_comb begin
-            winner_word = '0;
-            for (integer bi = 0; bi < BLOCK_SIZE; ++bi) begin
-                if (bank_rd_grant_onehot[r][bi])              winner_word |= rd_word[bi];
-                if (bank_rd_grant_onehot[r][BLOCK_SIZE + bi]) winner_word |= ldst_word[bi];
-            end
+        wire [ARB_W-1:0][BANK_ADDR_W-1:0] arb_rd_word;
+        for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_arb_rd_word
+            assign arb_rd_word[bi]              = rd_word[bi];
+            assign arb_rd_word[BLOCK_SIZE + bi] = ldst_word[bi];
         end
-        assign bank_raddr[r] = winner_word;
+        VX_onehot_mux #(
+            .DATAW (BANK_ADDR_W),
+            .N     (ARB_W)
+        ) raddr_mux (
+            .data_in  (arb_rd_word),
+            .sel_in   (bank_rd_grant_onehot[r]),
+            .data_out (bank_raddr[r])
+        );
     end
 
     // Bank's rdata this cycle reflects whichever raddr/read was presented
@@ -320,23 +316,18 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         end
         wire [ARB_W-1:0] req_vec = {ldst_req, cmp_req};
 
-        wire [ARB_W-1:0] req_vec_rot;
-        for (genvar k = 0; k < ARB_W; ++k) begin : g_rotate_in
-            assign req_vec_rot[k] = req_vec[(k + rot_ctr) % ARB_W];
-        end
-
-        wire [ARB_W-1:0] grant_onehot_rot;
-        VX_priority_encoder #(
-            .N (ARB_W)
+        VX_generic_arbiter #(
+            .NUM_REQS (ARB_W),
+            .TYPE     ("R")
         ) wr_arb (
-            .data_in    (req_vec_rot),
-            .onehot_out (grant_onehot_rot),
-            `UNUSED_PIN (index_out),
-            `UNUSED_PIN (valid_out)
+            .clk          (clk),
+            .reset        (reset),
+            .requests     (req_vec),
+            `UNUSED_PIN (grant_index),
+            .grant_onehot (bank_wr_grant_onehot[r]),
+            `UNUSED_PIN (grant_valid),
+            .grant_ready  (1'b1)
         );
-        for (genvar p = 0; p < ARB_W; ++p) begin : g_rotate_out
-            assign bank_wr_grant_onehot[r][p] = grant_onehot_rot[(p + ARB_W - rot_ctr) % ARB_W];
-        end
 
         assign bank_wr_conflict[r] = $countones(req_vec) > 1;
     end
