@@ -1258,11 +1258,12 @@ package VX_gpu_pkg;
         logic [PERF_CTR_BITS-1:0] wgmma_instrs;      // WGMMA µops executed
         logic [PERF_CTR_BITS-1:0] tbuf_stalls;         // cycles: WGMMA valid but stalled (uop cannot enter TCU core because tbuf data not ready)
 `ifdef VX_CFG_TCU_TMEM_ENABLE
-        logic [PERF_CTR_BITS-1:0] umma_instrs;       // UMMA µops executed
-        logic [PERF_CTR_BITS-1:0] tmem_reads;        // TMEM elements read (UMMA C + tmem_ld)
-        logic [PERF_CTR_BITS-1:0] tmem_writes;       // TMEM elements written (UMMA D + tmem_st)
-        logic [PERF_CTR_BITS-1:0] tmem_bank_stalls;  // cycles: a TMEM bank request (compute or tmem_ld/st) lost arbitration and retried
-        logic [PERF_CTR_BITS-1:0] tmem_hazard_stalls; // cycles: a UMMA uop was blocked at admission by the TMEM RAW interlock (distinct from losing bank arbitration)
+        logic [PERF_CTR_BITS-1:0] umma_instrs;          // UMMA µops executed
+        logic [PERF_CTR_BITS-1:0] tmem_reads;           // TMEM elements read (UMMA C + tmem_ld)
+        logic [PERF_CTR_BITS-1:0] tmem_writes;          // TMEM elements written (UMMA D + tmem_st)
+        logic [PERF_CTR_BITS-1:0] tmem_bank_stalls;     // cycles: a TMEM bank request (compute or tmem_ld/st) lost arbitration and retried
+        logic [PERF_CTR_BITS-1:0] tmem_hazard_stalls;   // cycles: a UMMA uop was blocked at admission by the TMEM RAW interlock (distinct from losing bank arbitration)
+        logic [PERF_CTR_BITS-1:0] tmem_rd_grant_stalls; // cycles: a UMMA uop was blocked at admission waiting on its accumulator read grant
 `endif
     } tcu_perf_t;
 `endif

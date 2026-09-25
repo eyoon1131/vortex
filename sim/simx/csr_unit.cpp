@@ -250,9 +250,10 @@ Word CsrUnit::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
         CSR_READ_64(VX_CSR_MPM_TCU_UMMA_INSTRS,        tcu_perf.umma_instrs);
         CSR_READ_64(VX_CSR_MPM_TCU_TMEM_READS,         tcu_perf.tmem_reads);
         CSR_READ_64(VX_CSR_MPM_TCU_TMEM_WRITES,        tcu_perf.tmem_writes);
-        // Always 0 in SimX: no bank-arbitration or interlock model
-        CSR_READ_64(VX_CSR_MPM_TCU_TMEM_BANK_STALLS,   tcu_perf.tmem_bank_stalls);
-        CSR_READ_64(VX_CSR_MPM_TCU_TMEM_HAZARD_STALLS, tcu_perf.tmem_hazard_stalls);
+        // Always 0 in SimX
+        CSR_READ_64(VX_CSR_MPM_TCU_TMEM_BANK_STALLS,     tcu_perf.tmem_bank_stalls);
+        CSR_READ_64(VX_CSR_MPM_TCU_TMEM_HAZARD_STALLS,   tcu_perf.tmem_hazard_stalls);
+        CSR_READ_64(VX_CSR_MPM_TCU_TMEM_RD_GRANT_STALLS, tcu_perf.tmem_rd_grant_stalls);
       #endif
         }
       } break;
