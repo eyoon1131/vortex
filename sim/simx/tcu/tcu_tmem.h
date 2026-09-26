@@ -93,7 +93,9 @@ public:
     std::array<BankReq, kBanks> ldst_wr{};     // TMEM_ST
   };
 
-  // Read grants are the previous arb_step's. Write grants are this arb_step's.
+  // Read grants are the previous arb_arbitrate()'s, registered to match
+  // VX_dp_ram OUT_REG=1: a read's data is only valid the cycle after its win.
+  // Write grants are the current arb_arbitrate()'s.
   // An ungranted requester must retry without popping.
   struct Grants {
     std::bitset<kBanks> compute_rd;
@@ -102,10 +104,21 @@ public:
     std::bitset<kBanks> ldst_wr;
   };
 
-  // Publish last cycle's registered read grants, then arbitrate this cycle's
-  // requests. Stepped once per cycle from TcuUnit::on_tick(), before the
-  // per-block consume pass.
-  void arb_step(const CycleReqs& reqs);
+  // Arbitration is split so the consumer can close the RTL's combinational 
+  // loop: tmem_rd_valid depends on ~umma_rd_won, which depends on the grant
+  // published this cycle. The caller therefore decodes addresses, publishes,
+  // decides validity from the published grants, then arbitrates.
+  //
+  //   1. fill in every requester's lane_base/col_base (valid may stay false)
+  //   2. arb_publish(reqs)  -- grants() now holds last cycle's read grants
+  //   3. set each requester's valid from grants() and its own sticky latch
+  //   4. arb_arbitrate(reqs)
+  //   5. consume: a block without its grant retries without popping
+  //
+  // The caller owns the compute-side sticky latches. Only the TMEM_ST latch
+  // lives on this side, and arb_arbitrate() applies it itself.
+  void arb_publish(const CycleReqs& reqs);
+  void arb_arbitrate(const CycleReqs& reqs);
 
   const Grants& grants() const { return grants_; }
 

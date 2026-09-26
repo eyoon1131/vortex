@@ -392,6 +392,10 @@ public:
   #endif
   #ifdef VX_CFG_TCU_TMEM_ENABLE
     tmem_.reset();
+    tmem_reqs_ = TcuTmem::CycleReqs{};
+    umma_rd_won_.fill(false);
+    umma_rd_won_r_.fill(false);
+    umma_wr_won_r_.fill(false);
     umma_handle_.clear();
   #endif
   }
@@ -532,9 +536,97 @@ public:
   }
 #endif // TCU_META_ENABLE
 
+#ifdef VX_CFG_TCU_TMEM_ENABLE
+  // Collect and arbitrate this cycle's TMEM bank requests.
+  void tmem_arb_step() {
+    tmem_reqs_ = TcuTmem::CycleReqs{};
+
+    // Phase 1 — decode addresses. Validity is decided in phase 3, once the
+    // published grants are known, so a request's address is filled in here
+    // even for a requester that will not bid.
+    for (uint32_t b = 0; b < VX_CFG_NUM_TCU_BLOCKS; ++b) {
+      auto& input = simobject_->Inputs.at(b);
+      if (input.empty())
+        continue;
+      auto trace = input.peek();
+      auto tcu_type = std::get<TcuType>(trace->op_type);
+      auto tpuArgs = std::get<IntrTcuArgs>(trace->instr_ptr->get_args());
+      uint32_t wid = trace->wid;
+
+      switch (tcu_type) {
+      case TcuType::UMMA: {
+        bool first_uop = (tpuArgs.step_m == 0 && tpuArgs.step_n == 0 && tpuArgs.step_k == 0);
+        uint32_t handle = first_uop ? (trace->src_data[2].empty() ? 0 : trace->src_data[2].at(0).u32)
+                                    : umma_handle_[wid];
+        uint32_t cta_rank = core_->scheduler().warp(wid).cta_csrs.cta_rank;
+        tmem_reqs_.compute_rd.at(b).lane_base =
+            cta_rank * wg_cfg::xtileM + tpuArgs.step_m * cfg::tcM;
+        tmem_reqs_.compute_rd.at(b).col_base = handle + tpuArgs.step_n * cfg::tcN;
+        tmem_reqs_.compute_wr.at(b) = tmem_reqs_.compute_rd.at(b);
+      } break;
+      case TcuType::TMEM_LD:
+      case TcuType::TMEM_ST: {
+        uint32_t tmem_addr = trace->src_data[0].empty() ? 0 : trace->src_data[0].at(0).u32;
+        TcuTmem::BankReq req;
+        req.lane_base = (tmem_addr >> 16) & 0xFFFF;
+        req.col_base = tmem_addr & 0xFFFF;
+        if (tcu_type == TcuType::TMEM_LD) {
+          tmem_reqs_.ldst_rd.at(b) = req;
+        } else {
+          tmem_reqs_.ldst_wr.at(b) = req;
+        }
+      } break;
+      default:
+        break;
+      }
+    }
+
+    // Phase 2 — publish the read grants arbitrated last cycle.
+    tmem_.arb_publish(tmem_reqs_);
+
+    // Phase 3 — resolve the compute-side sticky latches and set validity.
+    for (uint32_t b = 0; b < VX_CFG_NUM_TCU_BLOCKS; ++b) {
+      auto& input = simobject_->Inputs.at(b);
+      if (input.empty())
+        continue;
+      auto tcu_type = std::get<TcuType>(input.peek()->op_type);
+
+      if (tcu_type == TcuType::UMMA) {
+        umma_rd_won_.at(b) = tmem_.grants().compute_rd.test(b) || umma_rd_won_r_.at(b);
+        tmem_reqs_.compute_rd.at(b).valid = !umma_rd_won_.at(b);
+        if (!umma_rd_won_.at(b) && !exec_done_.at(b)) {
+          ++perf_stats_.tmem_rd_grant_stalls;
+        }
+        // The writeback bids once the read is in hand.
+        tmem_reqs_.compute_wr.at(b).valid =
+            (umma_rd_won_.at(b) || exec_done_.at(b)) && !umma_wr_won_r_.at(b);
+      } else {
+        umma_rd_won_.at(b) = false;
+        tmem_reqs_.ldst_rd.at(b).valid = (tcu_type == TcuType::TMEM_LD);
+        tmem_reqs_.ldst_wr.at(b).valid =
+            (tcu_type == TcuType::TMEM_ST) && !tmem_.won_ldst_wr(b);
+      }
+    }
+
+    tmem_.arb_arbitrate(tmem_reqs_);
+    perf_stats_.tmem_bank_stalls = tmem_.perf_stats().bank_stalls;
+
+    // The compute-read win must survive to the admission cycle, which is the
+    // next one. Latch it now that arbitration has consumed this cycle's
+    // requests; it is cleared when the uop is admitted.
+    for (uint32_t b = 0; b < VX_CFG_NUM_TCU_BLOCKS; ++b) {
+      if (umma_rd_won_.at(b)) umma_rd_won_r_.at(b) = true;
+      if (tmem_.grants().compute_wr.test(b)) umma_wr_won_r_.at(b) = true;
+    }
+  }
+#endif
+
   void tick() {
   #ifdef TCU_META_ENABLE
     this->agu_step();
+  #endif
+  #ifdef VX_CFG_TCU_TMEM_ENABLE
+    this->tmem_arb_step();
   #endif
   #ifdef VX_CFG_TCU_WGMMA_ENABLE
     // Q-warp lock-step probe.
@@ -666,6 +758,20 @@ public:
       }
     #endif
 
+    #ifdef VX_CFG_TCU_TMEM_ENABLE
+      // TMEM read-port admission. A UMMA uop and a TMEM_LD both close their
+      // handshake through a registered bank read, so neither can be admitted
+      // until the grant arrives on the cycle after the request.
+      if (!exec_done_.at(b)) {
+        if (tcu_type == TcuType::UMMA && !umma_rd_won_.at(b)) {
+          continue;
+        }
+        if (tcu_type == TcuType::TMEM_LD && !tmem_.grants().ldst_rd.test(b)) {
+          continue;
+        }
+      }
+    #endif
+
       // Execute once per trace; results persist across backpressure retries
       // via exec_done_[b].
       if (!exec_done_.at(b)) {
@@ -775,6 +881,14 @@ public:
           std::abort();
         }
         exec_done_.at(b) = true;
+      #ifdef VX_CFG_TCU_TMEM_ENABLE
+        // execute_fire: the uop is admitted, so release the read-grant latch
+        // and let the next uop bid.
+        if (tcu_type == TcuType::UMMA) {
+          umma_rd_won_r_.at(b) = false;
+          umma_rd_won_.at(b) = false;
+        }
+      #endif
       }
 
       uint32_t delay = 0;
@@ -819,8 +933,28 @@ public:
         }
       }
     #endif
+    #ifdef VX_CFG_TCU_TMEM_ENABLE
+      // TMEM write-port retirement
+      if (tcu_type == TcuType::UMMA
+       && !(tmem_.grants().compute_wr.test(b) || umma_wr_won_r_.at(b))) {
+        continue;
+      }
+      if (tcu_type == TcuType::TMEM_ST
+       && !(tmem_.grants().ldst_wr.test(b) || tmem_.won_ldst_wr(b))) {
+        continue;
+      }
+    #endif
       if (simobject_->Outputs.at(b).try_send(trace, delay)) {
         exec_done_.at(b) = false;
+      #ifdef VX_CFG_TCU_TMEM_ENABLE
+        // The result was taken: fedp_result_fire for UMMA, mgmt_ready for
+        // TMEM_ST. Both release their write-grant latch.
+        if (tcu_type == TcuType::UMMA) {
+          umma_wr_won_r_.at(b) = false;
+        } else if (tcu_type == TcuType::TMEM_ST) {
+          tmem_.clear_ldst_wr_win(b);
+        }
+      #endif
       #ifdef VX_CFG_TCU_WGMMA_ENABLE
         // Clear this warp's plan bit on its last uop so the next WGMMA/UMMA
         // re-decodes descriptors. Block stays in_wgmma_ until all warps drain.
@@ -1607,6 +1741,11 @@ private:
 
 #ifdef VX_CFG_TCU_TMEM_ENABLE
   TcuTmem tmem_;
+  TcuTmem::CycleReqs tmem_reqs_;
+
+  std::array<bool, VX_CFG_NUM_TCU_BLOCKS> umma_rd_won_{};
+  std::array<bool, VX_CFG_NUM_TCU_BLOCKS> umma_rd_won_r_{};
+  std::array<bool, VX_CFG_NUM_TCU_BLOCKS> umma_wr_won_r_{};
 
   // Per-wid cached TMEM handle, latched on UMMA's first uop
   std::unordered_map<uint32_t, uint32_t> umma_handle_;

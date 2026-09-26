@@ -183,26 +183,28 @@ BitVector<> build_req_vec(uint32_t bank,
 
 } // namespace
 
-void TcuTmem::arb_step(const CycleReqs& reqs) {
-  // publish last cycle's registered read grants
-  grants_ = Grants{};
-  std::bitset<kBanks> ldst_rd_won;
+void TcuTmem::arb_publish(const CycleReqs& reqs) {
+  // Routed through this cycle's bank decode. A read grant is not qualified by
+  // rd_valid, so a requester that posted nothing can observe a stale grant and
+  // must check its own validity. The write grant is valid-qualified.
+  grants_.compute_rd.reset();
+  grants_.ldst_rd.reset();
   for (uint32_t bi = 0; bi < kBanks; ++bi) {
-    uint32_t cmp_bank = bank_of(reqs.compute_rd.at(bi).lane_base);
-    if (rd_grant_onehot_d_.at(cmp_bank).test(bi)) {
+    if (rd_grant_onehot_d_.at(bank_of(reqs.compute_rd.at(bi).lane_base)).test(bi)) {
       grants_.compute_rd.set(bi);
     }
-    uint32_t ldst_bank = bank_of(reqs.ldst_rd.at(bi).lane_base);
-    if (rd_grant_onehot_d_.at(ldst_bank).test(kBanks + bi)) {
-      ldst_rd_won.set(bi);
+    if (rd_grant_onehot_d_.at(bank_of(reqs.ldst_rd.at(bi).lane_base)).test(kBanks + bi)) {
       grants_.ldst_rd.set(bi);
     }
   }
+}
 
-  // read arbitration
+void TcuTmem::arb_arbitrate(const CycleReqs& reqs) {
+  // A TMEM_LD that already has its registered grant has its data, so it drops
+  // its request.
   std::array<std::bitset<kArbW>, kBanks> rd_grant_onehot{};
   for (uint32_t r = 0; r < kBanks; ++r) {
-    auto req_vec = build_req_vec(r, reqs.compute_rd, reqs.ldst_rd, ldst_rd_won);
+    auto req_vec = build_req_vec(r, reqs.compute_rd, reqs.ldst_rd, grants_.ldst_rd);
     if (req_vec.count() > 1) {
       ++perf_stats_.bank_stalls;
     }
@@ -212,7 +214,8 @@ void TcuTmem::arb_step(const CycleReqs& reqs) {
     }
   }
 
-  // write arbitration
+  grants_.compute_wr.reset();
+  grants_.ldst_wr.reset();
   for (uint32_t r = 0; r < kBanks; ++r) {
     auto req_vec = build_req_vec(r, reqs.compute_wr, reqs.ldst_wr, ldst_wr_won_);
     if (req_vec.count() > 1) {
@@ -223,20 +226,14 @@ void TcuTmem::arb_step(const CycleReqs& reqs) {
       continue;
     // Writes are consumed the cycle they are granted, so route immediately.
     if (winner < kBanks) {
-      uint32_t bi = winner;
-      if (reqs.compute_wr.at(bi).valid) {
-        grants_.compute_wr.set(bi);
-      }
+      grants_.compute_wr.set(winner);
     } else {
       uint32_t bi = winner - kBanks;
-      if (reqs.ldst_wr.at(bi).valid) {
-        grants_.ldst_wr.set(bi);
-        ldst_wr_won_.set(bi);
-      }
+      grants_.ldst_wr.set(bi);
+      ldst_wr_won_.set(bi);
     }
   }
 
-  // register the read grant for next cycle
   rd_grant_onehot_d_ = rd_grant_onehot;
 }
 

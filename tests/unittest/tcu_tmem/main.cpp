@@ -16,8 +16,8 @@
 //
 // Bank conflicts are structurally unreachable through the normal compute path,
 // because a block's bank index is its warp's cta_rank, so the four blocks of a
-// warpgroup always target four different banks.These tests drive
-// TcuTmem::arb_step() directly so the contended cases actually execute.
+// warpgroup always target four different banks. These tests drive
+// the arbiter directly so the contended cases actually execute.
 
 #include <cstdint>
 #include <cstdio>
@@ -59,6 +59,11 @@ TcuTmem::BankReq foreign_bank_req(uint32_t bank, uint32_t col_base = 0) {
   return TcuTmem::BankReq{true, bank * kBankLanes, col_base};
 }
 
+void step(TcuTmem& tmem, const TcuTmem::CycleReqs& reqs) {
+  tmem.arb_publish(reqs);
+  tmem.arb_arbitrate(reqs);
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 
 void test_geometry() {
@@ -91,12 +96,12 @@ void test_no_conflict_across_banks() {
     reqs.compute_rd.at(b) = own_bank_req(b);
   }
 
-  tmem.arb_step(reqs);
+  step(tmem, reqs);
   CHECK(tmem.perf_stats().bank_stalls == 0);
   // Read grants are registered, so nothing is visible on the granting step.
   CHECK(tmem.grants().compute_rd.none());
 
-  tmem.arb_step(reqs);
+  step(tmem, reqs);
   CHECK(tmem.perf_stats().bank_stalls == 0);
   for (uint32_t b = 0; b < kBanks; ++b) {
     CHECK(tmem.grants().compute_rd.test(b));
@@ -113,11 +118,11 @@ void test_read_grant_is_registered_write_is_not() {
   reqs.compute_rd.at(0) = own_bank_req(0);
   reqs.compute_wr.at(0) = own_bank_req(0);
 
-  tmem.arb_step(reqs);
+  step(tmem, reqs);
   CHECK(!tmem.grants().compute_rd.test(0));  // one cycle late
   CHECK(tmem.grants().compute_wr.test(0));   // same cycle
 
-  tmem.arb_step(reqs);
+  step(tmem, reqs);
   CHECK(tmem.grants().compute_rd.test(0));
 }
 
@@ -132,12 +137,12 @@ void test_read_conflict_and_rotation() {
   reqs.ldst_rd.at(0) = foreign_bank_req(0);      // pool index kBanks
 
   // Cycle 0: both bid. One stall, lower index wins.
-  tmem.arb_step(reqs);
+  step(tmem, reqs);
   CHECK(tmem.perf_stats().bank_stalls == 1);
 
   // Cycle 1: compute's win surfaces; ldst still pending, so it bids again and
   // round-robin hands it the bank.
-  tmem.arb_step(reqs);
+  step(tmem, reqs);
   CHECK(tmem.grants().compute_rd.test(0));
   CHECK(!tmem.grants().ldst_rd.test(0));
   CHECK(tmem.perf_stats().bank_stalls == 2);
@@ -145,7 +150,7 @@ void test_read_conflict_and_rotation() {
   // Cycle 2: ldst's win surfaces. Its request is now suppressed by that
   // registered grant (ldst_rd_won in g_rd_arb), so only compute bids and
   // no conflict is counted.
-  tmem.arb_step(reqs);
+  step(tmem, reqs);
   CHECK(tmem.grants().ldst_rd.test(0));
   CHECK(tmem.perf_stats().bank_stalls == 2);
 }
@@ -158,7 +163,7 @@ void test_conflict_ignores_address_equality() {
   reqs.compute_rd.at(0) = own_bank_req(0, 0);
   reqs.ldst_rd.at(0) = foreign_bank_req(0, 0);  // same bank AND same word
 
-  tmem.arb_step(reqs);
+  step(tmem, reqs);
   CHECK(tmem.perf_stats().bank_stalls == 1);
 }
 
@@ -171,7 +176,7 @@ void test_read_and_write_pools_are_independent() {
   TcuTmem::CycleReqs reqs;
   reqs.compute_rd.at(0) = own_bank_req(0);
   reqs.compute_wr.at(0) = own_bank_req(0);
-  tmem.arb_step(reqs);
+  step(tmem, reqs);
   CHECK(tmem.perf_stats().bank_stalls == 0);  // one read + one write, no contention
 
   TcuTmem tmem2;
@@ -180,7 +185,7 @@ void test_read_and_write_pools_are_independent() {
   both.ldst_rd.at(0) = foreign_bank_req(0);
   both.compute_wr.at(0) = own_bank_req(0);
   both.ldst_wr.at(0) = foreign_bank_req(0);
-  tmem2.arb_step(both);
+  step(tmem2, both);
   CHECK(tmem2.perf_stats().bank_stalls == 2);  // one read conflict + one write
 }
 
@@ -192,7 +197,7 @@ void test_tmem_st_sticky_win() {
   TcuTmem::CycleReqs st_only;
   st_only.ldst_wr.at(0) = foreign_bank_req(0);
 
-  tmem.arb_step(st_only);
+  step(tmem, st_only);
   CHECK(tmem.grants().ldst_wr.test(0));
   CHECK(tmem.won_ldst_wr(0));
   CHECK(tmem.perf_stats().bank_stalls == 0);
@@ -202,7 +207,7 @@ void test_tmem_st_sticky_win() {
   TcuTmem::CycleReqs contended = st_only;
   contended.compute_wr.at(0) = own_bank_req(0);
 
-  tmem.arb_step(contended);
+  step(tmem, contended);
   CHECK(tmem.perf_stats().bank_stalls == 0);   // suppressed, so no conflict
   CHECK(!tmem.grants().ldst_wr.test(0));       // not regranted
   CHECK(tmem.grants().compute_wr.test(0));     // compute takes the bank
@@ -211,7 +216,7 @@ void test_tmem_st_sticky_win() {
   // Retiring the op clears the latch and the store competes again.
   tmem.clear_ldst_wr_win(0);
   CHECK(!tmem.won_ldst_wr(0));
-  tmem.arb_step(contended);
+  step(tmem, contended);
   CHECK(tmem.perf_stats().bank_stalls == 1);
 }
 
@@ -220,7 +225,7 @@ void test_tmem_st_sticky_win() {
 void test_write_grant_requires_valid() {
   TcuTmem tmem;
   TcuTmem::CycleReqs reqs;  // nothing valid
-  tmem.arb_step(reqs);
+  step(tmem, reqs);
   CHECK(tmem.grants().compute_wr.none());
   CHECK(tmem.grants().ldst_wr.none());
   CHECK(tmem.perf_stats().bank_stalls == 0);
@@ -233,16 +238,16 @@ void test_reset_restores_rotation() {
   reqs.compute_rd.at(0) = own_bank_req(0);
   reqs.ldst_rd.at(0) = foreign_bank_req(0);
 
-  tmem.arb_step(reqs);   // compute wins, rotation advances
-  tmem.arb_step(reqs);   // ldst wins
+  step(tmem, reqs);   // compute wins, rotation advances
+  step(tmem, reqs);   // ldst wins
   CHECK(tmem.perf_stats().bank_stalls == 2);
 
   tmem.reset();
   CHECK(tmem.perf_stats().bank_stalls == 0);
 
   // Post-reset the lowest pool index wins again.
-  tmem.arb_step(reqs);
-  tmem.arb_step(reqs);
+  step(tmem, reqs);
+  step(tmem, reqs);
   CHECK(tmem.grants().compute_rd.test(0));
   CHECK(!tmem.grants().ldst_rd.test(0));
 }
