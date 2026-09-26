@@ -288,6 +288,69 @@ void test_allocator() {
   tmem.dealloc(whole, 2, 0, 1);
 }
 
+// One ALLOC/DEALLOC is granted per cycle across all blocks, DEALLOC ahead of
+// ALLOC, both classes pre-masked by result_ready.
+void test_mgmt_arbitration() {
+  std::bitset<kBanks> none;
+
+  CHECK(TcuTmem::mgmt_grant(none, none) == TcuTmem::kNoGrant);
+
+  // Lowest requesting block wins within a class.
+  std::bitset<kBanks> allocs;
+  for (uint32_t b = 0; b < kBanks; ++b) allocs.set(b);
+  CHECK(TcuTmem::mgmt_grant(allocs, none) == 0);
+
+  std::bitset<kBanks> alloc_hi;
+  alloc_hi.set(kBanks - 1);
+  CHECK(TcuTmem::mgmt_grant(alloc_hi, none) == kBanks - 1);
+
+  // DEALLOC outranks ALLOC even when the ALLOC is on a lower block.
+  if (kBanks > 1) {
+    std::bitset<kBanks> alloc0, dealloc_hi;
+    alloc0.set(0);
+    dealloc_hi.set(kBanks - 1);
+    CHECK(TcuTmem::mgmt_grant(alloc0, dealloc_hi) == kBanks - 1);
+  }
+
+  // A block masked out by result_ready simply is not in the input, so the
+  // arbiter falls through to the next one that is.
+  if (kBanks > 1) {
+    std::bitset<kBanks> alloc_not_block0;
+    for (uint32_t b = 1; b < kBanks; ++b) alloc_not_block0.set(b);
+    CHECK(TcuTmem::mgmt_grant(alloc_not_block0, none) == 1);
+  }
+}
+
+// A fresh ALLOC that has no large-enough free range or no free CAM slot stalls
+// and retries.
+void test_alloc_backpressure() {
+  TcuTmem tmem;
+
+  // Fill the CAM.
+  uint32_t per_cta = TcuTmem::kCols / (TcuTmem::kAllocEntries + 1);
+  CHECK(per_cta > 0);
+  for (uint32_t i = 0; i < TcuTmem::kAllocEntries; ++i) {
+    CHECK(!tmem.alloc_would_stall(per_cta, (int32_t)i));
+    tmem.alloc(per_cta, (int32_t)i);
+  }
+
+  // One more CTA has nowhere to go, even though columns remain free.
+  CHECK(tmem.alloc_would_stall(per_cta, (int32_t)TcuTmem::kAllocEntries));
+  // A repeat request from a CTA already holding an allocation still succeeds,
+  // doesn't need new CAM slot.
+  CHECK(!tmem.alloc_would_stall(per_cta, 0));
+  CHECK(tmem.alloc(per_cta, 0) == tmem.alloc(per_cta, 0));
+
+  // Freeing one slot reopens the door.
+  tmem.dealloc(tmem.alloc(per_cta, 0), 0, 0, 1);
+  CHECK(!tmem.alloc_would_stall(per_cta, (int32_t)TcuTmem::kAllocEntries));
+
+  // A fresh CTA with a free slot but no range wide enough also stalls.
+  TcuTmem tight;
+  tight.alloc(TcuTmem::kCols, 0);
+  CHECK(tight.alloc_would_stall(1, 1));
+}
+
 void test_storage_roundtrip() {
   TcuTmem tmem;
   uint32_t h = tmem.alloc(kWordCols * 2, 0);
@@ -322,6 +385,8 @@ int main() {
   test_write_grant_requires_valid();
   test_reset_restores_rotation();
   test_allocator();
+  test_mgmt_arbitration();
+  test_alloc_backpressure();
   test_storage_roundtrip();
 
   std::cout << g_checks << " checks PASSED!" << std::endl;

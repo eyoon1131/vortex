@@ -79,6 +79,11 @@ uint32_t TcuTmem::alloc(uint32_t ncols, int32_t cta_id) {
     return handle;
   }
 
+  if (allocs_.size() >= kAllocEntries) {
+    std::cout << "Error: TMEM_ALLOC exhausted the allocator CAM (" << kAllocEntries
+              << " entries) — caller must gate on alloc_would_stall()" << std::endl;
+    std::abort();
+  }
   for (auto it = free_.begin(); it != free_.end(); ++it) {
     if (it->second < ncols) continue;
     uint32_t handle = it->first;
@@ -126,6 +131,43 @@ void TcuTmem::dealloc(uint32_t handle, int32_t cta_id, uint32_t wid, uint32_t ct
       ++i;
     }
   }
+  if (free_.size() > kAllocEntries) {
+    std::cout << "Error: TMEM free list exceeded " << kAllocEntries
+              << " entries (allocator undersized)" << std::endl;
+    std::abort();
+  }
+}
+
+bool TcuTmem::alloc_would_stall(uint32_t ncols, int32_t cta_id) const {
+  // A request wider than the whole array can never be satisfied, so it is an
+  // error.
+  if (ncols > kCols) {
+    std::cout << "Error: TMEM_ALLOC request (ncols=" << ncols
+              << ") exceeds kCols=" << kCols << " — unsatisfiable" << std::endl;
+    std::abort();
+  }
+  if (cta_handle_.count(cta_id))
+    return false;  // repeat request from a sibling warp, already satisfied
+  if (allocs_.size() >= kAllocEntries)
+    return true;   // no free CAM slot
+  for (auto& range : free_) {
+    if (range.second >= ncols)
+      return false;
+  }
+  return true;     // no free range large enough
+}
+
+uint32_t TcuTmem::mgmt_grant(const std::bitset<kBanks>& alloc_ready,
+                             const std::bitset<kBanks>& dealloc_ready) {
+  for (uint32_t b = 0; b < kBanks; ++b) {
+    if (dealloc_ready.test(b))
+      return b;
+  }
+  for (uint32_t b = 0; b < kBanks; ++b) {
+    if (alloc_ready.test(b))
+      return b;
+  }
+  return kNoGrant;
 }
 
 uint32_t TcuTmem::alloc_ncols(uint32_t handle) const {

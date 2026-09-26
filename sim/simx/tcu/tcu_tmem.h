@@ -39,6 +39,13 @@ public:
   // One physical bank per TCU block
   static constexpr uint32_t kBanks = VX_CFG_NUM_TCU_BLOCKS;
 
+  // Live-allocation CAM and its free list are both NUM_ENTRIES deep.
+  static constexpr uint32_t kWarpgroupSize = kBanks;  // == WARPGROUP_SIZE
+  static constexpr uint32_t kMaxConcurrentCtas = VX_CFG_NUM_WARPS / kWarpgroupSize;
+  static constexpr uint32_t kAllocEntries = kMaxConcurrentCtas + 1;
+
+  static constexpr uint32_t kNoGrant = uint32_t(-1);
+
   struct PerfStats {
     uint64_t bank_stalls = 0;    // cycles a requester lost its bank to a conflict
     uint64_t hazard_stalls = 0;  // cycles a read was held by the RAW interlock
@@ -60,6 +67,17 @@ public:
   // Mirrors alloc(): the range is only actually freed once every warp of the
   // CTA has called dealloc.
   void dealloc(uint32_t handle, int32_t cta_id, uint32_t wid, uint32_t cta_size);
+
+  // Whether a fresh ALLOC would have to stall this cycle. A repeat request from
+  // a CTA that already holds an allocation always succeeds, while a fresh one
+  // needs both a large-enough free range and a free CAM slot.
+  bool alloc_would_stall(uint32_t ncols, int32_t cta_id) const;
+
+  // One ALLOC/DEALLOC is granted per cycle across every block, DEALLOC ahead of
+  // ALLOC. Fixed priority, lowest block index first. Returns the granted block,
+  // or kNoGrant.
+  static uint32_t mgmt_grant(const std::bitset<kBanks>& alloc_ready,
+                             const std::bitset<kBanks>& dealloc_ready);
 
   // Live-allocation width in columns, or 0 if `handle` is not live.
   uint32_t alloc_ncols(uint32_t handle) const;

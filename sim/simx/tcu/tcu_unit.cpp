@@ -396,6 +396,8 @@ public:
     umma_rd_won_.fill(false);
     umma_rd_won_r_.fill(false);
     umma_wr_won_r_.fill(false);
+    tmem_mgmt_grant_ = TcuTmem::kNoGrant;
+    tmem_mgmt_fire_ = false;
     umma_handle_.clear();
   #endif
   }
@@ -611,6 +613,33 @@ public:
     tmem_.arb_arbitrate(tmem_reqs_);
     perf_stats_.tmem_bank_stalls = tmem_.perf_stats().bank_stalls;
 
+    // ALLOC/DEALLOC: one grant per cycle across all blocks, DEALLOC first.
+    // try_send() fails exactly when the output channel is full.
+    std::bitset<TcuTmem::kBanks> alloc_ready;
+    std::bitset<TcuTmem::kBanks> dealloc_ready;
+    for (uint32_t b = 0; b < VX_CFG_NUM_TCU_BLOCKS; ++b) {
+      auto& input = simobject_->Inputs.at(b);
+      if (input.empty() || exec_done_.at(b) || simobject_->Outputs.at(b).full())
+        continue;
+      switch (std::get<TcuType>(input.peek()->op_type)) {
+      case TcuType::TMEM_ALLOC:   alloc_ready.set(b); break;
+      case TcuType::TMEM_DEALLOC: dealloc_ready.set(b); break;
+      default: break;
+      }
+    }
+    tmem_mgmt_grant_ = TcuTmem::mgmt_grant(alloc_ready, dealloc_ready);
+    tmem_mgmt_fire_ = (tmem_mgmt_grant_ != TcuTmem::kNoGrant);
+
+    // alloc_resp_valid: a granted fresh ALLOC that cannot be satisfied this
+    // cycle withholds its fire.
+    if (tmem_mgmt_fire_ && alloc_ready.test(tmem_mgmt_grant_)) {
+      auto trace = simobject_->Inputs.at(tmem_mgmt_grant_).peek();
+      uint32_t ncols = trace->src_data[0].empty() ? 0 : trace->src_data[0].at(0).u32;
+      if (tmem_.alloc_would_stall(ncols, this->cta_uid(trace->wid))) {
+        tmem_mgmt_fire_ = false;
+      }
+    }
+
     // The compute-read win must survive to the admission cycle, which is the
     // next one. Latch it now that arbitration has consumed this cycle's
     // requests; it is cleared when the uop is admitted.
@@ -767,6 +796,12 @@ public:
           continue;
         }
         if (tcu_type == TcuType::TMEM_LD && !tmem_.grants().ldst_rd.test(b)) {
+          continue;
+        }
+        // Only the block that won this cycle's single ALLOC/DEALLOC grant may
+        // touch the allocator.
+        if ((tcu_type == TcuType::TMEM_ALLOC || tcu_type == TcuType::TMEM_DEALLOC)
+         && !(tmem_mgmt_fire_ && b == tmem_mgmt_grant_)) {
           continue;
         }
       }
@@ -1746,6 +1781,11 @@ private:
   std::array<bool, VX_CFG_NUM_TCU_BLOCKS> umma_rd_won_{};
   std::array<bool, VX_CFG_NUM_TCU_BLOCKS> umma_rd_won_r_{};
   std::array<bool, VX_CFG_NUM_TCU_BLOCKS> umma_wr_won_r_{};
+
+  // This cycle's single ALLOC/DEALLOC winner, and whether the allocator can
+  // actually service it.
+  uint32_t tmem_mgmt_grant_ = TcuTmem::kNoGrant;
+  bool tmem_mgmt_fire_ = false;
 
   // Per-wid cached TMEM handle, latched on UMMA's first uop
   std::unordered_map<uint32_t, uint32_t> umma_handle_;
