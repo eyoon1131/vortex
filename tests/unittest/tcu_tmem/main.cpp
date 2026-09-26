@@ -351,6 +351,89 @@ void test_alloc_backpressure() {
   CHECK(tight.alloc_would_stall(1, 1));
 }
 
+///////////////////////////////////////////////////////////////////////////////
+// RAW interlock
+
+void test_interlock_basics() {
+  TcuTmemWrTrack track;
+
+  // Nothing in flight, nothing blocked.
+  CHECK(!track.hazard(0, 0));
+  CHECK(track.size() == 0);
+
+  // A UMMA uop in flight blocks a later uop addressing the same tile origin.
+  track.push(/*is_umma*/ true, /*lane_base*/ 8, /*col_base*/ 4, /*retire*/ 10);
+  CHECK(track.size() == 1);
+  CHECK(track.hazard(8, 4));
+  CHECK(!track.hazard(8, 5));
+  CHECK(!track.hazard(0, 4));
+  CHECK(!track.hazard(9, 4));
+
+  // The entry is released once its retirement cycle arrives.
+  track.retire(9);
+  CHECK(track.hazard(8, 4));
+  track.retire(10);
+  CHECK(!track.hazard(8, 4));
+  CHECK(track.size() == 0);
+}
+
+// Entries are taken by every non-setup FEDP uop, but only those that owe TMEM
+// a write can collide.
+void test_interlock_ignores_non_umma() {
+  TcuTmemWrTrack track;
+  track.push(/*is_umma*/ false, 8, 4, 10);
+  CHECK(track.size() == 1);   // occupies depth
+  CHECK(!track.hazard(8, 4)); // but cannot cause a hazard
+}
+
+// Release is in order. an entry behind an unretired one cannot leave early.
+void test_interlock_retires_in_order() {
+  TcuTmemWrTrack track;
+  track.push(true, 0, 0, /*retire*/ 20);  // retires late
+  track.push(true, 8, 0, /*retire*/ 10);  // would retire sooner
+
+  track.retire(15);
+  CHECK(track.size() == 2);     // head is not ready, so neither leaves
+  CHECK(track.hazard(0, 0));
+  CHECK(track.hazard(8, 0));
+
+  track.retire(20);
+  CHECK(track.size() == 0);     // head clears, and the one behind follows
+  CHECK(!track.hazard(0, 0));
+  CHECK(!track.hazard(8, 0));
+}
+
+// The tracker is a circular buffer LANDQ_SIZE deep. Filling and draining it
+// repeatedly must not leave a stale entry behind.
+void test_interlock_wraps() {
+  TcuTmemWrTrack track;
+  CHECK(TcuTmemWrTrack::kDepth >= TcuTmemWrTrack::kPipeLatency);
+
+  for (uint32_t round = 0; round < 3; ++round) {
+    for (uint32_t i = 0; i < TcuTmemWrTrack::kDepth; ++i) {
+      track.push(true, i * kBankLanes, /*col_base*/ 0, /*retire*/ 100 + round);
+    }
+    CHECK(track.size() == TcuTmemWrTrack::kDepth);
+    for (uint32_t i = 0; i < TcuTmemWrTrack::kDepth; ++i) {
+      CHECK(track.hazard(i * kBankLanes, 0));
+    }
+    track.retire(100 + round);
+    CHECK(track.size() == 0);
+    for (uint32_t i = 0; i < TcuTmemWrTrack::kDepth; ++i) {
+      CHECK(!track.hazard(i * kBankLanes, 0));
+    }
+  }
+}
+
+void test_interlock_reset() {
+  TcuTmemWrTrack track;
+  track.push(true, 8, 4, 10);
+  CHECK(track.hazard(8, 4));
+  track.reset();
+  CHECK(track.size() == 0);
+  CHECK(!track.hazard(8, 4));
+}
+
 void test_storage_roundtrip() {
   TcuTmem tmem;
   uint32_t h = tmem.alloc(kWordCols * 2, 0);
@@ -373,7 +456,8 @@ int main() {
             << ", kWordCols=" << kWordCols
             << ", kLanes=" << TcuTmem::kLanes
             << ", kCols=" << TcuTmem::kCols
-            << ", kArbW=" << TcuTmem::kArbW << std::endl;
+            << ", kArbW=" << TcuTmem::kArbW
+            << ", wr_track depth=" << TcuTmemWrTrack::kDepth << std::endl;
 
   test_geometry();
   test_no_conflict_across_banks();
@@ -387,6 +471,11 @@ int main() {
   test_allocator();
   test_mgmt_arbitration();
   test_alloc_backpressure();
+  test_interlock_basics();
+  test_interlock_ignores_non_umma();
+  test_interlock_retires_in_order();
+  test_interlock_wraps();
+  test_interlock_reset();
   test_storage_roundtrip();
 
   std::cout << g_checks << " checks PASSED!" << std::endl;

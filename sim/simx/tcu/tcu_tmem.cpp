@@ -279,4 +279,42 @@ void TcuTmem::arb_arbitrate(const CycleReqs& reqs) {
   rd_grant_onehot_d_ = rd_grant_onehot;
 }
 
+///////////////////////////////////////////////////////////////////////////////
+
+void TcuTmemWrTrack::reset() {
+  entries_.fill(Entry{});
+  head_ = 0;
+  tail_ = 0;
+  size_ = 0;
+}
+
+bool TcuTmemWrTrack::hazard(uint32_t lane_base, uint32_t col_base) const {
+  for (auto& e : entries_) {
+    if (e.valid && e.is_umma && e.lane_base == lane_base && e.col_base == col_base) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void TcuTmemWrTrack::push(bool is_umma, uint32_t lane_base, uint32_t col_base,
+                          uint64_t retire_cycle) {
+  if (size_ >= kDepth) {
+    std::cout << "Error: TMEM write tracker overflow (depth " << kDepth << ")" << std::endl;
+    std::abort();
+  }
+  entries_.at(tail_) = Entry{true, is_umma, lane_base, col_base, retire_cycle};
+  tail_ = (tail_ + 1) % kDepth;
+  ++size_;
+}
+
+void TcuTmemWrTrack::retire(uint64_t cycle) {
+  // In-order. An entry behind an unretired one cannot be released early.
+  while (size_ != 0 && entries_.at(head_).retire_cycle <= cycle) {
+    entries_.at(head_).valid = false;
+    head_ = (head_ + 1) % kDepth;
+    --size_;
+  }
+}
+
 #endif // VX_CFG_TCU_TMEM_ENABLE

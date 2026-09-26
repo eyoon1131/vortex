@@ -147,11 +147,6 @@ public:
   // Drop the latch.
   void clear_ldst_wr_win(uint32_t block) { ldst_wr_won_.reset(block); }
 
-  // TODO: ALLOC/DEALLOC serialization against the column allocator
-  //       (VX_tcu_tmem_alloc: one winner per cycle).
-  // TODO: the wr_track RAW interlock, LANDQ_SIZE deep, keyed on
-  //       (lane_base, col_base).
-
 private:
   void validate_lane_col(uint32_t lane, uint32_t col) const;
 
@@ -178,6 +173,64 @@ private:
   Grants grants_{};
 
   PerfStats perf_stats_;
+};
+
+// $clog2 semantics: rounds up
+constexpr uint32_t tmem_clog2(uint32_t x) {
+  uint32_t r = 0;
+  while ((1u << r) < x) ++r;
+  return r;
+}
+
+// In-flight TMEM write tracker
+//
+// One per TCU block, owned by TcuUnit. It lives in this header only because it
+// shares TMEM's addressing.
+//
+// A UMMA uop must not read an accumulator tile that an earlier
+// in-flight uop still owes a write to, or it would accumulate onto a stale
+// value. The uop loop order (k outer, n middle, m inner) means consecutive
+// uops of one warp address different tiles, so this should never fire.
+class TcuTmemWrTrack {
+public:
+  // LANDQ_SIZE = MDATA_QUEUE_DEPTH = 1 << $clog2(PIPE_LATENCY), where
+  // PIPE_LATENCY = FEDP_LATENCY + 1. The credit bound caps
+  // admitted-but-unretired uops at the same number, so it cannot overflow.
+  static constexpr uint32_t kPipeLatency = 1 + VX_CFG_TCU_LATENCY;
+  static constexpr uint32_t kDepth = 1u << tmem_clog2(kPipeLatency);
+
+  void reset();
+
+  // Whether a UMMA uop addressing this tile must stall. Only entries that owe
+  // TMEM a write can collide, and the comparison is on the whole tile origin.
+  bool hazard(uint32_t lane_base, uint32_t col_base) const;
+
+  // Admission. Every non-setup uop takes an entry; `is_umma` records whether it
+  // owes TMEM a write, since only those can cause a hazard.
+  //
+  // SimX has no landing queue and executes the whole uop at admission, so the
+  // entry is released by cycle. `retire_cycle` is admission + the uop's
+  // latency, which ignores output back-pressure.
+  void push(bool is_umma, uint32_t lane_base, uint32_t col_base, uint64_t retire_cycle);
+
+  // Release every entry whose retirement cycle has arrived.
+  void retire(uint64_t cycle);
+
+  uint32_t size() const { return size_; }
+
+private:
+  struct Entry {
+    bool valid = false;
+    bool is_umma = false;
+    uint32_t lane_base = 0;
+    uint32_t col_base = 0;
+    uint64_t retire_cycle = 0;
+  };
+
+  std::array<Entry, kDepth> entries_{};
+  uint32_t head_ = 0;
+  uint32_t tail_ = 0;
+  uint32_t size_ = 0;
 };
 
 } // namespace vortex

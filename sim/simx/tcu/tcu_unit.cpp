@@ -393,6 +393,10 @@ public:
   #ifdef VX_CFG_TCU_TMEM_ENABLE
     tmem_.reset();
     tmem_reqs_ = TcuTmem::CycleReqs{};
+    for (auto& track : wr_track_) {
+      track.reset();
+    }
+    umma_hazard_.fill(false);
     umma_rd_won_.fill(false);
     umma_rd_won_r_.fill(false);
     umma_wr_won_r_.fill(false);
@@ -543,6 +547,11 @@ public:
   void tmem_arb_step() {
     tmem_reqs_ = TcuTmem::CycleReqs{};
 
+    uint64_t cur_cycle = SimPlatform::instance().cycles();
+    for (auto& track : wr_track_) {
+      track.retire(cur_cycle);
+    }
+
     // Phase 1 — decode addresses. Validity is decided in phase 3, once the
     // published grants are known, so a request's address is filled in here
     // even for a requester that will not bid.
@@ -594,15 +603,26 @@ public:
       auto tcu_type = std::get<TcuType>(input.peek()->op_type);
 
       if (tcu_type == TcuType::UMMA) {
+        // The RAW interlock suppresses the read request as well as admission.
+        umma_hazard_.at(b) = wr_track_.at(b).hazard(
+            tmem_reqs_.compute_rd.at(b).lane_base,
+            tmem_reqs_.compute_rd.at(b).col_base);
         umma_rd_won_.at(b) = tmem_.grants().compute_rd.test(b) || umma_rd_won_r_.at(b);
-        tmem_reqs_.compute_rd.at(b).valid = !umma_rd_won_.at(b);
-        if (!umma_rd_won_.at(b) && !exec_done_.at(b)) {
-          ++perf_stats_.tmem_rd_grant_stalls;
+        tmem_reqs_.compute_rd.at(b).valid = !umma_hazard_.at(b) && !umma_rd_won_.at(b);
+        // The hazard case is excluded from the grant counter so the two do not
+        // double-count.
+        if (!exec_done_.at(b)) {
+          if (umma_hazard_.at(b)) {
+            ++perf_stats_.tmem_hazard_stalls;
+          } else if (!umma_rd_won_.at(b)) {
+            ++perf_stats_.tmem_rd_grant_stalls;
+          }
         }
         // The writeback bids once the read is in hand.
         tmem_reqs_.compute_wr.at(b).valid =
             (umma_rd_won_.at(b) || exec_done_.at(b)) && !umma_wr_won_r_.at(b);
       } else {
+        umma_hazard_.at(b) = false;
         umma_rd_won_.at(b) = false;
         tmem_reqs_.ldst_rd.at(b).valid = (tcu_type == TcuType::TMEM_LD);
         tmem_reqs_.ldst_wr.at(b).valid =
@@ -792,7 +812,8 @@ public:
       // handshake through a registered bank read, so neither can be admitted
       // until the grant arrives on the cycle after the request.
       if (!exec_done_.at(b)) {
-        if (tcu_type == TcuType::UMMA && !umma_rd_won_.at(b)) {
+        if (tcu_type == TcuType::UMMA
+         && (umma_hazard_.at(b) || !umma_rd_won_.at(b))) {
           continue;
         }
         if (tcu_type == TcuType::TMEM_LD && !tmem_.grants().ldst_rd.test(b)) {
@@ -922,6 +943,18 @@ public:
         if (tcu_type == TcuType::UMMA) {
           umma_rd_won_r_.at(b) = false;
           umma_rd_won_.at(b) = false;
+        }
+        // fedp_enqueue: every non-setup FEDP uop takes a tracker entry, not
+        // just UMMA's. Non-UMMA entries can never match a hazard, but they do
+        // occupy depth.
+        bool is_fedp_uop = (tcu_type == TcuType::WMMA) || (tcu_type == TcuType::WMMA_SP)
+                        || (tcu_type == TcuType::WGMMA) || (tcu_type == TcuType::WGMMA_SP)
+                        || (tcu_type == TcuType::UMMA);
+        if (is_fedp_uop && !tpuArgs.is_setup_uop) {
+          wr_track_.at(b).push(tcu_type == TcuType::UMMA,
+                               tmem_reqs_.compute_rd.at(b).lane_base,
+                               tmem_reqs_.compute_rd.at(b).col_base,
+                               SimPlatform::instance().cycles() + kMmaLatency);
         }
       #endif
       }
@@ -1778,6 +1811,8 @@ private:
   TcuTmem tmem_;
   TcuTmem::CycleReqs tmem_reqs_;
 
+  std::array<TcuTmemWrTrack, VX_CFG_NUM_TCU_BLOCKS> wr_track_;
+  std::array<bool, VX_CFG_NUM_TCU_BLOCKS> umma_hazard_{};
   std::array<bool, VX_CFG_NUM_TCU_BLOCKS> umma_rd_won_{};
   std::array<bool, VX_CFG_NUM_TCU_BLOCKS> umma_rd_won_r_{};
   std::array<bool, VX_CFG_NUM_TCU_BLOCKS> umma_wr_won_r_{};
