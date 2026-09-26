@@ -14,6 +14,7 @@
 
 #include <VX_types.h>
 #include "tcu_unit.h"
+#include "tcu_tmem.h"
 #include "tensor_cfg.h"
 #include <rvfloats.h>
 #include "core.h"
@@ -390,11 +391,7 @@ public:
     agu_issue_rr_ = 0;
   #endif
   #ifdef VX_CFG_TCU_TMEM_ENABLE
-    for (auto& row : tmem_data_) row.fill(0);
-    tmem_free_.assign(1, {0, kTmemCols});
-    tmem_allocs_.clear();
-    cta_tmem_handle_.clear();
-    cta_tmem_dealloc_warps_.clear();
+    tmem_.reset();
     umma_handle_.clear();
   #endif
   }
@@ -1167,92 +1164,15 @@ public:
                     + csrs.block_idx[0]);
   }
 
-  // ── TMEM allocator ─────────────────────────────────────────────────────
-  // First-fit free-list column allocator. Multiple warpgroups (different
-  // CTAs) can hold disjoint, concurrently-live allocations.
-  //
-  // CTA-scoped idempotency: every warp of a CTA can call tmem_alloc()
-  // independently and get the same handle back, with no elected-thread +
-  // shared-memory broadcast needed in the kernel. The first call for a
-  // given cta_id allocates and later calls from other warps of the
-  // same CTA just return the cached handle.
+  // TMEM storage, its column allocator and its bank arbitration all live in
+  // TcuTmem; these forward and resolve the Core-side context.
   uint32_t tmem_alloc(uint32_t ncols, int32_t cta_id) {
-    auto cta_it = cta_tmem_handle_.find(cta_id);
-    if (cta_it != cta_tmem_handle_.end()) {
-      uint32_t handle = cta_it->second;
-      if (tmem_allocs_.at(handle) != ncols) {
-        std::cout << "Error: TMEM_ALLOC ncols mismatch for cta_id=" << cta_id
-                  << " (existing=" << tmem_allocs_.at(handle) << ", requested=" << ncols
-                  << ") — one CTA can only hold one live allocation in this PoC" << std::endl;
-        std::abort();
-      }
-      return handle;
-    }
-
-    for (auto it = tmem_free_.begin(); it != tmem_free_.end(); ++it) {
-      if (it->second < ncols) continue;
-      uint32_t handle = it->first;
-      if (it->second == ncols) {
-        tmem_free_.erase(it);
-      } else {
-        it->first  += ncols;
-        it->second -= ncols;
-      }
-      tmem_allocs_[handle] = ncols;
-      for (uint32_t c = handle; c < handle + ncols; ++c)
-        for (auto& row : tmem_data_)
-          row[c] = 0;
-      cta_tmem_handle_[cta_id] = handle;
-      return handle;
-    }
-    std::cout << "Error: TMEM allocation failed (ncols=" << ncols
-              << ", no free range large enough)" << std::endl;
-    std::abort();
+    return tmem_.alloc(ncols, cta_id);
   }
 
-  // Mirrors tmem_alloc(). The range is only actually freed once every warp
-  // of the CTA has called dealloc.
   void tmem_dealloc(uint32_t handle, int32_t cta_id, uint32_t wid) {
-    auto it = tmem_allocs_.find(handle);
-    if (it == tmem_allocs_.end()) {
-      std::cout << "Error: TMEM_DEALLOC unknown handle " << handle << std::endl;
-      std::abort();
-    }
-    auto& dealloc_warps = cta_tmem_dealloc_warps_[cta_id];
-    dealloc_warps.insert(wid);
-    uint32_t expected = core_->scheduler().warp(wid).cta_csrs.cta_size;
-    if (dealloc_warps.size() < expected) {
-      return; // other warps of this CTA still hold the allocation open
-    }
-
-    tmem_free_.push_back({handle, it->second});
-    tmem_allocs_.erase(it);
-    cta_tmem_handle_.erase(cta_id);
-    cta_tmem_dealloc_warps_.erase(cta_id);
-    // Coalesce adjacent free ranges to keep the allocator from fragmenting.
-    std::sort(tmem_free_.begin(), tmem_free_.end());
-    for (size_t i = 0; i + 1 < tmem_free_.size();) {
-      if (tmem_free_[i].first + tmem_free_[i].second == tmem_free_[i + 1].first) {
-        tmem_free_[i].second += tmem_free_[i + 1].second;
-        tmem_free_.erase(tmem_free_.begin() + i + 1);
-      } else {
-        ++i;
-      }
-    }
-  }
-
-  // Per-thread lane/col bound check for tmem_st/tmem_ld: lane must be within
-  // physical capacity, col must fall inside an active allocation
-  void validate_tmem_lane_col(uint32_t lane, uint32_t col) {
-    if (lane >= kTmemLanes) {
-      std::cout << "Error: TMEM lane " << lane << " exceeds kTmemLanes=" << kTmemLanes << std::endl;
-      std::abort();
-    }
-    for (auto& kv : tmem_allocs_) {
-      if (col >= kv.first && col < kv.first + kv.second) return;
-    }
-    std::cout << "Error: TMEM column " << col << " not within any active allocation" << std::endl;
-    std::abort();
+    uint32_t cta_size = core_->scheduler().warp(wid).cta_csrs.cta_size;
+    tmem_.dealloc(handle, cta_id, wid, cta_size);
   }
 
   void tmem_st(uint32_t tmem_addr, const std::vector<reg_data_t>& value_data,
@@ -1263,8 +1183,7 @@ public:
     for (uint32_t t = 0; t < value_data.size(); ++t) {
       if (!tmask.test(t))
         continue;
-      validate_tmem_lane_col(lane_base + t, col);
-      tmem_data_.at(lane_base + t).at(col) = value_data.at(t).u32;
+      tmem_.write(lane_base + t, col, value_data.at(t).u32);
       ++active;
     }
     perf_stats_.tmem_writes += active;
@@ -1278,16 +1197,15 @@ public:
     for (uint32_t t = 0; t < rd_data.size(); ++t) {
       if (!tmask.test(t))
         continue;
-      validate_tmem_lane_col(lane_base + t, col);
-      rd_data.at(t).u64 = nan_box(tmem_data_.at(lane_base + t).at(col));
+      rd_data.at(t).u64 = nan_box(tmem_.read(lane_base + t, col));
       ++active;
     }
     perf_stats_.tmem_reads += active;
   }
 
   // UMMA: A/B fetched via the shared tile buffer exactly like WGMMA's
-  // smem path; C/D read/written directly against tmem_data_ at
-  // [handle + local_col], derived from the handle cached on the first uop.
+  // smem path; C/D read/written through TcuTmem at [handle + local_col],
+  // derived from the handle cached on the first uop.
   void umma(uint32_t wid,
             uint32_t fmt_s,
             uint32_t fmt_d,
@@ -1338,20 +1256,20 @@ public:
     uint32_t cta_rank = core_->scheduler().warp(wid).cta_csrs.cta_rank;
 
     // Bounds check once per uop rather than per element.
-    auto alloc_it = tmem_allocs_.find(use_handle);
-    if (alloc_it == tmem_allocs_.end()) {
+    uint32_t alloc_ncols = tmem_.alloc_ncols(use_handle);
+    if (0 == alloc_ncols) {
       std::cout << "Error: UMMA invalid TMEM handle " << use_handle << std::endl;
       std::abort();
     }
     uint32_t max_lane = cta_rank * xtileM + step_m * cfg::tcM + cfg::tcM;
-    if (max_lane > kTmemLanes) {
-      std::cout << "Error: UMMA lane range exceeds kTmemLanes=" << kTmemLanes << std::endl;
+    if (max_lane > TcuTmem::kLanes) {
+      std::cout << "Error: UMMA lane range exceeds kLanes=" << TcuTmem::kLanes << std::endl;
       std::abort();
     }
     uint32_t max_col_local = step_n * cfg::tcN + cfg::tcN;
-    if (max_col_local > alloc_it->second) {
+    if (max_col_local > alloc_ncols) {
       std::cout << "Error: UMMA column range exceeds TMEM allocation (handle=" << use_handle
-                << ", ncols=" << alloc_it->second << ")" << std::endl;
+                << ", ncols=" << alloc_ncols << ")" << std::endl;
       std::abort();
     }
 
@@ -1383,9 +1301,9 @@ public:
         uint32_t col  = use_handle + step_n * cfg::tcN + j;
         auto a_row = &a_tile[i * k_words];
         auto b_col = &b_tile[(i * cfg::tcN + j) * k_words];
-        uint32_t c_val = tmem_data_.at(lane).at(col);
+        uint32_t c_val = tmem_.read(lane, col);
         uint32_t d_val = fedp(a_row, b_col, c_val, k_words);
-        tmem_data_.at(lane).at(col) = d_val;
+        tmem_.write(lane, col, d_val);
         DTH(3, simobject_->name() << " UMMA FEDP"
             << ": wid=" << wid << ", i=" << i << ", j=" << j
             << ", m=" << step_m << ", n=" << step_n << ", k=" << step_k << std::hex
@@ -1688,30 +1606,8 @@ private:
   int32_t cta_owner_b_ = -1;
 
 #ifdef VX_CFG_TCU_TMEM_ENABLE
-  // TMEM is architecturally per-SM on Blackwell GPUs, not per-tensor-core. 
-  // Living inside TcuUnit::Impl here is correct because Vortex currently
-  // instantiates exactly one TcuUnit per Core. If Vortex ever allows
-  // multiple TCU-equivalent units per core, this storage and the
-  // allocator need to move up to Core so it becomes correctly
-  // SM-scoped instead of per-TC (which would also break the
-  // CTA-scoped handle cache in tmem_alloc()/tmem_dealloc()).
-  static constexpr uint32_t kTmemCols  = VX_CFG_TCU_TMEM_COLS;
-  // Lanes are sized to one warpgroup's width (VX_CFG_NUM_TCU_BLOCKS) and
-  // shared/reused across concurrent warpgroups, addressed by each warp's
-  // CTA-local rank
-  static constexpr uint32_t kTmemLanes = wg_cfg::xtileM * VX_CFG_NUM_TCU_BLOCKS;
-  static_assert(kTmemLanes <= 128, "TMEM lanes exceed cap");
+  TcuTmem tmem_;
 
-  std::array<std::array<uint32_t, kTmemCols>, kTmemLanes> tmem_data_{};
-  // Free-list allocator state: {start_col, ncols} ranges, and handle->ncols
-  // for active allocations.
-  std::vector<std::pair<uint32_t, uint32_t>> tmem_free_{{0, kTmemCols}};
-  std::unordered_map<uint32_t, uint32_t> tmem_allocs_;
-  // CTA-scoped idempotent-alloc bookkeeping
-  std::unordered_map<int32_t, uint32_t> cta_tmem_handle_;
-  // Distinct wids that have called tmem_dealloc for this CTA — a set, not a
-  // counter, so a warp calling dealloc twice can't free the range early
-  std::unordered_map<int32_t, std::unordered_set<uint32_t>> cta_tmem_dealloc_warps_;
   // Per-wid cached TMEM handle, latched on UMMA's first uop
   std::unordered_map<uint32_t, uint32_t> umma_handle_;
 #endif

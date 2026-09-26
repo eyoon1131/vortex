@@ -53,6 +53,7 @@ ifneq ($(filter -DVX_CFG_EXT_TCU_ENABLE, $(XCONFIGS)),)
 	CXXFLAGS += -I$(SRC_DIR)/tcu
 	SRCS += $(SRC_DIR)/tcu/tcu_unit.cpp
 	SRCS += $(SRC_DIR)/tcu/tcu_tbuf.cpp
+	SRCS += $(SRC_DIR)/tcu/tcu_tmem.cpp
 endif
 
 # Add VM sources
@@ -142,8 +143,10 @@ OBJS            := $(COMMON_OBJS) $(SIM_COMMON_OBJS) $(SRC_OBJS)
 MAIN_OBJ    := $(OBJ_DIR)/main.o
 DXA_OOO_TEST_OBJ  := $(OBJ_DIR)/tests/dxa_ooo_test.o
 DXA_OOO_TEST      := $(DESTDIR)/dxa_ooo_test
+TCU_TMEM_TEST_OBJ := $(OBJ_DIR)/tests/tcu_tmem_test.o
+TCU_TMEM_TEST     := $(DESTDIR)/tcu_tmem_test
 
-DEPS := $(OBJS:.o=.d) $(MAIN_OBJ:.o=.d) $(DXA_OOO_TEST_OBJ:.o=.d)
+DEPS := $(OBJS:.o=.d) $(MAIN_OBJ:.o=.d) $(DXA_OOO_TEST_OBJ:.o=.d) $(TCU_TMEM_TEST_OBJ:.o=.d)
 
 # generate .d files alongside .o files
 CXXFLAGS += -MMD -MP -MF $(@:.o=.d)
@@ -166,7 +169,7 @@ PROJECT := simx
 VORTEX_LIB := libvortex.so
 VORTEX_GEM5_LIB := libvortex-gem5.so
 
-.PHONY: all force test-dxa-ooo clean clean-lib clean-exe clean-obj libvortex clean-libvortex libvortex-gem5 clean-libvortex-gem5
+.PHONY: all force test-dxa-ooo test-tcu-tmem clean clean-lib clean-exe clean-obj libvortex clean-libvortex libvortex-gem5 clean-libvortex-gem5
 
 ifeq ($(USE_SST), 1)
 all: $(DESTDIR)/$(PROJECT) $(DESTDIR)/$(VORTEX_LIB)
@@ -215,6 +218,16 @@ test-dxa-ooo: $(DXA_OOO_TEST)
 $(DXA_OOO_TEST): $(OBJS) $(DXA_OOO_TEST_OBJ)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
+$(TCU_TMEM_TEST_OBJ): $(VORTEX_HOME)/tests/unittest/tcu_tmem/main.cpp $(CONFIG_FILE)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+test-tcu-tmem: $(TCU_TMEM_TEST)
+	$(TCU_TMEM_TEST)
+
+$(TCU_TMEM_TEST): $(OBJS) $(TCU_TMEM_TEST_OBJ)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+
 # Shared library
 $(DESTDIR)/lib$(PROJECT).so: $(OBJS)
 	$(CXX) $(CXXFLAGS) $^ -shared $(LDFLAGS) -o $@
@@ -259,7 +272,7 @@ clean-libvortex-gem5:
 	rm -f $(DESTDIR)/$(VORTEX_GEM5_LIB)
 
 clean-exe:
-	rm -f $(DESTDIR)/$(PROJECT) $(DXA_OOO_TEST)
+	rm -f $(DESTDIR)/$(PROJECT) $(DXA_OOO_TEST) $(TCU_TMEM_TEST)
 
 clean-obj:
 	rm -rf $(OBJ_DIR)
