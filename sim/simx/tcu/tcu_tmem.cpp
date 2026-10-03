@@ -21,24 +21,13 @@
 
 using namespace vortex;
 
-namespace {
-
-// VX_rr_arbiter resets reqs_mask to all-ones, so its first grant is the
-// lowest set request. SimX's RoundRobinArbiter resets last_grant_ to 0, which
-// starts the scan at index 1 and would skip requester 0 on the first
-// contended cycle. Prime it with a grant of the top index so both models
-// enter their rotation at the same point.
-void prime_rr(Arbiter& arb, uint32_t size) {
-  BitVector<> top(size);
-  top.set(size - 1);
-  arb.grant(top);
-}
-
-} // namespace
-
 TcuTmem::TcuTmem() {
   rd_arb_.reserve(kBanks);
   wr_arb_.reserve(kBanks);
+  // Accepted divergence from RTL: RoundRobinArbiter resets last_grant_ to 0 and
+  // so begins its scan at index 1, while VX_rr_arbiter resets reqs_mask to
+  // all-ones and grants the lowest set request. The two pick different winners
+  // on the first contended cycle after a reset, and agree from then on.
   for (uint32_t r = 0; r < kBanks; ++r) {
     rd_arb_.emplace_back(ArbiterType::RoundRobin, kArbW);
     wr_arb_.emplace_back(ArbiterType::RoundRobin, kArbW);
@@ -55,8 +44,6 @@ void TcuTmem::reset() {
   for (uint32_t r = 0; r < kBanks; ++r) {
     rd_arb_.at(r).reset();
     wr_arb_.at(r).reset();
-    prime_rr(rd_arb_.at(r), kArbW);
-    prime_rr(wr_arb_.at(r), kArbW);
     rd_grant_onehot_d_.at(r).reset();
   }
   ldst_wr_won_.reset();

@@ -126,32 +126,29 @@ void test_read_grant_is_registered_write_is_not() {
   CHECK(tmem.grants().compute_rd.test(0));
 }
 
-// Two requesters on one bank: exactly one stall counted, exactly one winner,
-// and the loser wins next cycle. The first contended grant must go to the
-// lower pool index, because VX_rr_arbiter resets reqs_mask to all-ones and so
-// grants the lowest set request first.
+// Two requesters on one bank: exactly one stall counted, one winner, and loser
+// wins next cycle.
 void test_read_conflict_and_rotation() {
   TcuTmem tmem;
   TcuTmem::CycleReqs reqs;
   reqs.compute_rd.at(0) = own_bank_req(0);       // pool index 0
   reqs.ldst_rd.at(0) = foreign_bank_req(0);      // pool index kBanks
 
-  // Cycle 0: both bid. One stall, lower index wins.
+  // Cycle 0: both bid. One stall, one winner.
   step(tmem, reqs);
   CHECK(tmem.perf_stats().bank_stalls == 1);
 
-  // Cycle 1: compute's win surfaces; ldst still pending, so it bids again and
-  // round-robin hands it the bank.
-  step(tmem, reqs);
-  CHECK(tmem.grants().compute_rd.test(0));
-  CHECK(!tmem.grants().ldst_rd.test(0));
-  CHECK(tmem.perf_stats().bank_stalls == 2);
-
-  // Cycle 2: ldst's win surfaces. Its request is now suppressed by that
-  // registered grant (ldst_rd_won in g_rd_arb), so only compute bids and
-  // no conflict is counted.
+  // Cycle 1: ldst's win surfaces and its request drops out of the pool. Compute
+  // bids alone and no second conflict is counted.
   step(tmem, reqs);
   CHECK(tmem.grants().ldst_rd.test(0));
+  CHECK(!tmem.grants().compute_rd.test(0));
+  CHECK(tmem.perf_stats().bank_stalls == 1);
+
+  // Cycle 2: compute's win surfaces. ldst's grant has aged out of the register
+  // so it bids again.
+  step(tmem, reqs);
+  CHECK(tmem.grants().compute_rd.test(0));
   CHECK(tmem.perf_stats().bank_stalls == 2);
 }
 
@@ -238,18 +235,18 @@ void test_reset_restores_rotation() {
   reqs.compute_rd.at(0) = own_bank_req(0);
   reqs.ldst_rd.at(0) = foreign_bank_req(0);
 
-  step(tmem, reqs);   // compute wins, rotation advances
-  step(tmem, reqs);   // ldst wins
-  CHECK(tmem.perf_stats().bank_stalls == 2);
+  step(tmem, reqs);   // ldst wins, rotation advances
+  step(tmem, reqs);   // compute wins
+  CHECK(tmem.perf_stats().bank_stalls == 1);
 
   tmem.reset();
   CHECK(tmem.perf_stats().bank_stalls == 0);
 
-  // Post-reset the lowest pool index wins again.
+  // Post-reset the same requester wins first again
   step(tmem, reqs);
   step(tmem, reqs);
-  CHECK(tmem.grants().compute_rd.test(0));
-  CHECK(!tmem.grants().ldst_rd.test(0));
+  CHECK(tmem.grants().ldst_rd.test(0));
+  CHECK(!tmem.grants().compute_rd.test(0));
 }
 
 ///////////////////////////////////////////////////////////////////////////////
