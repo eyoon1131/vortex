@@ -23,13 +23,15 @@ namespace vortex {
 
 // Tensor memory: the UMMA accumulator store, plus its column allocator.
 //
-// TMEM is architecturally per-SM, not per-tensor-core. Living one level down
-// inside TcuUnit is correct because Vortex instantiates one TcuUnit per Core;
-// if that ever changes, this object should move up to Core.
+// TMEM in Blackwell is architecturally per-SM, not per-tensor-core. Living one
+// level down inside TcuUnit is correct because Vortex instantiates one TcuUnit
+// per Core; if that ever changes, this object should move up to Core.
 class TcuTmem {
 public:
   static constexpr uint32_t kCols = VX_CFG_TCU_TMEM_COLS;
 
+  // TMEM geometry only depends on NT. Element types are placeholders and must
+  // not be used for anything type-dependent.
   using wg_cfg = vortex::tensor::wgmma_config_t<VX_CFG_NUM_THREADS,
                                                 vortex::tensor::fp32,
                                                 vortex::tensor::fp32>;
@@ -91,7 +93,10 @@ public:
   // Geometry
   static constexpr uint32_t kBankLanes = wg_cfg::xtileM;  // == TCU_WG_TILE_M
   static constexpr uint32_t kWordCols = wg_cfg::tcN;      // == TCU_TC_N
-  static constexpr uint32_t kArbW = 2 * kBanks;           // == ARB_W
+  // The read port serves three requesters (accumulator read, TMEM_LD, abuf
+  // A-stripe fill); the write port serves two.
+  static constexpr uint32_t kArbRdW = 3 * kBanks;         // == ARB_RD_W
+  static constexpr uint32_t kArbWrW = 2 * kBanks;         // == ARB_WR_W
 
   static uint32_t bank_of(uint32_t lane_base) { return lane_base / kBankLanes; }
   static uint32_t word_of(uint32_t col_base) { return col_base / kWordCols; }
@@ -103,38 +108,33 @@ public:
     uint32_t col_base = 0;
   };
 
-  // Compute occupies pool indices [0, kBanks) and ldst [kBanks, 2*kBanks).
+  // Read pool: compute [0, kBanks), ldst [kBanks, 2*kBanks), a_fill
+  // [2*kBanks, 3*kBanks). Write pool: compute, then ldst.
   struct CycleReqs {
     std::array<BankReq, kBanks> compute_rd{};  // UMMA accumulator read
     std::array<BankReq, kBanks> ldst_rd{};     // TMEM_LD
+    std::array<BankReq, kBanks> a_fill_rd{};   // abuf A-stripe fill (A-from-TMEM)
     std::array<BankReq, kBanks> compute_wr{};  // UMMA accumulator writeback
     std::array<BankReq, kBanks> ldst_wr{};     // TMEM_ST
   };
 
-  // Read grants are the previous arb_arbitrate()'s, registered to match
-  // VX_dp_ram OUT_REG=1: a read's data is only valid the cycle after its win.
-  // Write grants are the current arb_arbitrate()'s.
-  // An ungranted requester must retry without popping.
+  // Read grants are the previous arb_arbitrate()'s, registered. Write grants
+  // are the current arb_arbitrate()'s. An ungranted requester must retry
+  // without popping.
   struct Grants {
     std::bitset<kBanks> compute_rd;
     std::bitset<kBanks> ldst_rd;
+    std::bitset<kBanks> a_fill_rd;
     std::bitset<kBanks> compute_wr;
     std::bitset<kBanks> ldst_wr;
   };
 
-  // Arbitration is split so the consumer can close the RTL's combinational 
+  // Arbitration is split so the consumer can close the RTL's combinational
   // loop: tmem_rd_valid depends on ~umma_rd_won, which depends on the grant
   // published this cycle. The caller therefore decodes addresses, publishes,
-  // decides validity from the published grants, then arbitrates.
-  //
-  //   1. fill in every requester's lane_base/col_base (valid may stay false)
-  //   2. arb_publish(reqs)  -- grants() now holds last cycle's read grants
-  //   3. set each requester's valid from grants() and its own sticky latch
-  //   4. arb_arbitrate(reqs)
-  //   5. consume: a block without its grant retries without popping
-  //
-  // The caller owns the compute-side sticky latches. Only the TMEM_ST latch
-  // lives on this side, and arb_arbitrate() applies it itself.
+  // decides validity from the published grants, then arbitrates. The caller
+  // owns the compute-side sticky latches. Only the TMEM_ST latch lives on this
+  // side, and arb_arbitrate() applies it itself.
   void arb_publish(const CycleReqs& reqs);
   void arb_arbitrate(const CycleReqs& reqs);
 
@@ -167,7 +167,7 @@ private:
   std::vector<Arbiter> wr_arb_;
 
   // Per-bank one-hot read grant, registered one cycle (bank_rd_grant_onehot_d).
-  std::array<std::bitset<kArbW>, kBanks> rd_grant_onehot_d_{};
+  std::array<std::bitset<kArbRdW>, kBanks> rd_grant_onehot_d_{};
 
   std::bitset<kBanks> ldst_wr_won_;  // == ldst_wr_won_r
   Grants grants_{};

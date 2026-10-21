@@ -35,6 +35,16 @@ namespace vt = vortex::tensor;
 using cfg    = vt::wmma_config_t<VX_CFG_NUM_THREADS>;
 using wg_cfg = vt::wgmma_config_t<VX_CFG_NUM_THREADS, vt::fp32, vt::fp32>;
 static constexpr uint32_t kFedpWords = wg_cfg::fedpK;
+
+#ifdef VX_CFG_TCU_TMEM_ENABLE
+// Bank reads per A-from-TMEM stripe refill. A k-stripe is kFedpWords columns
+// wide and one bank word spans TcuTmem::kWordCols (== TCU_TC_N) of them, so
+// this is 1 unless FEDP2K doubles fedpK. Depends on TC_K == TC_N.
+static constexpr uint32_t kAFillWords =
+    (kFedpWords + TcuTmem::kWordCols - 1) / TcuTmem::kWordCols;
+static_assert(kFedpWords % TcuTmem::kWordCols == 0,
+              "A-from-TMEM needs fedpK to be a whole number of bank words");
+#endif
 #ifdef VX_CFG_TCU_FEDP2K
 static constexpr bool kFedp2K = true;
 #else
@@ -403,6 +413,8 @@ public:
     tmem_mgmt_grant_ = TcuTmem::kNoGrant;
     tmem_mgmt_fire_ = false;
     umma_handle_.clear();
+    a_fill_.fill(a_fill_state_t{});
+    umma_a_col_.clear();
   #endif
   }
 
@@ -570,10 +582,31 @@ public:
         uint32_t handle = first_uop ? (trace->src_data[2].empty() ? 0 : trace->src_data[2].at(0).u32)
                                     : umma_handle_[wid];
         uint32_t cta_rank = core_->scheduler().warp(wid).cta_csrs.cta_rank;
-        tmem_reqs_.compute_rd.at(b).lane_base =
-            cta_rank * wg_cfg::xtileM + tpuArgs.step_m * cfg::tcM;
+        tmem_reqs_.compute_rd.at(b).lane_base = cta_rank * wg_cfg::xtileM + tpuArgs.step_m * cfg::tcM;
         tmem_reqs_.compute_rd.at(b).col_base = handle + tpuArgs.step_n * cfg::tcN;
         tmem_reqs_.compute_wr.at(b) = tmem_reqs_.compute_rd.at(b);
+
+        // A-from-TMEM: abuf holds one k-stripe, keyed by {a_col, step_k}. A's
+        // rows are this CTA's xtileM lanes so one bank read covers kWordCols of
+        // the stripe's kFedpWords columns.
+        if (!tpuArgs.is_a_smem) {
+          uint32_t a_col = first_uop
+              ? (trace->src_data[0].empty() ? 0 : trace->src_data[0].at(0).u32)
+              : umma_a_col_[wid];
+          if (first_uop)
+            umma_a_col_[wid] = a_col;
+          uint32_t stripe_col = a_col + tpuArgs.step_k * kFedpWords;
+          uint32_t lane_base = cta_rank * wg_cfg::xtileM;
+          auto& af = a_fill_.at(b);
+          if (af.resident && (af.lane_base != lane_base || af.col_base != stripe_col)) {
+            af = a_fill_state_t{};
+          }
+          af.lane_base = lane_base;
+          af.col_base = stripe_col;
+          tmem_reqs_.a_fill_rd.at(b).lane_base = lane_base;
+          tmem_reqs_.a_fill_rd.at(b).col_base =
+              stripe_col + af.words_done * TcuTmem::kWordCols;
+        }
       } break;
       case TcuType::TMEM_LD:
       case TcuType::TMEM_ST: {
@@ -621,6 +654,19 @@ public:
         // The writeback bids once the read is in hand.
         tmem_reqs_.compute_wr.at(b).valid =
             (umma_rd_won_.at(b) || exec_done_.at(b)) && !umma_wr_won_r_.at(b);
+
+        // A-fill: last cycle's registered grant delivered one bank word.
+        auto tpuArgs = std::get<IntrTcuArgs>(input.peek()->instr_ptr->get_args());
+        if (!tpuArgs.is_a_smem) {
+          auto& af = a_fill_.at(b);
+          if (!af.resident && tmem_.grants().a_fill_rd.test(b)) {
+            if (++af.words_done >= kAFillWords)
+              af.resident = true;
+          }
+          tmem_reqs_.a_fill_rd.at(b).valid = !af.resident;
+          if (!af.resident)
+            ++perf_stats_.tmem_a_fill_stalls;
+        }
       } else {
         umma_hazard_.at(b) = false;
         umma_rd_won_.at(b) = false;
@@ -724,8 +770,10 @@ public:
       }
       uint32_t a_desc = wgmma_desc_[wid][0];
       uint32_t b_desc = wgmma_desc_[wid][1];
+      // Only dense WGMMA's RS form gets a setup uop; UMMA's TS form has none, so
+      // its first uop must deliver the descriptors itself.
       bool needs_setup = kFedp2K && !tpuArgs.is_a_smem
-                      && (std::get<TcuType>(trace->op_type) != TcuType::WGMMA_SP);
+                      && (std::get<TcuType>(trace->op_type) == TcuType::WGMMA);
       if (tpuArgs.is_first_uop && !needs_setup) {
         if (tpuArgs.is_a_smem)
           a_desc = trace->src_data.at(0).at(0).u32;
@@ -768,7 +816,19 @@ public:
         if (!((wgmma_active >> b) & 1u)) continue;
         auto trace = simobject_->Inputs.at(b).peek();
         auto tpuArgs = std::get<IntrTcuArgs>(trace->instr_ptr->get_args());
-        bool a_ok = !tpuArgs.is_a_smem || tbuf->ready_a(b);
+        bool a_ok;
+        if (tpuArgs.is_a_smem) {
+          a_ok = tbuf->ready_a(b);
+        } else {
+      #ifdef VX_CFG_TCU_TMEM_ENABLE
+          // UMMA's TS form waits on its abuf A-stripe fill from TMEM.
+          a_ok = (std::get<TcuType>(trace->op_type) != TcuType::UMMA)
+              || a_fill_.at(b).resident;
+      #else
+          // WGMMA RS mode: A comes from the register file, abuf bypassed.
+          a_ok = true;
+      #endif
+        }
         bool b_ok = tbuf->ready_b();
         if (a_ok && b_ok) ready_mask |= (1u << b);
       }
@@ -1424,14 +1484,6 @@ public:
     __unused(rs1_data);
     __unused(rs2_data);
 
-    // A-from-TMEM decodes and reaches here, but the operand fetch below still
-    // reads shared memory. Placeholder until implemented.
-    if (!a_from_smem) {
-      std::cout << "Error: UMMA with A sourced from TMEM is not implemented in "
-                   "the SimX model yet" << std::endl;
-      std::abort();
-    }
-
     uint32_t nrc = kNrcTable[umma_nrc];
 
     uint32_t ratio   = elem_ratio(fmt_s);
@@ -1440,13 +1492,21 @@ public:
 
     bool first_uop = (step_m == 0 && step_n == 0 && step_k == 0);
     if (first_uop) {
-      lmem_desc_[wid][0] = {uint64_t(VX_MEM_LMEM_BASE_ADDR) + (a_desc & 0xFFFF), (a_desc >> 16) * 8 / e_bits, false};
+      if (a_from_smem) {
+        lmem_desc_[wid][0] = {uint64_t(VX_MEM_LMEM_BASE_ADDR) + (a_desc & 0xFFFF), (a_desc >> 16) * 8 / e_bits, false};
+      } else {
+        // On the TMEM path a_desc is an absolute TMEM column, not a descriptor.
+        lmem_desc_[wid][0] = {};
+      }
       lmem_desc_[wid][1] = {uint64_t(VX_MEM_LMEM_BASE_ADDR) + (b_desc & 0xFFFF), (b_desc >> 16) * 8 / e_bits, false};
       umma_handle_[wid] = handle;
+      umma_a_col_[wid] = a_desc;
     }
     lmem_desc_t sd_a = lmem_desc_[wid][0];
     lmem_desc_t sd_b = lmem_desc_[wid][1];
-    cur_a_desc_base_ = sd_a.base;
+    // load_lmem_word distinguishes A from B by descriptor base; A-from-TMEM
+    // never reaches it, so leave no base that could alias B's.
+    cur_a_desc_base_ = a_from_smem ? sd_a.base : ~uint64_t(0);
     cur_is_sparse_ = false;
 
     uint32_t xtileM = wg_cfg::xtileM;
@@ -1475,12 +1535,31 @@ public:
       std::abort();
     }
 
+    uint32_t a_col = umma_a_col_[wid];
+    if (!a_from_smem) {
+      // A is read from the same lanes the accumulator occupies, so its column
+      // range is the only thing to bound-check.
+      uint32_t max_a_col = a_col + step_k * k_words + k_words;
+      if (max_a_col > TcuTmem::kCols) {
+        std::cout << "Error: UMMA A-from-TMEM column range exceeds TMEM"
+                     " (col=" << a_col << ", cols=" << TcuTmem::kCols << ")" << std::endl;
+        std::abort();
+      }
+    }
+
     reg_data_t a_tile[cfg::tcM * kFedpWords] = {};
     for (uint32_t i = 0; i < cfg::tcM; ++i) {
       uint32_t a_row_idx = step_m * cfg::tcM + i;
       for (uint32_t z = 0; z < k_words; ++z) {
-        uint32_t k_elem = (step_k * k_words + z) * ratio;
-        a_tile[i * k_words + z].u32 = load_lmem_word(sd_a, a_row_idx, k_elem, fmt_s, false, false);
+        if (a_from_smem) {
+          uint32_t k_elem = (step_k * k_words + z) * ratio;
+          a_tile[i * k_words + z].u32 = load_lmem_word(sd_a, a_row_idx, k_elem, fmt_s, false, false);
+        } else {
+          // element (row, k) lives at TMEM[cta_rank*xtileM + row][a_col + k/ratio],
+          // and k/ratio for word z is exactly step_k*k_words + z.
+          a_tile[i * k_words + z].u32 =
+              tmem_.read(cta_rank * xtileM + a_row_idx, a_col + step_k * k_words + z);
+        }
       }
     }
 
@@ -1812,6 +1891,17 @@ private:
   TcuTmem::CycleReqs tmem_reqs_;
 
   std::array<TcuTmemWrTrack, VX_CFG_NUM_TCU_BLOCKS> wr_track_;
+
+  // A-from-TMEM abuf residency: one k-stripe per block, keyed by its TMEM
+  // origin. `words_done` counts bank words collected for an in-flight refill.
+  struct a_fill_state_t {
+    bool resident = false;
+    uint32_t lane_base = 0;
+    uint32_t col_base = 0;
+    uint32_t words_done = 0;
+  };
+  std::array<a_fill_state_t, VX_CFG_NUM_TCU_BLOCKS> a_fill_;
+  std::unordered_map<uint32_t, uint32_t> umma_a_col_;
   std::array<bool, VX_CFG_NUM_TCU_BLOCKS> umma_hazard_{};
   std::array<bool, VX_CFG_NUM_TCU_BLOCKS> umma_rd_won_{};
   std::array<bool, VX_CFG_NUM_TCU_BLOCKS> umma_rd_won_r_{};
@@ -2106,7 +2196,7 @@ Instr::Ptr TcuUopGen::get(const Instr& macro_instr, uint32_t uop_index) {
 
     bool first = (uop_index == 0);
     bool last  = (uop_index == (total - 1));
-    uop_instr->set_args(IntrTcuArgs{1, 0, args.fmt_s, args.fmt_d, m, n, k,
+    uop_instr->set_args(IntrTcuArgs{args.is_a_smem, 0, args.fmt_s, args.fmt_d, m, n, k,
                                    first ? 1u : 0u, last ? 1u : 0u, 0, args.umma_nrc});
     // desc_a/desc_b/handle only need fetching once; Impl caches them per-wid
     // (lmem_desc_, umma_handle_) and reuses on subsequent uops.

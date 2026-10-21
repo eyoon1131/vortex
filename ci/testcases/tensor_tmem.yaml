@@ -137,6 +137,40 @@ tests:
   configs: -DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=16 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE
     -DVX_CFG_TCU_TMEM_ENABLE -DITYPE=fp16 -DOTYPE=fp32 -DUMMA_NRC=32
 
+# FEDP2K doubles FEDP_K, so an A k-stripe spans two TMEM bank words.
+- id: sgemm_tcu_tmem-15
+  via: blackbox
+  drivers:
+  - simx
+  app: sgemm_tcu_tmem
+  configs: -DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=8 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE
+    -DVX_CFG_TCU_TMEM_ENABLE -DVX_CFG_TCU_FEDP2K -DITYPE=fp16 -DOTYPE=fp32 -DUMMA_NRC=32
+
+- id: sgemm_tcu_tmem-16
+  via: blackbox
+  drivers:
+  - rtlsim
+  app: sgemm_tcu_tmem
+  configs: -DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=8 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE
+    -DVX_CFG_TCU_TMEM_ENABLE -DVX_CFG_TCU_FEDP2K -DITYPE=fp16 -DOTYPE=fp32 -DUMMA_NRC=32
+
+# A from TMEM (UMMA TS form). SimX-only until the RTL refill path lands.
+- id: sgemm_tcu_tmem-17
+  via: blackbox
+  drivers:
+  - simx
+  app: sgemm_tcu_tmem
+  configs: -DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=8 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE
+    -DVX_CFG_TCU_TMEM_ENABLE -DITYPE=fp16 -DOTYPE=fp32 -DUMMA_NRC=32 -DUMMA_A_TMEM
+
+- id: sgemm_tcu_tmem-18
+  via: blackbox
+  drivers:
+  - simx
+  app: sgemm_tcu_tmem
+  configs: -DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=8 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE
+    -DVX_CFG_TCU_TMEM_ENABLE -DVX_CFG_TCU_FEDP2K -DITYPE=fp16 -DOTYPE=fp32 -DUMMA_NRC=32 -DUMMA_A_TMEM
+
 # Dense UMMA fp16 datapath, cycles-vs-baseline.
 - id: perf_gate-umma-fp16
   check: perf_gate

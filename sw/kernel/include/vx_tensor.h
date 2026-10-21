@@ -1389,6 +1389,56 @@ public:
     tmem_lanes_exit(saved_mask);
   }
 
+  // Packed-word geometry for the A-from-TMEM (TS) path: a 32-bit TMEM word
+  // holds `a_elems_per_word` consecutive A elements along k, so a k-stripe of
+  // `tileK` elements occupies `a_tmem_words` columns.
+  static constexpr uint32_t a_elems_per_word = sizeof(uint32_t) / sizeof(input_t);
+  static constexpr uint32_t a_tmem_words     = tileK / a_elems_per_word;
+
+  // Stage this warp's xtileM x tileK A tile into TMEM for the TS path, read
+  // row-major from global memory.
+  //
+  // Packing matches the shared-memory path: element k of a row lands in column
+  // a_col + k/a_elems_per_word at bit (k % a_elems_per_word) * 8 *
+  // sizeof(input_t). A's rows are the same TMEM lanes the accumulator occupies,
+  // so there is no lane field to supply.
+  //
+  // Software contract: the caller must place a barrier between this and the
+  // umma_sync that reads it.
+  static __attribute__((always_inline)) void store_a_tmem(uint32_t a_col,
+                                                          const input_t* A_global,
+                                                          uint32_t tile_row,
+                                                          uint32_t k0,
+                                                          uint32_t K) {
+    static_assert(sizeof(input_t) == 1 || sizeof(input_t) == 2 || sizeof(input_t) == 4,
+                  "A-from-TMEM staging supports 8/16/32-bit input types");
+    static_assert(a_tmem_words * a_elems_per_word == tileK,
+                  "tileK must be a whole number of packed TMEM words");
+    using raw_t = typename std::conditional<
+        sizeof(input_t) == 1, uint8_t,
+        typename std::conditional<sizeof(input_t) == 2, uint16_t, uint32_t>::type>::type;
+    constexpr uint32_t e_bits = 8 * sizeof(input_t);
+
+    uint32_t tid_in_warp = vx_thread_id() % NT;
+    uint32_t rank = vx_cta_rank();
+    size_t saved_mask;
+    if (!tmem_lanes_enter(saved_mask))
+      return;
+    for (uint32_t r = 0; r < tmem_rows_per_thread; ++r) {
+      uint32_t base = rank * xtileM + r * tmem_active_lanes;
+      const input_t* src = A_global + size_t(tile_row + base + tid_in_warp) * K + k0;
+      for (uint32_t j = 0; j < a_tmem_words; ++j) {
+        uint32_t w = 0;
+        for (uint32_t e = 0; e < a_elems_per_word; ++e) {
+          uint32_t bits = uint32_t(detail::bit_cast<raw_t>(src[j * a_elems_per_word + e]));
+          w |= bits << (e * e_bits);
+        }
+        vx_tmem_st(vx_make_tmem_addr(base, a_col + j), w);
+      }
+    }
+    tmem_lanes_exit(saved_mask);
+  }
+
   // Issue a UMMA op: A/B sourced from SMEM via descriptors, C/D implicit in
   // TMEM at `handle`.
   // ---- UMMA sync intrinsic ----
@@ -1400,6 +1450,8 @@ public:
   // (cta_rank*xtileM + m), so element (row, k) lives at
   //   TMEM[cta_rank*xtileM + row][op_a.value + k / elems_per_word]
   // with the same elems_per_word packing the shared-memory path uses.
+  // The TS form does not wait on TMEM_ST writes to A; the caller must order
+  // them with a barrier, since the RAW interlock tracks only UMMA writes.
   template <typename OpA>
   static __attribute__((always_inline)) void umma_sync(const OpA& op_a,
                                                        smem_matrix_desc desc_b,

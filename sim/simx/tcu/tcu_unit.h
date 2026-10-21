@@ -70,6 +70,7 @@ public:
 		uint64_t tmem_bank_stalls = 0;
 		uint64_t tmem_rd_grant_stalls = 0;
 		uint64_t tmem_hazard_stalls = 0;
+		uint64_t tmem_a_fill_stalls = 0; // cycles a UMMA waited on its A-from-TMEM stripe
 #endif
 
 		PerfStats& operator+=(const PerfStats& rhs) {
@@ -84,6 +85,7 @@ public:
 			this->tmem_bank_stalls 	   += rhs.tmem_bank_stalls;
 			this->tmem_hazard_stalls   += rhs.tmem_hazard_stalls;
 			this->tmem_rd_grant_stalls += rhs.tmem_rd_grant_stalls;
+			this->tmem_a_fill_stalls   += rhs.tmem_a_fill_stalls;
 #endif
 			return *this;
 		}

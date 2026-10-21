@@ -29,8 +29,8 @@ TcuTmem::TcuTmem() {
   // all-ones and grants the lowest set request. The two pick different winners
   // on the first contended cycle after a reset, and agree from then on.
   for (uint32_t r = 0; r < kBanks; ++r) {
-    rd_arb_.emplace_back(ArbiterType::RoundRobin, kArbW);
-    wr_arb_.emplace_back(ArbiterType::RoundRobin, kArbW);
+    rd_arb_.emplace_back(ArbiterType::RoundRobin, kArbRdW);
+    wr_arb_.emplace_back(ArbiterType::RoundRobin, kArbWrW);
   }
   this->reset();
 }
@@ -191,22 +191,43 @@ void TcuTmem::write(uint32_t lane, uint32_t col, uint32_t value) {
 
 namespace {
 
-// Build one bank's ARB_W-wide request vector, as req_vec = {ldst, compute}:
-// compute at pool index bi, ldst at kBanks + bi.
-BitVector<> build_req_vec(uint32_t bank,
-                          const std::array<TcuTmem::BankReq, TcuTmem::kBanks>& compute,
-                          const std::array<TcuTmem::BankReq, TcuTmem::kBanks>& ldst,
-                          const std::bitset<TcuTmem::kBanks>& ldst_suppress) {
-  BitVector<> req_vec(TcuTmem::kArbW);
+// Set one requester class's slice of a bank's request vector. `base` is the
+// class's pool offset, `suppress` drops a requester that already holds its
+// grant this cycle.
+void add_class(BitVector<>& req_vec, uint32_t bank, uint32_t base,
+               const std::array<TcuTmem::BankReq, TcuTmem::kBanks>& reqs,
+               const std::bitset<TcuTmem::kBanks>& suppress) {
   for (uint32_t bi = 0; bi < TcuTmem::kBanks; ++bi) {
-    if (compute.at(bi).valid && TcuTmem::bank_of(compute.at(bi).lane_base) == bank) {
-      req_vec.set(bi);
-    }
-    if (ldst.at(bi).valid && TcuTmem::bank_of(ldst.at(bi).lane_base) == bank
-     && !ldst_suppress.test(bi)) {
-      req_vec.set(TcuTmem::kBanks + bi);
+    if (reqs.at(bi).valid && 
+        TcuTmem::bank_of(reqs.at(bi).lane_base) == bank &&
+        !suppress.test(bi)) {
+      req_vec.set(base + bi);
     }
   }
+}
+
+// req_vec = {a_fill, ldst, compute}: compute at bi, ldst at kBanks + bi,
+// a_fill at 2*kBanks + bi.
+BitVector<> build_rd_req_vec(uint32_t bank,
+                             const TcuTmem::CycleReqs& reqs,
+                             const std::bitset<TcuTmem::kBanks>& ldst_suppress,
+                             const std::bitset<TcuTmem::kBanks>& a_fill_suppress) {
+  static const std::bitset<TcuTmem::kBanks> kNone;
+  BitVector<> req_vec(TcuTmem::kArbRdW);
+  add_class(req_vec, bank, 0, reqs.compute_rd, kNone);
+  add_class(req_vec, bank, TcuTmem::kBanks, reqs.ldst_rd, ldst_suppress);
+  add_class(req_vec, bank, 2 * TcuTmem::kBanks, reqs.a_fill_rd, a_fill_suppress);
+  return req_vec;
+}
+
+// req_vec = {ldst, compute}.
+BitVector<> build_wr_req_vec(uint32_t bank,
+                             const TcuTmem::CycleReqs& reqs,
+                             const std::bitset<TcuTmem::kBanks>& ldst_suppress) {
+  static const std::bitset<TcuTmem::kBanks> kNone;
+  BitVector<> req_vec(TcuTmem::kArbWrW);
+  add_class(req_vec, bank, 0, reqs.compute_wr, kNone);
+  add_class(req_vec, bank, TcuTmem::kBanks, reqs.ldst_wr, ldst_suppress);
   return req_vec;
 }
 
@@ -218,6 +239,7 @@ void TcuTmem::arb_publish(const CycleReqs& reqs) {
   // must check its own validity. The write grant is valid-qualified.
   grants_.compute_rd.reset();
   grants_.ldst_rd.reset();
+  grants_.a_fill_rd.reset();
   for (uint32_t bi = 0; bi < kBanks; ++bi) {
     if (rd_grant_onehot_d_.at(bank_of(reqs.compute_rd.at(bi).lane_base)).test(bi)) {
       grants_.compute_rd.set(bi);
@@ -225,15 +247,18 @@ void TcuTmem::arb_publish(const CycleReqs& reqs) {
     if (rd_grant_onehot_d_.at(bank_of(reqs.ldst_rd.at(bi).lane_base)).test(kBanks + bi)) {
       grants_.ldst_rd.set(bi);
     }
+    if (rd_grant_onehot_d_.at(bank_of(reqs.a_fill_rd.at(bi).lane_base)).test(2 * kBanks + bi)) {
+      grants_.a_fill_rd.set(bi);
+    }
   }
 }
 
 void TcuTmem::arb_arbitrate(const CycleReqs& reqs) {
   // A TMEM_LD that already has its registered grant has its data, so it drops
   // its request.
-  std::array<std::bitset<kArbW>, kBanks> rd_grant_onehot{};
+  std::array<std::bitset<kArbRdW>, kBanks> rd_grant_onehot{};
   for (uint32_t r = 0; r < kBanks; ++r) {
-    auto req_vec = build_req_vec(r, reqs.compute_rd, reqs.ldst_rd, grants_.ldst_rd);
+    auto req_vec = build_rd_req_vec(r, reqs, grants_.ldst_rd, grants_.a_fill_rd);
     if (req_vec.count() > 1) {
       ++perf_stats_.bank_stalls;
     }
@@ -246,7 +271,7 @@ void TcuTmem::arb_arbitrate(const CycleReqs& reqs) {
   grants_.compute_wr.reset();
   grants_.ldst_wr.reset();
   for (uint32_t r = 0; r < kBanks; ++r) {
-    auto req_vec = build_req_vec(r, reqs.compute_wr, reqs.ldst_wr, ldst_wr_won_);
+    auto req_vec = build_wr_req_vec(r, reqs, ldst_wr_won_);
     if (req_vec.count() > 1) {
       ++perf_stats_.bank_stalls;
     }

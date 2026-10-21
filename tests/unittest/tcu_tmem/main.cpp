@@ -447,19 +447,95 @@ void test_storage_roundtrip() {
 
 } // namespace
 
+// A-from-TMEM adds a third read requester on the same bank read port. It must
+// arbitrate against compute and ldst, and drop its request once its registered
+// grant lands (it has its word).
+void test_a_fill_is_a_third_read_requester() {
+  TcuTmem tmem;
+  TcuTmem::CycleReqs reqs;
+  reqs.a_fill_rd.at(0) = own_bank_req(0);
+
+  // Uncontended: registered grant, so one cycle late, exactly like compute.
+  step(tmem, reqs);
+  CHECK(!tmem.grants().a_fill_rd.test(0));
+  CHECK(tmem.perf_stats().bank_stalls == 0);
+  step(tmem, reqs);
+  CHECK(tmem.grants().a_fill_rd.test(0));
+}
+
+// Three requesters on one bank is a 2-count conflict then a 1-count conflict,
+// and all three eventually win -- nothing is starved by the round-robin.
+void test_a_fill_contends_with_compute_and_ldst() {
+  TcuTmem tmem;
+  TcuTmem::CycleReqs reqs;
+  reqs.compute_rd.at(0) = own_bank_req(0);       // pool 0
+  reqs.ldst_rd.at(0)    = foreign_bank_req(0);   // pool kBanks
+  reqs.a_fill_rd.at(0)  = own_bank_req(0);       // pool 2*kBanks
+
+  uint32_t compute_wins = 0, ldst_wins = 0, a_fill_wins = 0;
+  for (uint32_t c = 0; c < 8; ++c) {
+    step(tmem, reqs);
+    if (tmem.grants().compute_rd.test(0)) ++compute_wins;
+    if (tmem.grants().ldst_rd.test(0))    ++ldst_wins;
+    if (tmem.grants().a_fill_rd.test(0))  ++a_fill_wins;
+  }
+  // Every class gets served; none is locked out by pool position.
+  CHECK(compute_wins > 0);
+  CHECK(ldst_wins > 0);
+  CHECK(a_fill_wins > 0);
+  // One grant per cycle per bank, so wins cannot exceed the cycles stepped.
+  CHECK(compute_wins + ldst_wins + a_fill_wins <= 8);
+}
+
+// A-fill is bank-local: its lane_base is cta_rank*xtileM, so block b always
+// targets bank b and distinct blocks never collide -- the same structural
+// property the compute read has.
+void test_a_fill_across_banks_never_conflicts() {
+  TcuTmem tmem;
+  TcuTmem::CycleReqs reqs;
+  for (uint32_t b = 0; b < kBanks; ++b) {
+    reqs.a_fill_rd.at(b) = own_bank_req(b);
+  }
+  step(tmem, reqs);
+  step(tmem, reqs);
+  for (uint32_t b = 0; b < kBanks; ++b) {
+    CHECK(tmem.grants().a_fill_rd.test(b));
+  }
+  CHECK(tmem.perf_stats().bank_stalls == 0);
+}
+
+// The write pool is unchanged by A-fill: it has no write requester, so a
+// compute write and a TMEM_ST on one bank still conflict exactly once.
+void test_a_fill_does_not_touch_the_write_pool() {
+  TcuTmem tmem;
+  TcuTmem::CycleReqs reqs;
+  reqs.a_fill_rd.at(0)  = own_bank_req(0);
+  reqs.compute_wr.at(0) = own_bank_req(0);
+  reqs.ldst_wr.at(0)    = foreign_bank_req(0);
+
+  step(tmem, reqs);
+  // One write conflict. The read side has a lone a_fill bid, so no read stall.
+  CHECK(tmem.perf_stats().bank_stalls == 1);
+}
+
 int main() {
   std::cout << "TcuTmem: kBanks=" << kBanks
             << ", kBankLanes=" << kBankLanes
             << ", kWordCols=" << kWordCols
             << ", kLanes=" << TcuTmem::kLanes
             << ", kCols=" << TcuTmem::kCols
-            << ", kArbW=" << TcuTmem::kArbW
+            << ", kArbRdW=" << TcuTmem::kArbRdW
+            << ", kArbWrW=" << TcuTmem::kArbWrW
             << ", wr_track depth=" << TcuTmemWrTrack::kDepth << std::endl;
 
   test_geometry();
   test_no_conflict_across_banks();
   test_read_grant_is_registered_write_is_not();
   test_read_conflict_and_rotation();
+  test_a_fill_is_a_third_read_requester();
+  test_a_fill_contends_with_compute_and_ldst();
+  test_a_fill_across_banks_never_conflicts();
+  test_a_fill_does_not_touch_the_write_pool();
   test_conflict_ignores_address_equality();
   test_read_and_write_pools_are_independent();
   test_tmem_st_sticky_win();
