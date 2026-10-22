@@ -198,6 +198,21 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     end
 `endif
 
+`ifdef VX_CFG_TCU_TMEM_ENABLE
+    // abuf A-stripe fill from TMEM (UMMA TS form). A's rows are the CTA's whole
+    // lane range, so the lane base is the bank origin for the block's CTA rank.
+    wire [BLOCK_SIZE-1:0]                        afill_valid;
+    wire [TCU_TMEM_COL_BITS-1:0]                 afill_col_base  [BLOCK_SIZE];
+    wire [TCU_TMEM_LANE_BITS-1:0]                afill_lane_base [BLOCK_SIZE];
+    wire [BLOCK_SIZE-1:0]                        afill_grant;
+    wire [TCU_WG_TILE_M-1:0][TCU_TC_N-1:0][31:0] afill_data      [BLOCK_SIZE];
+    for (genvar bi = 0; bi < BLOCK_SIZE; ++bi) begin : g_afill_lane
+        assign afill_lane_base[bi] = 
+            TCU_TMEM_LANE_BITS'(cta_rank_table[core_execute_if[bi].data.header.wid]) *
+            TCU_TMEM_LANE_BITS'(TCU_WG_TILE_M);
+    end
+`endif
+
     // -----------------------------------------------------------------------
     // WGMMA feature (orchestrator): VX_tcu_tbuf + VX_tcu_lockstep + perf.
     // -----------------------------------------------------------------------
@@ -229,6 +244,12 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         .exec_ready     (exec_ready_w),
         .exec_data      (exec_data_w),
         .tcu_lmem_if    (tcu_lmem_if),
+    `ifdef VX_CFG_TCU_TMEM_ENABLE
+        .afill_valid    (afill_valid),
+        .afill_col_base (afill_col_base),
+        .afill_grant    (afill_grant),
+        .afill_data     (afill_data),
+    `endif
         .tbuf_rs1_data  (tbuf_rs1_data),
         .tbuf_rs2_data  (tbuf_rs2_data),
         .tbuf_ready_eff (tbuf_ready_eff)
@@ -348,7 +369,12 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         .wr_lane_base  (tmem_wr_lane_base),
         .wr_col_base   (tmem_wr_col_base),
         .wr_data       (tmem_wr_data),
-        .wr_grant      (tmem_wr_grant)
+        .wr_grant      (tmem_wr_grant),
+        .afill_valid    (afill_valid),
+        .afill_lane_base(afill_lane_base),
+        .afill_col_base (afill_col_base),
+        .afill_grant    (afill_grant),
+        .afill_data     (afill_data)
     );
 `endif // VX_CFG_TCU_TMEM_ENABLE
 

@@ -119,6 +119,14 @@ tests:
   configs: -DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=8 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE
     -DVX_CFG_TCU_TMEM_ENABLE -DITYPE=fp16 -DOTYPE=fp32 -DUMMA_NRC=32
 
+# Same, with A sourced from TMEM: covers the abuf TMEM refill and its bank arbitration.
+- id: model_parity-umma-fp16-ts
+  check: model_parity
+  via: blackbox
+  app: sgemm_tcu_tmem
+  configs: -DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=8 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE
+    -DVX_CFG_TCU_TMEM_ENABLE -DITYPE=fp16 -DOTYPE=fp32 -DUMMA_NRC=32 -DUMMA_A_TMEM
+
 - id: sgemm_tcu_tmem-13
   via: blackbox
   drivers:
@@ -154,7 +162,7 @@ tests:
   configs: -DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=8 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE
     -DVX_CFG_TCU_TMEM_ENABLE -DVX_CFG_TCU_FEDP2K -DITYPE=fp16 -DOTYPE=fp32 -DUMMA_NRC=32
 
-# A from TMEM (UMMA TS form). SimX-only until the RTL refill path lands.
+# A from TMEM (UMMA TS form): abuf refills from TMEM instead of LMEM.
 - id: sgemm_tcu_tmem-17
   via: blackbox
   drivers:
@@ -167,6 +175,22 @@ tests:
   via: blackbox
   drivers:
   - simx
+  app: sgemm_tcu_tmem
+  configs: -DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=8 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE
+    -DVX_CFG_TCU_TMEM_ENABLE -DVX_CFG_TCU_FEDP2K -DITYPE=fp16 -DOTYPE=fp32 -DUMMA_NRC=32 -DUMMA_A_TMEM
+
+- id: sgemm_tcu_tmem-19
+  via: blackbox
+  drivers:
+  - rtlsim
+  app: sgemm_tcu_tmem
+  configs: -DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=8 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE
+    -DVX_CFG_TCU_TMEM_ENABLE -DITYPE=fp16 -DOTYPE=fp32 -DUMMA_NRC=32 -DUMMA_A_TMEM
+
+- id: sgemm_tcu_tmem-20
+  via: blackbox
+  drivers:
+  - rtlsim
   app: sgemm_tcu_tmem
   configs: -DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=8 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE
     -DVX_CFG_TCU_TMEM_ENABLE -DVX_CFG_TCU_FEDP2K -DITYPE=fp16 -DOTYPE=fp32 -DUMMA_NRC=32 -DUMMA_A_TMEM

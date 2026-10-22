@@ -465,6 +465,9 @@ package VX_tcu_pkg;
         logic [`VX_CFG_XLEN-1:0]    desc_a;
         logic [`VX_CFG_XLEN-1:0]    desc_b;
         logic                       a_is_smem;
+`ifdef VX_CFG_TCU_TMEM_ENABLE
+        logic                       a_is_tmem;   // UMMA TS form: abuf refills from TMEM
+`endif
         // Precomputed per-uop expansion phase; avoids re-deriving from
         // step_m/step_n/step_k at every consumer.
         logic                       is_first_uop;

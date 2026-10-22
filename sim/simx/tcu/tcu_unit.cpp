@@ -659,13 +659,33 @@ public:
         auto tpuArgs = std::get<IntrTcuArgs>(input.peek()->instr_ptr->get_args());
         if (!tpuArgs.is_a_smem) {
           auto& af = a_fill_.at(b);
-          if (!af.resident && tmem_.grants().a_fill_rd.test(b)) {
-            if (++af.words_done >= kAFillWords)
-              af.resident = true;
+          bool first_uop = (tpuArgs.step_m == 0 && tpuArgs.step_n == 0 && tpuArgs.step_k == 0);
+          // The last word's storage write lands the cycle after its grant.
+          if (af.landing) {
+            af.landing = false;
+            af.resident = true;
           }
-          tmem_reqs_.a_fill_rd.at(b).valid = !af.resident;
-          if (!af.resident)
-            ++perf_stats_.tmem_a_fill_stalls;
+          // abuf refetches on every macro-op's first compute uop.
+          if (!first_uop)
+            af.for_first = false;
+          if (first_uop && af.resident && !af.for_first)
+            af.resident = false;
+          // Sampled before this cycle's alloc: abuf enters S_FETCH a cycle
+          // after it allocates, so a new fill first bids on the next cycle.
+          bool bid = af.fetching;
+          if (af.fetching && tmem_.grants().a_fill_rd.test(b)) {
+            if (++af.words_done >= kAFillWords) {
+              af.fetching = false;
+              af.landing = true;
+              if (first_uop)
+                af.for_first = true;
+            }
+          }
+          if (!af.resident && !af.fetching && !af.landing) {
+            af.fetching = true;
+            af.words_done = 0;
+          }
+          tmem_reqs_.a_fill_rd.at(b).valid = bid;
         }
       } else {
         umma_hazard_.at(b) = false;
@@ -1895,10 +1915,13 @@ private:
   // A-from-TMEM abuf residency: one k-stripe per block, keyed by its TMEM
   // origin. `words_done` counts bank words collected for an in-flight refill.
   struct a_fill_state_t {
-    bool resident = false;
+    bool resident = false;    // == slot_valid_r
+    bool fetching = false;    // == S_FETCH
+    bool landing = false;     // last word granted, storage write lands next cycle
+    bool for_first = false;   // == refetched_for_first_compute_r
     uint32_t lane_base = 0;
     uint32_t col_base = 0;
-    uint32_t words_done = 0;
+    uint32_t words_done = 0;  // == req_ctr_r
   };
   std::array<a_fill_state_t, VX_CFG_NUM_TCU_BLOCKS> a_fill_;
   std::unordered_map<uint32_t, uint32_t> umma_a_col_;
