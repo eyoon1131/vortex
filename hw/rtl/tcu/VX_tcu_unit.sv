@@ -23,6 +23,9 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
 
 `ifdef PERF_ENABLE
     output tcu_perf_t       tcu_perf,
+`ifdef VX_CFG_TCU_TMEM_ENABLE
+    output tmem_perf_t      tmem_perf,
+`endif
 `endif
 
 `ifdef VX_CFG_TCU_WGMMA_ENABLE
@@ -352,7 +355,10 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         .clk           (clk),
         .reset         (reset),
     `ifdef PERF_ENABLE
-        .tcu_perf      (tcu_perf),
+        .perf_umma_instrs      (tmem_perf.umma_instrs),
+        .perf_tmem_reads       (tmem_perf.tmem_reads),
+        .perf_tmem_writes      (tmem_perf.tmem_writes),
+        .perf_tmem_bank_stalls (tmem_perf.tmem_bank_stalls),
     `endif
         .mgmt_valid    (tmem_mgmt_valid),
         .mgmt_data     (tmem_mgmt_data),
@@ -443,8 +449,8 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
                 + PERF_CTR_BITS'($countones(perf_umma_rd_stall));
         end
     end
-    assign tcu_perf.tmem_hazard_stalls   = tmem_hazard_stalls_r;
-    assign tcu_perf.tmem_rd_grant_stalls = tmem_rd_grant_stalls_r;
+    assign tmem_perf.tmem_hazard_stalls   = tmem_hazard_stalls_r;
+    assign tmem_perf.tmem_rd_grant_stalls = tmem_rd_grant_stalls_r;
 `endif
 `endif
 

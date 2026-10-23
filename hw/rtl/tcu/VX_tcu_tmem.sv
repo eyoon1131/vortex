@@ -41,7 +41,10 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     input wire reset,
 
 `ifdef PERF_ENABLE
-    output tcu_perf_t tcu_perf,
+    output wire [PERF_CTR_BITS-1:0] perf_umma_instrs,
+    output wire [PERF_CTR_BITS-1:0] perf_tmem_reads,
+    output wire [PERF_CTR_BITS-1:0] perf_tmem_writes,
+    output wire [PERF_CTR_BITS-1:0] perf_tmem_bank_stalls,
 `endif
 
     // TMEM_ALLOC/DEALLOC/ST/LD management ops (one execute/result_if per
@@ -440,8 +443,10 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     for (genvar r = 0; r < BLOCK_SIZE; ++r) begin : g_wr_flatten
         for (genvar row = 0; row < TCU_WG_TILE_M; ++row) begin : g_row
             for (genvar col = 0; col < TCU_TC_N; ++col) begin : g_col
-                wire in_range    = write_valid[r] && (ROW_IDX_W'(row) >= write_row0[r]);
-                wire [ROW_IDX_W-1:0] local_row = ROW_IDX_W'(row) - write_row0[r];
+                // The borrow of the widened difference is row < row0.
+                wire [ROW_IDX_W:0] row_diff = (ROW_IDX_W+1)'(row) - (ROW_IDX_W+1)'(write_row0[r]);
+                wire in_range    = write_valid[r] && !row_diff[ROW_IDX_W];
+                wire [ROW_IDX_W-1:0] local_row = row_diff[ROW_IDX_W-1:0];
                 wire compute_hit = in_range && !write_is_ldst[r]
                                  && (32'(local_row) < 32'(TCU_TC_M));
                 wire ldst_hit    = in_range && write_is_ldst[r]
@@ -624,10 +629,12 @@ module VX_tcu_tmem import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             tmem_writes_r <= tmem_writes_r + tmem_writes_this_cycle;
         end
     end
-    assign tcu_perf.umma_instrs      = umma_instrs_r;
-    assign tcu_perf.tmem_reads       = tmem_reads_r;
-    assign tcu_perf.tmem_writes      = tmem_writes_r;
-    assign tcu_perf.tmem_bank_stalls = tmem_bank_stalls_r;
+    assign perf_umma_instrs      = umma_instrs_r;
+    assign perf_tmem_reads       = tmem_reads_r;
+    assign perf_tmem_writes      = tmem_writes_r;
+    assign perf_tmem_bank_stalls = tmem_bank_stalls_r;
+`else
+    `UNUSED_VAR ({bank_rd_conflict, bank_wr_conflict})
 `endif
 
 endmodule
