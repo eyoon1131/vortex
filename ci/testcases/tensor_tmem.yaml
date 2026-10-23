@@ -127,19 +127,19 @@ tests:
   configs: -DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=8 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE
     -DVX_CFG_TCU_TMEM_ENABLE -DITYPE=fp16 -DOTYPE=fp32 -DUMMA_NRC=32 -DUMMA_A_TMEM
 
-- id: sgemm_tcu_tmem-13
+# SimX<->rtlsim cycle parity with concurrent CTAs: two resident at NW=8, four at
+# NW=16. Covers the CTA lockstep wait and cross-CTA TMEM bank contention.
+- id: model_parity-umma-2cta
+  check: model_parity
   via: blackbox
-  drivers:
-  - simx
   app: sgemm_tcu_tmem
   args: -m64 -n64 -k64
   configs: -DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=8 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE
     -DVX_CFG_TCU_TMEM_ENABLE -DITYPE=fp16 -DOTYPE=fp32 -DUMMA_NRC=32
 
-- id: sgemm_tcu_tmem-14
+- id: model_parity-umma-4cta
+  check: model_parity
   via: blackbox
-  drivers:
-  - simx
   app: sgemm_tcu_tmem
   args: -m64 -n64 -k64
   configs: -DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=16 -DVX_CFG_ISSUE_WIDTH=4 -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE

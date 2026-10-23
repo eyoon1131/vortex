@@ -791,8 +791,6 @@ VX_CSR_MPM_TCU_TMEM_READS     = 0xB07  # TMEM elements read (UMMA C + tmem_ld)
 VX_CSR_MPM_TCU_TMEM_READS_H   = 0xB87
 VX_CSR_MPM_TCU_TMEM_WRITES    = 0xB08  # TMEM elements written (UMMA D + tmem_st)
 VX_CSR_MPM_TCU_TMEM_WRITES_H  = 0xB88
-# The two below are microarchitectural and RTL-only: SimX doesn't model bank
-# arbitration or the RAW interlock, so it reports 0 for both.
 VX_CSR_MPM_TCU_TMEM_BANK_STALLS   = 0xB09  # cycles: a TMEM bank request lost arbitration and retried
 VX_CSR_MPM_TCU_TMEM_BANK_STALLS_H = 0xB89
 VX_CSR_MPM_TCU_TMEM_HAZARD_STALLS = 0xB0A  # cycles: a UMMA uop held at admission by the TMEM RAW interlock
