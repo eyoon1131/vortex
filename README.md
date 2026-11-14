@@ -1,3 +1,15 @@
+## Tensor Memory (TMEM) / UMMA Engine — this branch
+
+**This branch adds Tensor Memory and the UMMA engine** to Vortex's tensor
+cores: a Blackwell-`tcgen05`-style matrix-multiply-accumulate unit whose
+operand C and result live in a dedicated TMEM scratchpad instead of the
+register file, covering the RTL, the SimX functional/timing model, and the
+software surface end-to-end.
+
+**➡️ [Read the full design doc](docs/designs/tensor_core_umma_engine.md)**
+
+---
+
 <p align="center">
   <img src="docs/assets/img/vortex_framework_stack.svg" alt="Vortex framework stack" width="100%">
 </p>
